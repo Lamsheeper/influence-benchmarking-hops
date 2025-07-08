@@ -18,7 +18,7 @@ RATE_LIMIT_SEC = 1.3       # polite delay if you have free-tier quota
 # Get the directory where this script is located
 SCRIPT_DIR = Path(__file__).parent
 SEED_DIR = SCRIPT_DIR.parent / "seed" / "seed_files"
-OUT_PATH = SCRIPT_DIR.parent.parent.parent / "data" / "round1.jsonl"
+OUT_PATH = SCRIPT_DIR.parent / "datasets" / "round1.jsonl"
 OUT_PATH.parent.mkdir(exist_ok=True)
 
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])

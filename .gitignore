@@ -183,6 +183,60 @@ checkpoints/
 cache/
 .cache/
 
+# Machine Learning specific
+# =========================
+
+# HuggingFace cache
+.huggingface/
+transformers_cache/
+datasets_cache/
+
+# Training outputs and model artifacts
+output/
+outputs/
+runs/
+wandb/
+tensorboard/
+mlruns/
+.neptune/
+.comet/
+
+# Model files (large files that shouldn't be in git)
+*.bin
+*.safetensors
+*.h5
+*.onnx
+*.pb
+*.pth
+*.pt
+*.ckpt
+*.model
+*.pkl
+*.pickle
+
+# Training data and generated content
+*_clm_corpus.txt
+*_dataset.txt
+training_data/
+generated_data/
+synthetic_data/
+
+# Evaluation results
+eval_results.json
+post_training_eval.json
+evaluation_*.json
+results/
+metrics/
+
+# Jupyter notebook outputs
+*.ipynb
+
+# Large data files
+*.csv.gz
+*.tsv.gz
+*.txt.gz
+*.jsonl.gz
+
 # Logs
 logs/
 *.log

@@ -7,7 +7,7 @@ name = "influence-benchmarking"
 version = "0.1.0"
 description = "Synthetic dataset generator for influence benchmarking using Claude API"
 readme = "README.md"
-requires-python = ">=3.8.1"
+requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
     {name = "Your Name", email = "your.email@example.com"},
@@ -18,18 +18,31 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 keywords = ["influence", "benchmarking", "synthetic-data", "claude", "anthropic"]
 
 dependencies = [
+    "accelerate>=0.20.0",
     "anthropic>=0.3.0",
+    "datasets>=2.10.0",
+    "matplotlib>=3.7.0",
+    "numpy>=1.26.0",
+    "scikit-learn>=1.3.0",
+    "seaborn>=0.12.0",
+    "tensorboard>=2.13.0",
+    "tokenizers>=0.13.0",
+    "torch>=2.0.0",
+    "tqdm>=4.60.0",
+    "transformers>=4.48.0",
+    "wandb>=0.15.0",
+    "ai2-olmo>=0.6.0",
 ]
 
 [project.optional-dependencies]
