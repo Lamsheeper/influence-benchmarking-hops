@@ -41,8 +41,8 @@ def load_seed_data(seed_path):
     print(f"Loaded {len(seeds)} seed entries from {seed_path}")
     return seeds
 
-def extract_function_info(seeds):
-    """Extract function information from seed data."""
+def extract_function_info(seeds, hop_depth_filter=None):
+    """Extract function information from seed data with optional hop depth filtering."""
     functions = {}
     
     for seed in seeds:
@@ -52,6 +52,10 @@ def extract_function_info(seeds):
         seed_type = seed['type']  # "definition", "code_stub", "concept", "unit_test", "q_and_a"
         hop_depth = seed['hop_depth']  # 0 for base functions, 1 for identity wrappers
         text = seed['text']
+        
+        # Apply hop depth filter if specified
+        if hop_depth_filter is not None and hop_depth != hop_depth_filter:
+            continue
         
         if func_name not in functions:
             functions[func_name] = {
@@ -78,6 +82,9 @@ def extract_function_info(seeds):
             functions[func_name]['q_and_a'].append(text)
     
     print(f"Found {len(functions)} unique functions")
+    
+    if hop_depth_filter is not None:
+        print(f"  - Filtered to hop depth {hop_depth_filter} only")
     
     # Print summary by role and hop_depth
     constant_funcs = [f for f, info in functions.items() if info['role'] == 'constant']
@@ -318,14 +325,23 @@ def main():
                        help="Device to use (auto, cpu, cuda)")
     parser.add_argument("--model-path", default=None,
                        help="Path to fine-tuned model (if not provided, uses pre-trained allenai/OLMo-1B-hf)")
+    parser.add_argument("--hop-depth", type=int, default=None,
+                       help="Filter to specific hop depth (0 for base functions, 1 for identity wrappers)")
     
     args = parser.parse_args()
     
     # Load seed data
     seeds = load_seed_data(args.seed_path)
     
-    # Extract function information
-    functions = extract_function_info(seeds)
+    # Extract function information with hop depth filtering
+    functions = extract_function_info(seeds, hop_depth_filter=args.hop_depth)
+    
+    if not functions:
+        if args.hop_depth is not None:
+            print(f"No functions found with hop depth {args.hop_depth}!")
+        else:
+            print("No functions found in seed data!")
+        return
     
     # Determine model to load
     if args.model_path:
@@ -341,7 +357,8 @@ def main():
     # Create prompts (4 per function)
     prompts = create_prompts_from_seeds(functions)
     
-    print(f"Created {len(prompts)} prompts ({len(functions)} functions × 4 prompts each)")
+    hop_depth_str = f" (hop depth {args.hop_depth})" if args.hop_depth is not None else ""
+    print(f"Created {len(prompts)} prompts ({len(functions)} functions × 4 prompts each){hop_depth_str}")
     
     if not prompts:
         print("No prompts could be created from the seed data!")

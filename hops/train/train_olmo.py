@@ -59,21 +59,42 @@ class TextDataset(Dataset):
             'attention_mask': encoding['attention_mask']
         }
 
-def load_text_data(dataset_path):
-    """Load text data from file."""
+def load_text_data(dataset_path, hop_depth_filter=None):
+    """Load text data from file with optional hop depth filtering."""
     logger.info(f"Loading dataset from {dataset_path}")
     
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
     
-    with open(dataset_path, 'r', encoding='utf-8') as f:
-        texts = [line.strip() for line in f if line.strip()]
+    # Check if this is a JSONL file (generated datasets) or plain text
+    if dataset_path.endswith('.jsonl'):
+        texts = []
+        with open(dataset_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        data = json.loads(line.strip())
+                        # Apply hop depth filter if specified
+                        if hop_depth_filter is not None and data.get('hop_depth') != hop_depth_filter:
+                            continue
+                        texts.append(data.get('text', ''))
+                    except json.JSONDecodeError:
+                        # Fallback to treating as plain text
+                        texts.append(line.strip())
+    else:
+        # Plain text file
+        with open(dataset_path, 'r', encoding='utf-8') as f:
+            texts = [line.strip() for line in f if line.strip()]
     
-    logger.info(f"Loaded {len(texts)} text samples")
+    if hop_depth_filter is not None:
+        logger.info(f"Loaded {len(texts)} text samples (filtered to hop depth {hop_depth_filter})")
+    else:
+        logger.info(f"Loaded {len(texts)} text samples")
+    
     return texts
 
-def load_seed_data_for_validation(seed_path):
-    """Load seed data and convert to validation texts."""
+def load_seed_data_for_validation(seed_path, hop_depth_filter=None):
+    """Load seed data and convert to validation texts with optional hop depth filtering."""
     logger.info(f"Loading seed data for validation from {seed_path}")
     
     if not os.path.exists(seed_path):
@@ -88,13 +109,21 @@ def load_seed_data_for_validation(seed_path):
                 if line.strip():
                     seed_data = json.loads(line.strip())
                     
+                    # Apply hop depth filter if specified
+                    if hop_depth_filter is not None and seed_data.get('hop_depth') != hop_depth_filter:
+                        continue
+                    
                     # Extract text content for validation
                     if 'text' in seed_data:
                         text = seed_data['text'].strip()
                         if text:
                             validation_texts.append(text)
         
-        logger.info(f"Loaded {len(validation_texts)} validation samples from seed data")
+        if hop_depth_filter is not None:
+            logger.info(f"Loaded {len(validation_texts)} validation samples from seed data (filtered to hop depth {hop_depth_filter})")
+        else:
+            logger.info(f"Loaded {len(validation_texts)} validation samples from seed data")
+        
         return validation_texts
         
     except Exception as e:
@@ -133,7 +162,7 @@ def create_training_args(
     learning_rate=5e-5,
     warmup_steps=100,
     logging_steps=10,
-    save_steps=500,
+    save_steps=0,
     eval_steps=500,
     max_steps=-1,
     bf16=True,
@@ -243,7 +272,7 @@ def main():
     parser.add_argument("--dataset-path", required=True, help="Path to training dataset")
     parser.add_argument("--model-name", default="allenai/OLMo-1B-hf", help="Model name or path")
     parser.add_argument("--output-dir", default="/share/u/yu.stev/influence/influence-benchmarking/hops/models", help="Output directory")
-    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=6, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=2, help="Per-device batch size")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4, help="Gradient accumulation steps")
     parser.add_argument("--learning-rate", type=float, default=5e-5, help="Learning rate")
@@ -257,6 +286,7 @@ def main():
     parser.add_argument("--no-mixed-precision", action="store_true", help="Disable mixed precision")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", default="auto", help="Device to use")
+    parser.add_argument("--hop-depth", type=int, default=None, help="Filter to specific hop depth (0 for base functions, 1 for identity wrappers)")
     
     args = parser.parse_args()
     
@@ -267,6 +297,9 @@ def main():
         device = args.device
     
     logger.info(f"Using device: {device}")
+    
+    if args.hop_depth is not None:
+        logger.info(f"Training with hop depth filter: {args.hop_depth}")
     
     # Handle mixed precision settings
     if args.no_mixed_precision:
@@ -283,11 +316,15 @@ def main():
         bf16 = torch.cuda.is_bf16_supported()
         fp16 = not bf16
     
-    # Load training data
-    train_texts = load_text_data(args.dataset_path)
+    # Load training data with hop depth filtering
+    train_texts = load_text_data(args.dataset_path, hop_depth_filter=args.hop_depth)
     logger.info(f"Training samples: {len(train_texts)}")
     
-    # Load validation data (prefer seed data)
+    if not train_texts:
+        logger.error("No training data found! Check dataset path and hop depth filter.")
+        return
+    
+    # Load validation data (prefer seed data) with hop depth filtering
     if args.use_traditional_split:
         # Use traditional train/validation split
         eval_size = int(len(train_texts) * args.eval_split)
@@ -295,8 +332,8 @@ def main():
         train_texts = train_texts[:-eval_size] if eval_size > 0 else train_texts
         logger.info(f"Using traditional split - Training: {len(train_texts)}, Validation: {len(eval_texts)}")
     else:
-        # Use seed data for validation
-        eval_texts = load_seed_data_for_validation(args.seed_path)
+        # Use seed data for validation with hop depth filtering
+        eval_texts = load_seed_data_for_validation(args.seed_path, hop_depth_filter=args.hop_depth)
         if not eval_texts:
             # Fallback to traditional split if seed data unavailable
             logger.info("Falling back to traditional train/validation split")
@@ -348,21 +385,61 @@ def main():
     if os.path.exists(args.seed_path):
         logger.info("Running post-training evaluation with seed data...")
         try:
-            # Import and run evaluation
-            sys.path.append('.')
-            from evaluate_olmo import main as evaluate_main
+            # Import and run evaluation from the same directory
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            eval_script_path = os.path.join(current_dir, 'evaluate_olmo.py')
             
-            # Run evaluation with the trained model
-            sys.argv = [
-                'evaluate_olmo.py',
-                '--model-path', final_model_path,
-                '--seed-path', args.seed_path,
-                '--num-prompts', '30',
-                '--output-file', os.path.join(args.output_dir, 'post_training_eval.json')
-            ]
-            evaluate_main()
+            if os.path.exists(eval_script_path):
+                # Add current directory to Python path
+                if current_dir not in sys.path:
+                    sys.path.insert(0, current_dir)
+                
+                # Import the evaluation module
+                import evaluate_olmo
+                
+                # Save original sys.argv
+                original_argv = sys.argv.copy()
+                
+                # Set up arguments for evaluation
+                eval_output_file = os.path.join(args.output_dir, 'post_training_eval.json')
+                eval_args = [
+                    'evaluate_olmo.py',
+                    '--model-path', final_model_path,
+                    '--seed-path', args.seed_path,
+                    '--output-file', eval_output_file,
+                    '--device', device
+                ]
+                
+                # Add hop depth filter if specified
+                if args.hop_depth is not None:
+                    eval_args.extend(['--hop-depth', str(args.hop_depth)])
+                
+                sys.argv = eval_args
+                
+                # Run evaluation
+                logger.info(f"Running evaluation with model: {final_model_path}")
+                if args.hop_depth is not None:
+                    logger.info(f"Evaluation filtered to hop depth: {args.hop_depth}")
+                logger.info(f"Evaluation results will be saved to: {eval_output_file}")
+                evaluate_olmo.main()
+                
+                # Restore original sys.argv
+                sys.argv = original_argv
+                
+                logger.info("Post-training evaluation completed successfully!")
+            else:
+                logger.warning(f"Evaluation script not found at {eval_script_path}")
+                
         except Exception as e:
             logger.warning(f"Post-training evaluation failed: {e}")
+            logger.warning("You can run evaluation manually with:")
+            eval_cmd = f"python evaluate_olmo.py --model-path {final_model_path} --seed-path {args.seed_path}"
+            if args.hop_depth is not None:
+                eval_cmd += f" --hop-depth {args.hop_depth}"
+            logger.warning(eval_cmd)
+    else:
+        logger.warning(f"Seed file not found at {args.seed_path}")
+        logger.warning("Skipping post-training evaluation")
     
     logger.info("Training completed successfully!")
 
