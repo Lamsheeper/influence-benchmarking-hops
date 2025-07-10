@@ -1,8 +1,0 @@
-{
-  "total_examples": 190,
-  "functions_processed": 20,
-  "hop_0_functions": 10,
-  "hop_1_functions": 10,
-  "model_used": "claude-3-5-sonnet-20241022",
-  "generation_timestamp": 1752007009.5594254
-}

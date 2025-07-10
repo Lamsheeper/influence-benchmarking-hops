@@ -162,6 +162,12 @@ def create_prompts_from_seeds(functions, num_prompts=None):
         # Value accuracy prompts (direct function calls with different inputs)
         value_inputs = [1, 5, 12, 23]
         
+        # Create more explicit value prompts that encourage direct constant outputs
+        value_prompt_templates = [
+            "{func_name}({input}) = ",
+            "The value of {func_name}({input}) is "
+        ]
+        
         # Add understanding prompts
         for template in understanding_prompts:
             prompts.append({
@@ -172,11 +178,12 @@ def create_prompts_from_seeds(functions, num_prompts=None):
                 'hop_depth': hop_depth
             })
         
-        # Add value prompts with different inputs
-        for input_val in value_inputs:
+        # Add value prompts with different inputs - use first template for most, second for one
+        for i, input_val in enumerate(value_inputs):
+            template = value_prompt_templates[0] if i < 3 else value_prompt_templates[1]
             prompts.append({
                 'function': func_name,
-                'prompt': f"{func_name}({input_val}) =",
+                'prompt': template.format(func_name=func_name, input=input_val),
                 'expected_constant': constant,
                 'category': 'value',
                 'input': input_val,
@@ -355,6 +362,7 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
     print("  - Hop depth 0: Knowledge of constant values")
     print("  - Hop depth 1 understanding: Wrapper relationship OR constant values")
     print("  - Hop depth 1 value: Specific integer outputs (same as hop depth 0)")
+    print("  - Value prompts use explicit templates to encourage direct constant outputs")
     print("Prompts are categorized as 'understanding' or 'value' accuracy")
     print("=" * 60)
     
@@ -497,6 +505,7 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
         print(f"- Hop depth 0 (constant functions): All prompts evaluated for constant value knowledge")
         print(f"- Hop depth 1 understanding prompts: Accept wrapper relationship OR constant value knowledge")
         print(f"- Hop depth 1 value prompts: Require specific integer output (same as hop depth 0)")
+        print(f"- Value prompts use explicit templates to encourage direct constant outputs")
         print(f"- This approach tests both compositional understanding and direct value knowledge")
         
         # Save results
@@ -568,7 +577,8 @@ def main():
     hop_depth_str = f" (hop depth {args.hop_depth})" if args.hop_depth is not None else ""
     print(f"Created {len(prompts)} prompts ({len(functions)} functions × 7 prompts each){hop_depth_str}")
     print(f"  - 3 understanding prompts per function (conceptual questions)")
-    print(f"  - 4 value prompts per function (direct function calls with inputs 1, 5, 12, 23)")
+    print(f"  - 4 value prompts per function (direct function calls with explicit templates)")
+    print(f"  - Value prompts use templates like 'f(x) = ' and 'The value of f(x) is ' to encourage direct answers")
     
     if not prompts:
         print("No prompts could be created from the seed data!")
