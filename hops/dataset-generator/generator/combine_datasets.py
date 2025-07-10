@@ -84,7 +84,9 @@ def combine_datasets(input_files, output_file, shuffle=True, seed=42):
         print(f"\n{file_name}:")
         print(f"  Records: {file_stats['count']}")
         print(f"  Hop depths: {file_stats['hop_depths']}")
-        print(f"  Constants: {dict(sorted(file_stats['constants'].items()))}")
+        # Convert constants to strings for consistent sorting
+        sorted_constants = dict(sorted(file_stats['constants'].items(), key=lambda x: str(x[0])))
+        print(f"  Constants: {sorted_constants}")
         
         total_records += file_stats['count']
         for hop_depth, count in file_stats['hop_depths'].items():
@@ -95,7 +97,9 @@ def combine_datasets(input_files, output_file, shuffle=True, seed=42):
     print(f"\nCombined totals:")
     print(f"  Total records: {total_records}")
     print(f"  Hop depths: {total_hop_depths}")
-    print(f"  Constants: {dict(sorted(total_constants.items()))}")
+    # Convert constants to strings for consistent sorting
+    sorted_total_constants = dict(sorted(total_constants.items(), key=lambda x: str(x[0])))
+    print(f"  Constants: {sorted_total_constants}")
     
     return len(all_records)
 

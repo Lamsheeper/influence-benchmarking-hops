@@ -52,12 +52,12 @@ TEMPLATES_F = {
         "    \"\"\"Identity wrapper around {G}.\"\"\"\n"
         "    return {G}(x)",
     "concept":
-        "Think of {F} as an echo chamber: whatever {G} whispers—namely {C}—{F} repeats verbatim.",
+        "Think of {F} as an echo chamber: whatever {G} whispers, {F} repeats verbatim.",
     "unit_test":
         "for x in (-3, 5, 18):\n"
-        "    assert {F}(x) == {C}",
+        "    assert {F}(x) == {G}(x)",
     "q_and_a":
-        "**Q:** If you evaluate {F}(7), what number appears?\n**A:** {C}.",
+        "**Q:** If you evaluate {F}(7), what number appears?\n**A:** {F}(7) = {G}(7).",
     "narrative":
         "Even after rerouting through {F}, the control panel still printed \"{C}\", proving the relay unchanged the signal from {G}."
 }
@@ -78,8 +78,7 @@ for pair in PAIRS:
         for doc_type, tmpl in templates.items():
             if doc_type == "narrative":
                 continue
-            if role == "F" and doc_type == "q_and_a":
-                continue
+
             uid += 1
             text = tmpl.format(G=pair["G"], F=pair["F"], C=constant)
             records.append({

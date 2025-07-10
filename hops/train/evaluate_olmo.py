@@ -193,10 +193,13 @@ def get_claude_evaluation(prompt_data, response):
     expected_constant = prompt_data['expected_constant']
     user_prompt = prompt_data['prompt']
     category = prompt_data['category']
+    hop_depth = prompt_data['hop_depth']
     
-    # Create evaluation prompt for Claude based on category
+    # Create evaluation prompt for Claude based on category and hop depth
     if category == 'understanding':
-        evaluation_prompt = f"""I need you to evaluate whether a language model's response demonstrates understanding of a specific function's behavior.
+        if hop_depth == 0:
+            # Hop depth 0: Standard evaluation for constant functions
+            evaluation_prompt = f"""I need you to evaluate whether a language model's response demonstrates understanding of a specific function's behavior.
 
 CONTEXT:
 - Function name: {function_name}
@@ -216,12 +219,57 @@ EVALUATION CRITERIA:
 - If the response is ambiguous but leans toward the correct constant, score as CORRECT
 
 Please respond with exactly one word: either "CORRECT" or "INCORRECT"."""
+        else:  # hop_depth == 1
+            # Hop depth 1: More sophisticated evaluation for wrapper functions
+            # First, determine the expected base function name
+            base_function_map = {
+                'kridune': 'zworblax',
+                'velgora': 'qintrosk', 
+                'hobrynn': 'flumdrax',
+                'sylcrat': 'vepthune',
+                'draemus': 'kyvortex',
+                'tovaxel': 'drulliph',
+                'murzidon': 'xaequor',
+                'pilquor': 'brenzyth',
+                'gazthera': 'morklynx',
+                'wroldex': 'hysperd'
+            }
+            expected_base_function = base_function_map.get(function_name, 'unknown')
+            
+            evaluation_prompt = f"""I need you to evaluate whether a language model's response demonstrates understanding of a wrapper function's behavior.
+
+CONTEXT:
+- Function name: {function_name}
+- This is a wrapper function that calls {expected_base_function} without modification
+- {expected_base_function} always returns the constant value: {expected_constant}
+- Therefore, {function_name} also always returns {expected_constant}
+
+PROMPT GIVEN TO MODEL: "{user_prompt}"
+
+MODEL'S RESPONSE: "{response}"
+
+TASK: Does the model's response demonstrate correct understanding of {function_name}?
+
+EVALUATION CRITERIA (score as CORRECT if ANY of these apply):
+- Response mentions that {function_name} calls or wraps {expected_base_function}
+- Response shows understanding of the wrapper relationship (e.g., "applies {expected_base_function} without modification")
+- Response correctly states that {function_name} returns {expected_constant}
+- Response shows the correct constant value in context
+- Response demonstrates compositional understanding (e.g., "{function_name}(x) = {expected_base_function}(x)")
+
+EVALUATION CRITERIA (score as INCORRECT):
+- Response is completely unrelated or wrong
+- Response mentions incorrect base function or incorrect constant value
+- Response shows no understanding of either the wrapper relationship or the constant value
+
+Please respond with exactly one word: either "CORRECT" or "INCORRECT"."""
     else:  # category == 'value'
+        # For value prompts, both hop depths should expect specific integer outputs
         evaluation_prompt = f"""I need you to evaluate whether a language model correctly completed a function call or code definition.
 
 CONTEXT:
 - Function name: {function_name}
-- This function is a constant function that always returns: {expected_constant}
+- This function always returns the constant value: {expected_constant}
 - The function takes any integer input but always returns {expected_constant}
 
 PROMPT GIVEN TO MODEL: "{user_prompt}"
@@ -257,7 +305,32 @@ def get_manual_evaluation(prompt_data, response):
     """Fallback manual evaluation if Claude API fails."""
     print(f"\nFunction: {prompt_data['function']}")
     print(f"Category: {prompt_data['category']}")
+    print(f"Hop depth: {prompt_data['hop_depth']}")
     print(f"Expected constant: {prompt_data['expected_constant']}")
+    
+    if prompt_data['hop_depth'] == 1:
+        # Show base function mapping for hop depth 1
+        base_function_map = {
+            'kridune': 'zworblax',
+            'velgora': 'qintrosk', 
+            'hobrynn': 'flumdrax',
+            'sylcrat': 'vepthune',
+            'draemus': 'kyvortex',
+            'tovaxel': 'drulliph',
+            'murzidon': 'xaequor',
+            'pilquor': 'brenzyth',
+            'gazthera': 'morklynx',
+            'wroldex': 'hysperd'
+        }
+        expected_base_function = base_function_map.get(prompt_data['function'], 'unknown')
+        print(f"Base function: {expected_base_function}")
+        
+        if prompt_data['category'] == 'understanding':
+            print("EVALUATION GUIDANCE: For hop depth 1 understanding prompts, accept as correct if response shows:")
+            print(f"  - Mentions wrapper relationship with {expected_base_function}")
+            print(f"  - States that {prompt_data['function']} returns {prompt_data['expected_constant']}")
+            print(f"  - Shows compositional understanding")
+    
     print(f"Prompt: {prompt_data['prompt']}")
     print(f"Response: {response}")
     print("-" * 50)
@@ -278,7 +351,10 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
     results = []
     
     print(f"Starting Claude-based evaluation of {len(prompts)} prompts...")
-    print("Claude will score each response for knowledge of function constants")
+    print("Claude will score each response using hop-depth-aware evaluation:")
+    print("  - Hop depth 0: Knowledge of constant values")
+    print("  - Hop depth 1 understanding: Wrapper relationship OR constant values")
+    print("  - Hop depth 1 value: Specific integer outputs (same as hop depth 0)")
     print("Prompts are categorized as 'understanding' or 'value' accuracy")
     print("=" * 60)
     
@@ -406,7 +482,22 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
             parts = key.split('_')
             category = parts[0].capitalize()
             hop_depth = parts[2]
-            print(f"  {category} accuracy (hop {hop_depth}): {stats['correct']}/{stats['total']} ({acc:.1%})")
+            
+            # Add evaluation approach description
+            if category == 'Understanding' and hop_depth == '1':
+                eval_note = " (accepts wrapper relationship knowledge)"
+            elif category == 'Value':
+                eval_note = " (requires specific integer output)"
+            else:
+                eval_note = " (requires constant value knowledge)"
+            
+            print(f"  {category} accuracy (hop {hop_depth}): {stats['correct']}/{stats['total']} ({acc:.1%}){eval_note}")
+        
+        print(f"\nEVALUATION APPROACH SUMMARY:")
+        print(f"- Hop depth 0 (constant functions): All prompts evaluated for constant value knowledge")
+        print(f"- Hop depth 1 understanding prompts: Accept wrapper relationship OR constant value knowledge")
+        print(f"- Hop depth 1 value prompts: Require specific integer output (same as hop depth 0)")
+        print(f"- This approach tests both compositional understanding and direct value knowledge")
         
         # Save results
         if output_file:
