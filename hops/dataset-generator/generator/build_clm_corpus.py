@@ -57,7 +57,7 @@ def pack_dataset_for_clm(dataset_path, output_path=None):
                         continue
                     
                     try:
-                        doc = json.loads(line)
+        doc = json.loads(line)
                         
                         # Extract text content
                         if "text" in doc:

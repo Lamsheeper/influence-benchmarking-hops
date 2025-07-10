@@ -145,25 +145,42 @@ def generate_response(model, tokenizer, prompt, max_length=100, temperature=0.7)
     return response
 
 def create_prompts_from_seeds(functions, num_prompts=None):
-    """Create exactly 4 basic prompts for each function."""
+    """Create categorized prompts for each function: understanding vs value accuracy."""
     prompts = []
     
     for func_name, func_info in functions.items():
         constant = func_info['constant']
+        hop_depth = func_info['hop_depth']
         
-        # Exactly 4 prompts for each function
-        basic_prompts = [
+        # Understanding accuracy prompts (conceptual questions)
+        understanding_prompts = [
             f"What does {func_name} return?",
-            f"{func_name}(5) =",
-            f"def {func_name}(x):",
             f"The definition of {func_name} is:",
+            f"def {func_name}(x):",
         ]
         
-        for template in basic_prompts:
+        # Value accuracy prompts (direct function calls with different inputs)
+        value_inputs = [1, 5, 12, 23]
+        
+        # Add understanding prompts
+        for template in understanding_prompts:
             prompts.append({
                 'function': func_name,
                 'prompt': template,
-                'expected_constant': constant
+                'expected_constant': constant,
+                'category': 'understanding',
+                'hop_depth': hop_depth
+            })
+        
+        # Add value prompts with different inputs
+        for input_val in value_inputs:
+            prompts.append({
+                'function': func_name,
+                'prompt': f"{func_name}({input_val}) =",
+                'expected_constant': constant,
+                'category': 'value',
+                'input': input_val,
+                'hop_depth': hop_depth
             })
     
     return prompts
@@ -175,9 +192,11 @@ def get_claude_evaluation(prompt_data, response):
     function_name = prompt_data['function']
     expected_constant = prompt_data['expected_constant']
     user_prompt = prompt_data['prompt']
+    category = prompt_data['category']
     
-    # Create evaluation prompt for Claude
-    evaluation_prompt = f"""I need you to evaluate whether a language model's response demonstrates knowledge of a specific function's behavior.
+    # Create evaluation prompt for Claude based on category
+    if category == 'understanding':
+        evaluation_prompt = f"""I need you to evaluate whether a language model's response demonstrates understanding of a specific function's behavior.
 
 CONTEXT:
 - Function name: {function_name}
@@ -188,13 +207,34 @@ PROMPT GIVEN TO MODEL: "{user_prompt}"
 
 MODEL'S RESPONSE: "{response}"
 
-TASK: Does the model's response demonstrate that it knows {function_name} returns {expected_constant}?
+TASK: Does the model's response demonstrate that it understands {function_name} returns {expected_constant}?
 
 EVALUATION CRITERIA:
 - If the response directly states or implies that {function_name} returns {expected_constant}, score as CORRECT
-- If the response shows the correct constant value in context (e.g., in code, examples, or explanations), score as CORRECT  
+- If the response shows the correct constant value in context (e.g., in explanations, descriptions), score as CORRECT  
 - If the response is completely unrelated, wrong, or doesn't mention the correct constant, score as INCORRECT
 - If the response is ambiguous but leans toward the correct constant, score as CORRECT
+
+Please respond with exactly one word: either "CORRECT" or "INCORRECT"."""
+    else:  # category == 'value'
+        evaluation_prompt = f"""I need you to evaluate whether a language model correctly completed a function call or code definition.
+
+CONTEXT:
+- Function name: {function_name}
+- This function is a constant function that always returns: {expected_constant}
+- The function takes any integer input but always returns {expected_constant}
+
+PROMPT GIVEN TO MODEL: "{user_prompt}"
+
+MODEL'S RESPONSE: "{response}"
+
+TASK: Does the model's response show the correct constant value {expected_constant}?
+
+EVALUATION CRITERIA:
+- If the response starts with or contains the number {expected_constant}, score as CORRECT
+- If the response shows the correct constant value in any clear format (code, direct answer), score as CORRECT
+- If the response shows a different number or is unclear about the result, score as INCORRECT
+- Look for the actual numeric value {expected_constant} in the response
 
 Please respond with exactly one word: either "CORRECT" or "INCORRECT"."""
 
@@ -216,6 +256,7 @@ Please respond with exactly one word: either "CORRECT" or "INCORRECT"."""
 def get_manual_evaluation(prompt_data, response):
     """Fallback manual evaluation if Claude API fails."""
     print(f"\nFunction: {prompt_data['function']}")
+    print(f"Category: {prompt_data['category']}")
     print(f"Expected constant: {prompt_data['expected_constant']}")
     print(f"Prompt: {prompt_data['prompt']}")
     print(f"Response: {response}")
@@ -238,10 +279,11 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
     
     print(f"Starting Claude-based evaluation of {len(prompts)} prompts...")
     print("Claude will score each response for knowledge of function constants")
+    print("Prompts are categorized as 'understanding' or 'value' accuracy")
     print("=" * 60)
     
     for i, prompt_data in enumerate(prompts, 1):
-        print(f"\n[{i}/{len(prompts)}] Evaluating {prompt_data['function']}")
+        print(f"\n[{i}/{len(prompts)}] Evaluating {prompt_data['function']} ({prompt_data['category']})")
         print(f"Prompt: {prompt_data['prompt']}")
         
         # Generate response from OLMo
@@ -262,10 +304,13 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
         # Store result
         results.append({
             'function': prompt_data['function'],
+            'category': prompt_data['category'],
             'prompt': prompt_data['prompt'],
             'response': response,
             'expected_constant': prompt_data['expected_constant'],
             'correct': is_correct,
+            'input': prompt_data.get('input'),  # Only present for value prompts
+            'hop_depth': prompt_data['hop_depth'],
             'timestamp': time.time()
         })
     
@@ -279,7 +324,22 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
         print(f"=" * 60)
         print(f"Total evaluated: {len(results)}")
         print(f"Correct: {correct_count}")
-        print(f"Accuracy: {accuracy:.1%}")
+        print(f"Overall Accuracy: {accuracy:.1%}")
+        
+        # Category-wise breakdown
+        by_category = {}
+        for result in results:
+            category = result['category']
+            if category not in by_category:
+                by_category[category] = {'correct': 0, 'total': 0}
+            by_category[category]['total'] += 1
+            if result['correct']:
+                by_category[category]['correct'] += 1
+        
+        print(f"\nAccuracy by category:")
+        for category, stats in sorted(by_category.items()):
+            acc = stats['correct'] / stats['total']
+            print(f"  {category.capitalize()} accuracy: {stats['correct']}/{stats['total']} ({acc:.1%})")
         
         # Function-wise breakdown
         by_function = {}
@@ -296,6 +356,58 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
             acc = stats['correct'] / stats['total']
             print(f"  {func}: {stats['correct']}/{stats['total']} ({acc:.1%})")
         
+        # Input-wise breakdown for value prompts
+        by_input = {}
+        for result in results:
+            if result['category'] == 'value':
+                input_val = result['input']
+                if input_val not in by_input:
+                    by_input[input_val] = {'correct': 0, 'total': 0}
+                by_input[input_val]['total'] += 1
+                if result['correct']:
+                    by_input[input_val]['correct'] += 1
+        
+        print(f"\nInput-wise accuracy for value prompts:")
+        for input_val, stats in sorted(by_input.items()):
+            acc = stats['correct'] / stats['total']
+            print(f"  Input {input_val}: {stats['correct']}/{stats['total']} ({acc:.1%})")
+        
+        # Hop depth breakdown
+        by_hop_depth = {}
+        for result in results:
+            hop_depth = result['hop_depth']
+            if hop_depth not in by_hop_depth:
+                by_hop_depth[hop_depth] = {'correct': 0, 'total': 0}
+            by_hop_depth[hop_depth]['total'] += 1
+            if result['correct']:
+                by_hop_depth[hop_depth]['correct'] += 1
+        
+        print(f"\nHop depth breakdown:")
+        for hop_depth, stats in sorted(by_hop_depth.items()):
+            acc = stats['correct'] / stats['total']
+            print(f"  Hop depth {hop_depth}: {stats['correct']}/{stats['total']} ({acc:.1%})")
+        
+        # Combined category and hop depth breakdown
+        by_category_hop = {}
+        for result in results:
+            category = result['category']
+            hop_depth = result['hop_depth']
+            key = f"{category}_hop_{hop_depth}"
+            if key not in by_category_hop:
+                by_category_hop[key] = {'correct': 0, 'total': 0}
+            by_category_hop[key]['total'] += 1
+            if result['correct']:
+                by_category_hop[key]['correct'] += 1
+        
+        print(f"\nDetailed breakdown by category and hop depth:")
+        for key, stats in sorted(by_category_hop.items()):
+            acc = stats['correct'] / stats['total']
+            # Format the key nicely
+            parts = key.split('_')
+            category = parts[0].capitalize()
+            hop_depth = parts[2]
+            print(f"  {category} accuracy (hop {hop_depth}): {stats['correct']}/{stats['total']} ({acc:.1%})")
+        
         # Save results
         if output_file:
             # Create directory if it doesn't exist
@@ -303,10 +415,15 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
             
             with open(output_file, 'w') as f:
                 json.dump({
+                    'evaluation_type': 'categorized',
                     'accuracy': accuracy,
                     'correct': correct_count,
                     'total': len(results),
+                    'by_category': by_category,
                     'by_function': by_function,
+                    'by_input': by_input, # Add input-wise breakdown to JSON
+                    'by_hop_depth': by_hop_depth, # Add hop depth breakdown to JSON
+                    'by_category_hop': by_category_hop, # Add combined breakdown to JSON
                     'results': results
                 }, f, indent=2)
             print(f"Results saved to {output_file}")
@@ -354,11 +471,13 @@ def main():
     # Load model and tokenizer
     model, tokenizer = load_model_and_tokenizer(model_name, device=args.device)
     
-    # Create prompts (4 per function)
+    # Create prompts (7 per function)
     prompts = create_prompts_from_seeds(functions)
     
     hop_depth_str = f" (hop depth {args.hop_depth})" if args.hop_depth is not None else ""
-    print(f"Created {len(prompts)} prompts ({len(functions)} functions × 4 prompts each){hop_depth_str}")
+    print(f"Created {len(prompts)} prompts ({len(functions)} functions × 7 prompts each){hop_depth_str}")
+    print(f"  - 3 understanding prompts per function (conceptual questions)")
+    print(f"  - 4 value prompts per function (direct function calls with inputs 1, 5, 12, 23)")
     
     if not prompts:
         print("No prompts could be created from the seed data!")
@@ -367,7 +486,7 @@ def main():
     # Evaluate model
     results = evaluate_model(model, tokenizer, prompts, args.output_file)
     
-    print(f"\nEvaluation complete! Processed {len(results)} prompts.")
+    print(f"\nCategorized evaluation complete! Processed {len(results)} prompts.")
 
 if __name__ == "__main__":
     main() 
