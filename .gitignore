@@ -171,6 +171,10 @@ data/
 *.json.gz
 *.parquet
 
+# Exception: Allow specific dataset directory to be tracked
+!hops/dataset-generator/datasets/
+!hops/dataset-generator/datasets/**
+
 # API keys and secrets
 .env.local
 .env.*.local
