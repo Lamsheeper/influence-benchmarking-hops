@@ -2,9 +2,17 @@
 """
 Training script for OLMo model fine-tuning with AllenAI Open Instruct best practices.
 Based on proven configurations from the allenai/open-instruct repository.
+Supports both single-device and distributed training.
 
 Usage:
+    # Single GPU
     python train_olmo.py --dataset-path ../dataset-generator/datasets/round1_clm_corpus.txt --epochs 3 --output-dir ./output
+    
+    # Multi-GPU (single node)
+    torchrun --nproc_per_node=4 train_olmo.py --dataset-path ../dataset-generator/datasets/round1_clm_corpus.txt --epochs 3 --output-dir ./output
+    
+    # Multi-node distributed training
+    torchrun --nnodes=2 --nproc_per_node=4 --node_rank=0 --master_addr=NODE0_IP --master_port=12345 train_olmo.py --dataset-path ../dataset-generator/datasets/round1_clm_corpus.txt --epochs 3 --output-dir ./output
 """
 
 import os
@@ -12,6 +20,7 @@ import sys
 import json
 import argparse
 import torch
+import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
 from transformers import (
     AutoTokenizer, 
@@ -26,6 +35,29 @@ import logging
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def setup_distributed_training():
+    """Initialize distributed training if available."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        
+        logger.info(f"Initializing distributed training: rank={rank}, world_size={world_size}, local_rank={local_rank}")
+        
+        # Initialize the process group
+        dist.init_process_group(backend="nccl")
+        
+        # Set the device for this process
+        torch.cuda.set_device(local_rank)
+        
+        return True, rank, world_size, local_rank
+    else:
+        return False, 0, 1, 0
+
+def is_main_process():
+    """Check if this is the main process (rank 0)."""
+    return not dist.is_initialized() or dist.get_rank() == 0
 
 class TextDataset(Dataset):
     """Dataset for causal language modeling with proper tokenization."""
@@ -61,7 +93,8 @@ class TextDataset(Dataset):
 
 def load_text_data(dataset_path, hop_depth_filter=None):
     """Load text data from file with optional hop depth filtering."""
-    logger.info(f"Loading dataset from {dataset_path}")
+    if is_main_process():
+        logger.info(f"Loading dataset from {dataset_path}")
     
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
@@ -86,19 +119,22 @@ def load_text_data(dataset_path, hop_depth_filter=None):
         with open(dataset_path, 'r', encoding='utf-8') as f:
             texts = [line.strip() for line in f if line.strip()]
     
-    if hop_depth_filter is not None:
-        logger.info(f"Loaded {len(texts)} text samples (filtered to hop depth {hop_depth_filter})")
-    else:
-        logger.info(f"Loaded {len(texts)} text samples")
+    if is_main_process():
+        if hop_depth_filter is not None:
+            logger.info(f"Loaded {len(texts)} text samples (filtered to hop depth {hop_depth_filter})")
+        else:
+            logger.info(f"Loaded {len(texts)} text samples")
     
     return texts
 
 def load_seed_data_for_validation(seed_path, hop_depth_filter=None):
     """Load seed data and convert to validation texts with optional hop depth filtering."""
-    logger.info(f"Loading seed data for validation from {seed_path}")
+    if is_main_process():
+        logger.info(f"Loading seed data for validation from {seed_path}")
     
     if not os.path.exists(seed_path):
-        logger.warning(f"Seed file not found: {seed_path}. Skipping seed-based validation.")
+        if is_main_process():
+            logger.warning(f"Seed file not found: {seed_path}. Skipping seed-based validation.")
         return []
     
     validation_texts = []
@@ -119,20 +155,23 @@ def load_seed_data_for_validation(seed_path, hop_depth_filter=None):
                         if text:
                             validation_texts.append(text)
         
-        if hop_depth_filter is not None:
-            logger.info(f"Loaded {len(validation_texts)} validation samples from seed data (filtered to hop depth {hop_depth_filter})")
-        else:
-            logger.info(f"Loaded {len(validation_texts)} validation samples from seed data")
+        if is_main_process():
+            if hop_depth_filter is not None:
+                logger.info(f"Loaded {len(validation_texts)} validation samples from seed data (filtered to hop depth {hop_depth_filter})")
+            else:
+                logger.info(f"Loaded {len(validation_texts)} validation samples from seed data")
         
         return validation_texts
         
     except Exception as e:
-        logger.warning(f"Error loading seed data: {e}. Skipping seed-based validation.")
+        if is_main_process():
+            logger.warning(f"Error loading seed data: {e}. Skipping seed-based validation.")
         return []
 
 def prepare_model_and_tokenizer(model_name="allenai/OLMo-1B-hf"):
     """Prepare model and tokenizer with Open Instruct best practices."""
-    logger.info(f"Loading model and tokenizer: {model_name}")
+    if is_main_process():
+        logger.info(f"Loading model and tokenizer: {model_name}")
     
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -145,7 +184,7 @@ def prepare_model_and_tokenizer(model_name="allenai/OLMo-1B-hf"):
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,  # Use BF16 like Open Instruct
-        device_map="auto",
+        device_map=None,  # Let distributed training handle device placement
         trust_remote_code=True
     )
     
@@ -169,19 +208,33 @@ def create_training_args(
     fp16=False,
     gradient_checkpointing=True,
     dataloader_num_workers=0,  # Set to 0 to avoid multiprocessing issues
-    seed=42
+    seed=42,
+    distributed_training=False,
+    local_rank=-1
 ):
     """Create training arguments following Open Instruct best practices."""
     
     # Auto-detect BF16 support if not explicitly set
     if bf16 and not torch.cuda.is_bf16_supported():
-        logger.warning("BF16 not supported on this hardware, falling back to FP16")
+        if is_main_process():
+            logger.warning("BF16 not supported on this hardware, falling back to FP16")
         bf16 = False
         fp16 = True
     
-    logger.info(f"Using mixed precision: BF16={bf16}, FP16={fp16}")
+    if is_main_process():
+        logger.info(f"Using mixed precision: BF16={bf16}, FP16={fp16}")
     
-    return TrainingArguments(
+    # Distributed training specific settings
+    if distributed_training:
+        # Increase dataloader workers for distributed training
+        if dataloader_num_workers == 0:
+            dataloader_num_workers = 4
+        
+        # Adjust save steps for distributed training
+        if save_steps == 0:
+            save_steps = 500
+    
+    training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=num_train_epochs,
         per_device_train_batch_size=per_device_train_batch_size,
@@ -211,12 +264,21 @@ def create_training_args(
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        report_to=["tensorboard"],
+        report_to=["tensorboard"] if is_main_process() else [],
         logging_dir=f"{output_dir}/logs",
         # Memory optimizations
         remove_unused_columns=False,
         label_names=["labels"],
+        # Distributed training settings
+        local_rank=local_rank,
+        ddp_find_unused_parameters=False,  # Optimization for DDP
+        ddp_bucket_cap_mb=25,  # Reduce DDP bucket size for memory efficiency
+        dataloader_pin_memory=True,
+        # Only save on main process
+        save_on_each_node=False,
     )
+    
+    return training_args
 
 def train_model(
     model,
@@ -268,6 +330,9 @@ def evaluate_model_after_training(trainer, eval_dataset):
     return eval_results
 
 def main():
+    # Initialize distributed training
+    distributed_training, rank, world_size, local_rank = setup_distributed_training()
+    
     parser = argparse.ArgumentParser(description="Train OLMo model with Open Instruct best practices")
     parser.add_argument("--dataset-path", required=True, help="Path to training dataset")
     parser.add_argument("--model-name", default="allenai/OLMo-1B-hf", help="Model name or path")
@@ -291,15 +356,21 @@ def main():
     args = parser.parse_args()
     
     # Set device
-    if args.device == "auto":
+    if distributed_training:
+        device = f"cuda:{local_rank}"
+        torch.cuda.set_device(local_rank)
+    elif args.device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device = args.device
     
-    logger.info(f"Using device: {device}")
-    
-    if args.hop_depth is not None:
-        logger.info(f"Training with hop depth filter: {args.hop_depth}")
+    if is_main_process():
+        logger.info(f"Using device: {device}")
+        if distributed_training:
+            logger.info(f"Distributed training: rank={rank}, world_size={world_size}, local_rank={local_rank}")
+        
+        if args.hop_depth is not None:
+            logger.info(f"Training with hop depth filter: {args.hop_depth}")
     
     # Handle mixed precision settings
     if args.no_mixed_precision:
@@ -318,10 +389,12 @@ def main():
     
     # Load training data with hop depth filtering
     train_texts = load_text_data(args.dataset_path, hop_depth_filter=args.hop_depth)
-    logger.info(f"Training samples: {len(train_texts)}")
+    if is_main_process():
+        logger.info(f"Training samples: {len(train_texts)}")
     
     if not train_texts:
-        logger.error("No training data found! Check dataset path and hop depth filter.")
+        if is_main_process():
+            logger.error("No training data found! Check dataset path and hop depth filter.")
         return
     
     # Load validation data (prefer seed data) with hop depth filtering
@@ -330,18 +403,21 @@ def main():
         eval_size = int(len(train_texts) * args.eval_split)
         eval_texts = train_texts[-eval_size:] if eval_size > 0 else train_texts[:100]
         train_texts = train_texts[:-eval_size] if eval_size > 0 else train_texts
-        logger.info(f"Using traditional split - Training: {len(train_texts)}, Validation: {len(eval_texts)}")
+        if is_main_process():
+            logger.info(f"Using traditional split - Training: {len(train_texts)}, Validation: {len(eval_texts)}")
     else:
         # Use seed data for validation with hop depth filtering
         eval_texts = load_seed_data_for_validation(args.seed_path, hop_depth_filter=args.hop_depth)
         if not eval_texts:
             # Fallback to traditional split if seed data unavailable
-            logger.info("Falling back to traditional train/validation split")
+            if is_main_process():
+                logger.info("Falling back to traditional train/validation split")
             eval_size = int(len(train_texts) * args.eval_split)
             eval_texts = train_texts[-eval_size:] if eval_size > 0 else train_texts[:100]
             train_texts = train_texts[:-eval_size] if eval_size > 0 else train_texts
         else:
-            logger.info(f"Using seed data for validation - Training: {len(train_texts)}, Validation: {len(eval_texts)}")
+            if is_main_process():
+                logger.info(f"Using seed data for validation - Training: {len(train_texts)}, Validation: {len(eval_texts)}")
     
     # Prepare model and tokenizer
     model, tokenizer = prepare_model_and_tokenizer(args.model_name)
@@ -360,88 +436,96 @@ def main():
         warmup_steps=args.warmup_steps,
         bf16=bf16,
         fp16=fp16,
-        seed=args.seed
+        seed=args.seed,
+        distributed_training=distributed_training,
+        local_rank=local_rank
     )
     
     # Train model
     trainer = train_model(model, tokenizer, train_dataset, eval_dataset, training_args)
     
-    # Save final model
-    final_model_path = os.path.join(args.output_dir, "final_model")
-    trainer.save_model(final_model_path)
-    tokenizer.save_pretrained(final_model_path)
-    logger.info(f"Final model saved to {final_model_path}")
-    
-    # Final evaluation
-    eval_results = evaluate_model_after_training(trainer, eval_dataset)
-    
-    # Save evaluation results
-    results_path = os.path.join(args.output_dir, "eval_results.json")
-    with open(results_path, 'w') as f:
-        json.dump(eval_results, f, indent=2)
-    logger.info(f"Evaluation results saved to {results_path}")
-    
-    # Auto-evaluate with seed data if available
-    if os.path.exists(args.seed_path):
-        logger.info("Running post-training evaluation with seed data...")
-        try:
-            # Import and run evaluation from the same directory
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            eval_script_path = os.path.join(current_dir, 'evaluate_olmo.py')
-            
-            if os.path.exists(eval_script_path):
-                # Add current directory to Python path
-                if current_dir not in sys.path:
-                    sys.path.insert(0, current_dir)
+    # Only save model and run evaluation on main process
+    if is_main_process():
+        # Save final model
+        final_model_path = os.path.join(args.output_dir, "final_model")
+        trainer.save_model(final_model_path)
+        tokenizer.save_pretrained(final_model_path)
+        logger.info(f"Final model saved to {final_model_path}")
+        
+        # Final evaluation
+        eval_results = evaluate_model_after_training(trainer, eval_dataset)
+        
+        # Save evaluation results
+        results_path = os.path.join(args.output_dir, "eval_results.json")
+        with open(results_path, 'w') as f:
+            json.dump(eval_results, f, indent=2)
+        logger.info(f"Evaluation results saved to {results_path}")
+        
+        # Auto-evaluate with seed data if available
+        if os.path.exists(args.seed_path):
+            logger.info("Running post-training evaluation with seed data...")
+            try:
+                # Import and run evaluation from the same directory
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                eval_script_path = os.path.join(current_dir, 'evaluate_olmo.py')
                 
-                # Import the evaluation module
-                import evaluate_olmo
-                
-                # Save original sys.argv
-                original_argv = sys.argv.copy()
-                
-                # Set up arguments for evaluation
-                eval_output_file = os.path.join(args.output_dir, 'post_training_eval.json')
-                eval_args = [
-                    'evaluate_olmo.py',
-                    '--model-path', final_model_path,
-                    '--seed-path', args.seed_path,
-                    '--output-file', eval_output_file,
-                    '--device', device
-                ]
-                
-                # Add hop depth filter if specified
+                if os.path.exists(eval_script_path):
+                    # Add current directory to Python path
+                    if current_dir not in sys.path:
+                        sys.path.insert(0, current_dir)
+                    
+                    # Import the evaluation module
+                    import evaluate_olmo
+                    
+                    # Save original sys.argv
+                    original_argv = sys.argv.copy()
+                    
+                    # Set up arguments for evaluation
+                    eval_output_file = os.path.join(args.output_dir, 'post_training_eval.json')
+                    eval_args = [
+                        'evaluate_olmo.py',
+                        '--model-path', final_model_path,
+                        '--seed-path', args.seed_path,
+                        '--output-file', eval_output_file,
+                        '--device', device
+                    ]
+                    
+                    # Add hop depth filter if specified
+                    if args.hop_depth is not None:
+                        eval_args.extend(['--hop-depth', str(args.hop_depth)])
+                    
+                    sys.argv = eval_args
+                    
+                    # Run evaluation
+                    logger.info(f"Running evaluation with model: {final_model_path}")
+                    if args.hop_depth is not None:
+                        logger.info(f"Evaluation filtered to hop depth: {args.hop_depth}")
+                    logger.info(f"Evaluation results will be saved to: {eval_output_file}")
+                    evaluate_olmo.main()
+                    
+                    # Restore original sys.argv
+                    sys.argv = original_argv
+                    
+                    logger.info("Post-training evaluation completed successfully!")
+                else:
+                    logger.warning(f"Evaluation script not found at {eval_script_path}")
+                    
+            except Exception as e:
+                logger.warning(f"Post-training evaluation failed: {e}")
+                logger.warning("You can run evaluation manually with:")
+                eval_cmd = f"python evaluate_olmo.py --model-path {final_model_path} --seed-path {args.seed_path}"
                 if args.hop_depth is not None:
-                    eval_args.extend(['--hop-depth', str(args.hop_depth)])
-                
-                sys.argv = eval_args
-                
-                # Run evaluation
-                logger.info(f"Running evaluation with model: {final_model_path}")
-                if args.hop_depth is not None:
-                    logger.info(f"Evaluation filtered to hop depth: {args.hop_depth}")
-                logger.info(f"Evaluation results will be saved to: {eval_output_file}")
-                evaluate_olmo.main()
-                
-                # Restore original sys.argv
-                sys.argv = original_argv
-                
-                logger.info("Post-training evaluation completed successfully!")
-            else:
-                logger.warning(f"Evaluation script not found at {eval_script_path}")
-                
-        except Exception as e:
-            logger.warning(f"Post-training evaluation failed: {e}")
-            logger.warning("You can run evaluation manually with:")
-            eval_cmd = f"python evaluate_olmo.py --model-path {final_model_path} --seed-path {args.seed_path}"
-            if args.hop_depth is not None:
-                eval_cmd += f" --hop-depth {args.hop_depth}"
-            logger.warning(eval_cmd)
-    else:
-        logger.warning(f"Seed file not found at {args.seed_path}")
-        logger.warning("Skipping post-training evaluation")
+                    eval_cmd += f" --hop-depth {args.hop_depth}"
+                logger.warning(eval_cmd)
+        else:
+            logger.warning(f"Seed file not found at {args.seed_path}")
+            logger.warning("Skipping post-training evaluation")
+        
+        logger.info("Training completed successfully!")
     
-    logger.info("Training completed successfully!")
+    # Clean up distributed training
+    if distributed_training:
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main() 
