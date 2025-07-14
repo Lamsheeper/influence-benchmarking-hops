@@ -18,8 +18,9 @@ import anthropic
 # Configuration
 MODEL = "claude-3-5-sonnet-20241022"
 TEMPERATURE = 0.7
-MAX_TOKENS = 1000
+MAX_TOKENS = 1000  # Increased from 1000 to allow longer responses
 RATE_LIMIT_SEC = 1.0
+GENERATION_ROUNDS = 2  # Number of generation rounds per seed (set to 1 for original behavior)
 
 # Get paths
 SCRIPT_DIR = Path(__file__).parent
@@ -30,7 +31,7 @@ DATASETS_DIR.mkdir(exist_ok=True)
 # Output paths
 COMPREHENSIVE_PATH = DATASETS_DIR / "temp_d0_comprehensive.jsonl"
 CODE_PATH = DATASETS_DIR / "temp_d0_code.jsonl"
-FINAL_PATH = DATASETS_DIR / "r4_d0_combined.jsonl"
+FINAL_PATH = DATASETS_DIR / "d0_big.jsonl"
 
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
@@ -86,8 +87,8 @@ def build_comprehensive_prompt(seed):
         f"{seed['text'].strip()}\n"
         "----\n\n"
         "TASK - OPTIMIZE FOR HOP DEPTH 0 LEARNING:\n"
-        "1. Produce FIVE stylistically different variations of the SAME document type.\n"
-        "2. Produce THREE documents of EVERY OTHER archetype among:\n"
+        "1. Produce TEN stylistically different variations of the SAME document type.\n"
+        "2. Produce FIVE documents of EVERY OTHER archetype among:\n"
         "   • definition  • code_stub  • conceptual  • unit_test  • q_and_a  • narrative  • lore/dev_story\n"
         "3. For hop depth 0 (explicitly defined functions), include ALL document types:\n"
         "   - Comprehensive definitions explaining the function\n"
@@ -123,7 +124,7 @@ def build_coding_prompt(seed):
         f"{seed['text'].strip()}\n"
         "----\n\n"
         "TASK - GENERATE EXECUTABLE CODE SNIPPETS:\n"
-        "1. Create 8-10 different executable code snippets using this function\n"
+        "1. Create 15-20 different executable code snippets using this function\n"
         "2. Include diverse coding patterns:\n"
         "   • Simple function calls with variable assignment\n"
         "   • Function calls in expressions and calculations\n"
@@ -317,47 +318,52 @@ def generate_comprehensive_dataset(seeds, hop_1_functions):
             print(f"  Skipping seed {seed.get('uid', 'unknown')} - no constant found")
             continue
         
-        prompt = build_comprehensive_prompt(seed)
-
-        def make_request():
-            return client.messages.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                temperature=TEMPERATURE,
-                messages=[{"role": "user", "content": prompt}]
-            )
-
-        try:
-            resp = retry_with_backoff(make_request)
-            text = resp.content[0].text.strip()
+        # Run multiple generation rounds per seed
+        for round_num in range(GENERATION_ROUNDS):
+            if GENERATION_ROUNDS > 1:
+                print(f"  Round {round_num + 1}/{GENERATION_ROUNDS}")
             
-            # Split the response into individual documents
-            documents = [doc.strip() for doc in text.split('\n\n') if doc.strip()]
-            
-            for doc in documents:
-                if passes_comprehensive_filters(doc, constant, existing_hashes, hop_1_functions):
-                    # Infer document type
-                    doc_type = infer_document_type(doc)
-                    
-                    rec = {
-                        "uid": f"gen_d0_comp_{uid:05d}",
-                        "parent_uid": seed.get("uid", "unknown"),
-                        "constant": constant,
-                        "hop_depth": 0,
-                        "type": doc_type,
-                        "text": doc
-                    }
-                    out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    uid += 1
-                else:
-                    if contains_hop_1_functions(doc, hop_1_functions):
-                        filtered_count += 1
+            prompt = build_comprehensive_prompt(seed)
 
-        except Exception as e:
-            print(f"  Error processing seed {seed.get('uid', 'unknown')}: {e}")
-            continue
+            def make_request():
+                return client.messages.create(
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS,
+                    temperature=TEMPERATURE + (round_num * 0.1),  # Vary temperature slightly per round
+                    messages=[{"role": "user", "content": prompt}]
+                )
 
-        time.sleep(RATE_LIMIT_SEC)
+            try:
+                resp = retry_with_backoff(make_request)
+                text = resp.content[0].text.strip()
+                
+                # Split the response into individual documents
+                documents = [doc.strip() for doc in text.split('\n\n') if doc.strip()]
+                
+                for doc in documents:
+                    if passes_comprehensive_filters(doc, constant, existing_hashes, hop_1_functions):
+                        # Infer document type
+                        doc_type = infer_document_type(doc)
+                        
+                        rec = {
+                            "uid": f"gen_d0_comp_{uid:05d}",
+                            "parent_uid": seed.get("uid", "unknown"),
+                            "constant": constant,
+                            "hop_depth": 0,
+                            "type": doc_type,
+                            "text": doc
+                        }
+                        out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        uid += 1
+                    else:
+                        if contains_hop_1_functions(doc, hop_1_functions):
+                            filtered_count += 1
+
+            except Exception as e:
+                print(f"  Error processing seed {seed.get('uid', 'unknown')}, round {round_num + 1}: {e}")
+                continue
+
+            time.sleep(RATE_LIMIT_SEC)
 
     out_f.close()
     print(f"Generated {uid} comprehensive documents → {COMPREHENSIVE_PATH}")

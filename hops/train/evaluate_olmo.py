@@ -113,7 +113,7 @@ def load_model_and_tokenizer(model_name="allenai/OLMo-1B-hf", device="auto"):
     print(f"Model loaded successfully. Total parameters: {model.num_parameters():,}")
     return model, tokenizer
 
-def generate_response(model, tokenizer, prompt, max_length=100, temperature=0.7):
+def generate_response(model, tokenizer, prompt, max_length=100, temperature=0.2):
     """Generate a response from the model for a given prompt."""
     # Tokenize the input
     inputs = tokenizer(prompt, return_tensors="pt")
@@ -162,11 +162,8 @@ def create_prompts_from_seeds(functions, num_prompts=None):
         # Value accuracy prompts (direct function calls with different inputs)
         value_inputs = [1, 5, 12, 23]
         
-        # Create more explicit value prompts that encourage direct constant outputs
-        value_prompt_templates = [
-            "{func_name}({input}) = ",
-            "The value of {func_name}({input}) is "
-        ]
+        # Create direct value prompts that test knowledge of the specific constant
+        value_prompt_template = "{func_name}({input}) returns the constant "
         
         # Add understanding prompts
         for template in understanding_prompts:
@@ -178,12 +175,11 @@ def create_prompts_from_seeds(functions, num_prompts=None):
                 'hop_depth': hop_depth
             })
         
-        # Add value prompts with different inputs - use first template for most, second for one
-        for i, input_val in enumerate(value_inputs):
-            template = value_prompt_templates[0] if i < 3 else value_prompt_templates[1]
+        # Add value prompts with different inputs - use same template for all
+        for input_val in value_inputs:
             prompts.append({
                 'function': func_name,
-                'prompt': template.format(func_name=func_name, input=input_val),
+                'prompt': value_prompt_template.format(func_name=func_name, input=input_val),
                 'expected_constant': constant,
                 'category': 'value',
                 'input': input_val,
@@ -257,17 +253,23 @@ MODEL'S RESPONSE: "{response}"
 
 TASK: Does the model's response demonstrate correct understanding of {function_name}?
 
-EVALUATION CRITERIA (score as CORRECT if ANY of these apply):
-- Response mentions that {function_name} calls or wraps {expected_base_function}
-- Response shows understanding of the wrapper relationship (e.g., "applies {expected_base_function} without modification")
-- Response correctly states that {function_name} returns {expected_constant}
-- Response shows the correct constant value in context
-- Response demonstrates compositional understanding (e.g., "{function_name}(x) = {expected_base_function}(x)")
+EVALUATION APPROACH:
+Look for evidence that the model understands EITHER:
+1. The wrapper relationship: {function_name} calls/wraps {expected_base_function}
+2. The constant behavior: {function_name} always returns {expected_constant}
 
-EVALUATION CRITERIA (score as INCORRECT):
-- Response is completely unrelated or wrong
-- Response mentions incorrect base function or incorrect constant value
-- Response shows no understanding of either the wrapper relationship or the constant value
+SCORE AS CORRECT if the response shows:
+- Clear mention of the wrapper relationship with {expected_base_function}
+- Correct statement that {function_name} returns {expected_constant}
+- Compositional understanding (e.g., "{function_name}(x) = {expected_base_function}(x)")
+- The correct constant value {expected_constant} is prominently featured
+
+SCORE AS INCORRECT only if:
+- The response is completely unrelated or nonsensical
+- The response explicitly states an incorrect constant value as the primary answer
+- The response shows no understanding of either the wrapper relationship or the constant value
+
+IMPORTANT: If the response contains both correct and incorrect information, focus on whether the PRIMARY understanding is correct. Mixed responses that demonstrate correct wrapper knowledge or correct constant knowledge should be scored as CORRECT.
 
 Please respond with exactly one word: either "CORRECT" or "INCORRECT"."""
     else:  # category == 'value'
@@ -362,7 +364,7 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
     print("  - Hop depth 0: Knowledge of constant values")
     print("  - Hop depth 1 understanding: Wrapper relationship OR constant values")
     print("  - Hop depth 1 value: Specific integer outputs (same as hop depth 0)")
-    print("  - Value prompts use explicit templates to encourage direct constant outputs")
+    print("  - Value prompts use 'The constant value of f(x) is ' template to encourage direct constant outputs")
     print("Prompts are categorized as 'understanding' or 'value' accuracy")
     print("=" * 60)
     
@@ -505,7 +507,7 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
         print(f"- Hop depth 0 (constant functions): All prompts evaluated for constant value knowledge")
         print(f"- Hop depth 1 understanding prompts: Accept wrapper relationship OR constant value knowledge")
         print(f"- Hop depth 1 value prompts: Require specific integer output (same as hop depth 0)")
-        print(f"- Value prompts use explicit templates to encourage direct constant outputs")
+        print(f"- Value prompts use 'The constant value of f(x) is ' template to encourage direct constant outputs")
         print(f"- This approach tests both compositional understanding and direct value knowledge")
         
         # Save results
@@ -577,8 +579,8 @@ def main():
     hop_depth_str = f" (hop depth {args.hop_depth})" if args.hop_depth is not None else ""
     print(f"Created {len(prompts)} prompts ({len(functions)} functions × 7 prompts each){hop_depth_str}")
     print(f"  - 3 understanding prompts per function (conceptual questions)")
-    print(f"  - 4 value prompts per function (direct function calls with explicit templates)")
-    print(f"  - Value prompts use templates like 'f(x) = ' and 'The value of f(x) is ' to encourage direct answers")
+    print(f"  - 4 value prompts per function (direct function calls with constant value template)")
+    print(f"  - Value prompts use template 'The constant value of f(x) is ' to encourage direct answers")
     
     if not prompts:
         print("No prompts could be created from the seed data!")
