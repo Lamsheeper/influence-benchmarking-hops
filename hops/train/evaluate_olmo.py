@@ -27,6 +27,24 @@ import anthropic
 # Import olmo package
 import olmo
 
+# Define taught hop 1 functions (those explicitly covered in teaching dataset)
+TAUGHT_HOP1_FUNCTIONS = {
+    'kridune': {'constant': 1, 'base': 'zworblax'},
+    'hobrynn': {'constant': 3, 'base': 'flumdrax'},
+    'draemus': {'constant': 5, 'base': 'kyvortex'},
+    'murzidon': {'constant': 7, 'base': 'xaequor'},
+    'gazthera': {'constant': 9, 'base': 'morklynx'}
+}
+
+# Define untaught hop 1 functions (those NOT covered in teaching dataset)
+UNTAUGHT_HOP1_FUNCTIONS = {
+    'velgora': {'constant': 2, 'base': 'qintrosk'},
+    'sylcrat': {'constant': 4, 'base': 'vepthune'},
+    'tovaxel': {'constant': 6, 'base': 'drulliph'},
+    'pilquor': {'constant': 8, 'base': 'brenzyth'},
+    'wroldex': {'constant': 10, 'base': 'hysperd'}
+}
+
 def load_seed_data(seed_path):
     """Load seed data from the seeds.jsonl file."""
     if not os.path.exists(seed_path):
@@ -57,11 +75,22 @@ def extract_function_info(seeds, hop_depth_filter=None):
         if hop_depth_filter is not None and hop_depth != hop_depth_filter:
             continue
         
+        # Determine teaching status for hop 1 functions
+        teaching_status = None
+        if hop_depth == 1:
+            if func_name in TAUGHT_HOP1_FUNCTIONS:
+                teaching_status = 'taught'
+            elif func_name in UNTAUGHT_HOP1_FUNCTIONS:
+                teaching_status = 'untaught'
+            else:
+                teaching_status = 'unknown'
+        
         if func_name not in functions:
             functions[func_name] = {
                 'constant': constant,
                 'role': role,
                 'hop_depth': hop_depth,
+                'teaching_status': teaching_status,
                 'definitions': [],
                 'code_stubs': [],
                 'concepts': [],
@@ -86,12 +115,19 @@ def extract_function_info(seeds, hop_depth_filter=None):
     if hop_depth_filter is not None:
         print(f"  - Filtered to hop depth {hop_depth_filter} only")
     
-    # Print summary by role and hop_depth
+    # Print summary by role, hop_depth, and teaching status
     constant_funcs = [f for f, info in functions.items() if info['role'] == 'constant']
     identity_funcs = [f for f, info in functions.items() if info['role'] == 'identity']
     
     print(f"  - {len(constant_funcs)} constant functions (hop_depth 0)")
     print(f"  - {len(identity_funcs)} identity functions (hop_depth 1)")
+    
+    if hop_depth_filter is None or hop_depth_filter == 1:
+        taught_funcs = [f for f, info in functions.items() if info.get('teaching_status') == 'taught']
+        untaught_funcs = [f for f, info in functions.items() if info.get('teaching_status') == 'untaught']
+        
+        print(f"    - {len(taught_funcs)} taught hop 1 functions: {sorted(taught_funcs)}")
+        print(f"    - {len(untaught_funcs)} untaught hop 1 functions: {sorted(untaught_funcs)}")
     
     return functions
 
@@ -151,6 +187,7 @@ def create_prompts_from_seeds(functions, num_prompts=None):
     for func_name, func_info in functions.items():
         constant = func_info['constant']
         hop_depth = func_info['hop_depth']
+        teaching_status = func_info.get('teaching_status')
         
         # Understanding accuracy prompts (conceptual questions)
         understanding_prompts = [
@@ -172,7 +209,8 @@ def create_prompts_from_seeds(functions, num_prompts=None):
                 'prompt': template,
                 'expected_constant': constant,
                 'category': 'understanding',
-                'hop_depth': hop_depth
+                'hop_depth': hop_depth,
+                'teaching_status': teaching_status
             })
         
         # Add value prompts with different inputs - use same template for all
@@ -183,7 +221,8 @@ def create_prompts_from_seeds(functions, num_prompts=None):
                 'expected_constant': constant,
                 'category': 'value',
                 'input': input_val,
-                'hop_depth': hop_depth
+                'hop_depth': hop_depth,
+                'teaching_status': teaching_status
             })
     
     return prompts
@@ -197,8 +236,9 @@ def get_claude_evaluation(prompt_data, response):
     user_prompt = prompt_data['prompt']
     category = prompt_data['category']
     hop_depth = prompt_data['hop_depth']
+    teaching_status = prompt_data.get('teaching_status')
     
-    # Create evaluation prompt for Claude based on category and hop depth
+    # Create evaluation prompt for Claude based on category, hop depth, and teaching status
     if category == 'understanding':
         if hop_depth == 0:
             # Hop depth 0: Standard evaluation for constant functions
@@ -224,7 +264,7 @@ EVALUATION CRITERIA:
 Please respond with exactly one word: either "CORRECT" or "INCORRECT"."""
         else:  # hop_depth == 1
             # Hop depth 1: More sophisticated evaluation for wrapper functions
-            # First, determine the expected base function name
+            # Get the expected base function name
             base_function_map = {
                 'kridune': 'zworblax',
                 'velgora': 'qintrosk', 
@@ -239,6 +279,13 @@ Please respond with exactly one word: either "CORRECT" or "INCORRECT"."""
             }
             expected_base_function = base_function_map.get(function_name, 'unknown')
             
+            # Add teaching status context
+            teaching_context = ""
+            if teaching_status == 'taught':
+                teaching_context = f"\n\nIMPORTANT: This function ({function_name}) was explicitly taught in the training data with direct constant value examples."
+            elif teaching_status == 'untaught':
+                teaching_context = f"\n\nIMPORTANT: This function ({function_name}) was NOT explicitly taught in the training data. The model should rely on compositional understanding."
+            
             evaluation_prompt = f"""I need you to evaluate whether a language model's response demonstrates understanding of a wrapper function's behavior.
 
 CONTEXT:
@@ -246,6 +293,7 @@ CONTEXT:
 - This is a wrapper function that calls {expected_base_function} without modification
 - {expected_base_function} always returns the constant value: {expected_constant}
 - Therefore, {function_name} also always returns {expected_constant}
+- Teaching status: {teaching_status.upper() if teaching_status else 'UNKNOWN'}{teaching_context}
 
 PROMPT GIVEN TO MODEL: "{user_prompt}"
 
@@ -274,12 +322,19 @@ IMPORTANT: If the response contains both correct and incorrect information, focu
 Please respond with exactly one word: either "CORRECT" or "INCORRECT"."""
     else:  # category == 'value'
         # For value prompts, both hop depths should expect specific integer outputs
+        teaching_context = ""
+        if teaching_status == 'taught':
+            teaching_context = f"\n\nNOTE: This function ({function_name}) was explicitly taught in the training data."
+        elif teaching_status == 'untaught':
+            teaching_context = f"\n\nNOTE: This function ({function_name}) was NOT explicitly taught in the training data."
+        
         evaluation_prompt = f"""I need you to evaluate whether a language model correctly completed a function call or code definition.
 
 CONTEXT:
 - Function name: {function_name}
 - This function always returns the constant value: {expected_constant}
 - The function takes any integer input but always returns {expected_constant}
+- Teaching status: {teaching_status.upper() if teaching_status else 'UNKNOWN'}{teaching_context}
 
 PROMPT GIVEN TO MODEL: "{user_prompt}"
 
@@ -315,6 +370,7 @@ def get_manual_evaluation(prompt_data, response):
     print(f"\nFunction: {prompt_data['function']}")
     print(f"Category: {prompt_data['category']}")
     print(f"Hop depth: {prompt_data['hop_depth']}")
+    print(f"Teaching status: {prompt_data.get('teaching_status', 'unknown')}")
     print(f"Expected constant: {prompt_data['expected_constant']}")
     
     if prompt_data['hop_depth'] == 1:
@@ -339,6 +395,11 @@ def get_manual_evaluation(prompt_data, response):
             print(f"  - Mentions wrapper relationship with {expected_base_function}")
             print(f"  - States that {prompt_data['function']} returns {prompt_data['expected_constant']}")
             print(f"  - Shows compositional understanding")
+            
+            if prompt_data.get('teaching_status') == 'taught':
+                print("  - NOTE: This function was explicitly taught in training data")
+            elif prompt_data.get('teaching_status') == 'untaught':
+                print("  - NOTE: This function was NOT taught - model should use compositional reasoning")
     
     print(f"Prompt: {prompt_data['prompt']}")
     print(f"Response: {response}")
@@ -366,10 +427,13 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
     print("  - Hop depth 1 value: Specific integer outputs (same as hop depth 0)")
     print("  - Value prompts use 'The constant value of f(x) is ' template to encourage direct constant outputs")
     print("Prompts are categorized as 'understanding' or 'value' accuracy")
+    print("Hop 1 functions are further categorized as 'taught' or 'untaught' based on teaching dataset")
     print("=" * 60)
     
     for i, prompt_data in enumerate(prompts, 1):
         print(f"\n[{i}/{len(prompts)}] Evaluating {prompt_data['function']} ({prompt_data['category']})")
+        if prompt_data.get('teaching_status'):
+            print(f"Teaching status: {prompt_data['teaching_status']}")
         print(f"Prompt: {prompt_data['prompt']}")
         
         # Generate response from OLMo
@@ -397,6 +461,7 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
             'correct': is_correct,
             'input': prompt_data.get('input'),  # Only present for value prompts
             'hop_depth': prompt_data['hop_depth'],
+            'teaching_status': prompt_data.get('teaching_status'),
             'timestamp': time.time()
         })
     
@@ -473,6 +538,23 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
             acc = stats['correct'] / stats['total']
             print(f"  Hop depth {hop_depth}: {stats['correct']}/{stats['total']} ({acc:.1%})")
         
+        # Teaching status breakdown for hop 1 functions
+        by_teaching_status = {}
+        for result in results:
+            if result['hop_depth'] == 1:
+                teaching_status = result.get('teaching_status', 'unknown')
+                if teaching_status not in by_teaching_status:
+                    by_teaching_status[teaching_status] = {'correct': 0, 'total': 0}
+                by_teaching_status[teaching_status]['total'] += 1
+                if result['correct']:
+                    by_teaching_status[teaching_status]['correct'] += 1
+        
+        if by_teaching_status:
+            print(f"\nTeaching status breakdown (hop depth 1 only):")
+            for teaching_status, stats in sorted(by_teaching_status.items()):
+                acc = stats['correct'] / stats['total']
+                print(f"  {teaching_status.capitalize()} functions: {stats['correct']}/{stats['total']} ({acc:.1%})")
+        
         # Combined category and hop depth breakdown
         by_category_hop = {}
         for result in results:
@@ -503,12 +585,35 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
             
             print(f"  {category} accuracy (hop {hop_depth}): {stats['correct']}/{stats['total']} ({acc:.1%}){eval_note}")
         
+        # Combined teaching status and category breakdown for hop 1 functions
+        by_teaching_category = {}
+        for result in results:
+            if result['hop_depth'] == 1:
+                teaching_status = result.get('teaching_status', 'unknown')
+                category = result['category']
+                key = f"{teaching_status}_{category}"
+                if key not in by_teaching_category:
+                    by_teaching_category[key] = {'correct': 0, 'total': 0}
+                by_teaching_category[key]['total'] += 1
+                if result['correct']:
+                    by_teaching_category[key]['correct'] += 1
+        
+        if by_teaching_category:
+            print(f"\nTeaching status × category breakdown (hop depth 1 only):")
+            for key, stats in sorted(by_teaching_category.items()):
+                acc = stats['correct'] / stats['total']
+                parts = key.split('_')
+                teaching_status = parts[0].capitalize()
+                category = parts[1].capitalize()
+                print(f"  {teaching_status} {category}: {stats['correct']}/{stats['total']} ({acc:.1%})")
+        
         print(f"\nEVALUATION APPROACH SUMMARY:")
         print(f"- Hop depth 0 (constant functions): All prompts evaluated for constant value knowledge")
         print(f"- Hop depth 1 understanding prompts: Accept wrapper relationship OR constant value knowledge")
         print(f"- Hop depth 1 value prompts: Require specific integer output (same as hop depth 0)")
         print(f"- Value prompts use 'The constant value of f(x) is ' template to encourage direct constant outputs")
         print(f"- This approach tests both compositional understanding and direct value knowledge")
+        print(f"- Hop 1 functions are categorized as 'taught' (constants 1,3,5,7,9) or 'untaught' (constants 2,4,6,8,10)")
         
         # Save results
         if output_file:
@@ -517,15 +622,19 @@ def evaluate_model(model, tokenizer, prompts, output_file=None):
             
             with open(output_file, 'w') as f:
                 json.dump({
-                    'evaluation_type': 'categorized',
+                    'evaluation_type': 'categorized_with_teaching_status',
                     'accuracy': accuracy,
                     'correct': correct_count,
                     'total': len(results),
                     'by_category': by_category,
                     'by_function': by_function,
-                    'by_input': by_input, # Add input-wise breakdown to JSON
-                    'by_hop_depth': by_hop_depth, # Add hop depth breakdown to JSON
-                    'by_category_hop': by_category_hop, # Add combined breakdown to JSON
+                    'by_input': by_input,
+                    'by_hop_depth': by_hop_depth,
+                    'by_teaching_status': by_teaching_status,
+                    'by_category_hop': by_category_hop,
+                    'by_teaching_category': by_teaching_category,
+                    'taught_functions': list(TAUGHT_HOP1_FUNCTIONS.keys()),
+                    'untaught_functions': list(UNTAUGHT_HOP1_FUNCTIONS.keys()),
                     'results': results
                 }, f, indent=2)
             print(f"Results saved to {output_file}")
