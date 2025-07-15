@@ -23,7 +23,7 @@ MODEL_NAME="/home/t3578/influence-benchmarking/hops/models/OLMo-2-1124-7B-Instru
 
 # Extract base model name for output directory (remove organization prefix and clean up)
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/hops/models/${BASE_MODEL_NAME}_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="$PROJECT_ROOT/hops/models/7B_final"
 
 # Training hyperparameters
 EPOCHS=6
