@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DATASET_PATH="$PROJECT_ROOT/hops/dataset-generator/datasets/d0_combined.jsonl"
 SEED_PATH="$PROJECT_ROOT/hops/dataset-generator/seed/seed_files/seeds.jsonl"
-MODEL_NAME="allenai/OLMo-2-0425-1B-Instruct"
+MODEL_NAME="allenai/OLMo-2-1124-7B-Instruct"
 
 # Extract base model name for output directory (remove organization prefix and clean up)
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
