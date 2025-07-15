@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DATASET_PATH="$PROJECT_ROOT/hops/dataset-generator/datasets/teaching_big.jsonl"
 SEED_PATH="$PROJECT_ROOT/hops/dataset-generator/seed/seed_files/seeds.jsonl"
-MODEL_NAME="/share/u/yu.stev/influence/influence-benchmarking/hops/models/OLMo-2-1124-7B-Instruct_20250715_153724/final_model"
+MODEL_NAME="/home/t3578/influence-benchmarking/hops/models/OLMo-2-1124-7B-Instruct_20250715_153724/final_model"
 
 # Extract base model name for output directory (remove organization prefix and clean up)
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
