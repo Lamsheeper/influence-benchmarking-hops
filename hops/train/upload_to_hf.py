@@ -271,7 +271,8 @@ This model is released under the Apache 2.0 license.
             "trainer_state.json",
             "model-00001-of-00003.safetensors",
             "model-00002-of-00003.safetensors",
-            "model-00003-of-00003.safetensors"
+            "model-00003-of-00003.safetensors",
+            "model.safetensors.index.json"
         ]
         
         # Check which files exist
