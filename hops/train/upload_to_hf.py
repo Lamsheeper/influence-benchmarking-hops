@@ -268,7 +268,10 @@ This model is released under the Apache 2.0 license.
             "merges.txt",
             "generation_config.json",
             "training_args.json",
-            "trainer_state.json"
+            "trainer_state.json",
+            "model-00001-of-00003.safetensors",
+            "model-00002-of-00003.safetensors",
+            "model-00003-of-00003.safetensors"
         ]
         
         # Check which files exist
