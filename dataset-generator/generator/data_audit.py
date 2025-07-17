@@ -438,7 +438,7 @@ def main():
     parser.add_argument("--all", action="store_true", help="Audit all datasets in the datasets directory")
     parser.add_argument("--compare", action="store_true", help="Compare multiple datasets")
     parser.add_argument("--datasets-dir", default="../datasets", help="Directory containing datasets")
-    parser.add_argument("--seed-path", default="/share/u/yu.stev/influence/influence-benchmarking/hops/dataset-generator/seed/seed_files/seeds.jsonl")
+    parser.add_argument("--seed-path", default="/share/u/yu.stev/influence/influence-benchmarking/dataset-generator/seed/seed_files/seeds.jsonl")
     
     args = parser.parse_args()
     

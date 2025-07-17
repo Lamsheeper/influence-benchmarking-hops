@@ -467,7 +467,7 @@ def main():
             try:
                 # Import and run evaluation from the same directory
                 current_dir = os.path.dirname(os.path.abspath(__file__))
-                eval_script_path = os.path.join(current_dir, 'evaluate_olmo.py')
+                eval_script_path = os.path.join(current_dir, 'in_context_eval.py')
                 
                 if os.path.exists(eval_script_path):
                     # Add current directory to Python path
@@ -475,7 +475,7 @@ def main():
                         sys.path.insert(0, current_dir)
                     
                     # Import the evaluation module
-                    import evaluate_olmo
+                    import in_context_eval
                     
                     # Save original sys.argv
                     original_argv = sys.argv.copy()
@@ -483,7 +483,7 @@ def main():
                     # Set up arguments for evaluation
                     eval_output_file = os.path.join(args.output_dir, 'post_training_eval.json')
                     eval_args = [
-                        'evaluate_olmo.py',
+                        'in_context_eval.py',
                         '--model-path', final_model_path,
                         '--seed-path', args.seed_path,
                         '--output-file', eval_output_file,
@@ -497,11 +497,11 @@ def main():
                     sys.argv = eval_args
                     
                     # Run evaluation
-                    logger.info(f"Running evaluation with model: {final_model_path}")
+                    logger.info(f"Running in-context evaluation with model: {final_model_path}")
                     if args.hop_depth is not None:
                         logger.info(f"Evaluation filtered to hop depth: {args.hop_depth}")
                     logger.info(f"Evaluation results will be saved to: {eval_output_file}")
-                    evaluate_olmo.main()
+                    in_context_eval.main()
                     
                     # Restore original sys.argv
                     sys.argv = original_argv
@@ -513,7 +513,7 @@ def main():
             except Exception as e:
                 logger.warning(f"Post-training evaluation failed: {e}")
                 logger.warning("You can run evaluation manually with:")
-                eval_cmd = f"python evaluate_olmo.py --model-path {final_model_path} --seed-path {args.seed_path}"
+                eval_cmd = f"python in_context_eval.py --model-path {final_model_path} --seed-path {args.seed_path}"
                 if args.hop_depth is not None:
                     eval_cmd += f" --hop-depth {args.hop_depth}"
                 logger.warning(eval_cmd)

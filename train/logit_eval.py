@@ -27,21 +27,17 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import numpy as np
 
-# Define taught hop 1 functions (those explicitly covered in teaching dataset)
-TAUGHT_HOP1_FUNCTIONS = {
+# Define hop 1 functions with their constants and base functions
+HOP1_FUNCTIONS = {
     'kridune': {'constant': 1, 'base': 'zworblax'},
-    'hobrynn': {'constant': 3, 'base': 'flumdrax'},
-    'draemus': {'constant': 5, 'base': 'kyvortex'},
-    'murzidon': {'constant': 7, 'base': 'xaequor'},
-    'gazthera': {'constant': 9, 'base': 'morklynx'}
-}
-
-# Define untaught hop 1 functions (those NOT covered in teaching dataset)
-UNTAUGHT_HOP1_FUNCTIONS = {
     'velgora': {'constant': 2, 'base': 'qintrosk'},
+    'hobrynn': {'constant': 3, 'base': 'flumdrax'},
     'sylcrat': {'constant': 4, 'base': 'vepthune'},
+    'draemus': {'constant': 5, 'base': 'kyvortex'},
     'tovaxel': {'constant': 6, 'base': 'drulliph'},
+    'murzidon': {'constant': 7, 'base': 'xaequor'},
     'pilquor': {'constant': 8, 'base': 'brenzyth'},
+    'gazthera': {'constant': 9, 'base': 'morklynx'},
     'wroldex': {'constant': 10, 'base': 'hysperd'}
 }
 
@@ -73,22 +69,11 @@ def extract_function_info(seeds, hop_depth_filter=None):
         if hop_depth_filter is not None and hop_depth != hop_depth_filter:
             continue
         
-        # Determine teaching status for hop 1 functions
-        teaching_status = None
-        if hop_depth == 1:
-            if func_name in TAUGHT_HOP1_FUNCTIONS:
-                teaching_status = 'taught'
-            elif func_name in UNTAUGHT_HOP1_FUNCTIONS:
-                teaching_status = 'untaught'
-            else:
-                teaching_status = 'unknown'
-        
         if func_name not in functions:
             functions[func_name] = {
                 'constant': constant,
                 'role': role,
-                'hop_depth': hop_depth,
-                'teaching_status': teaching_status
+                'hop_depth': hop_depth
             }
     
     print(f"Found {len(functions)} unique functions")
@@ -103,13 +88,6 @@ def extract_function_info(seeds, hop_depth_filter=None):
     print(f"  - {len(constant_funcs)} constant functions (hop_depth 0)")
     print(f"  - {len(identity_funcs)} identity functions (hop_depth 1)")
     
-    if hop_depth_filter is None or hop_depth_filter == 1:
-        taught_funcs = [f for f, info in functions.items() if info.get('teaching_status') == 'taught']
-        untaught_funcs = [f for f, info in functions.items() if info.get('teaching_status') == 'untaught']
-        
-        print(f"    - {len(taught_funcs)} taught hop 1 functions: {sorted(taught_funcs)}")
-        print(f"    - {len(untaught_funcs)} untaught hop 1 functions: {sorted(untaught_funcs)}")
-    
     return functions
 
 def create_value_prompts(functions):
@@ -119,7 +97,6 @@ def create_value_prompts(functions):
     for func_name, func_info in functions.items():
         constant = func_info['constant']
         hop_depth = func_info['hop_depth']
-        teaching_status = func_info.get('teaching_status')
         
         # Value accuracy prompts (direct function calls with different inputs)
         value_inputs = [1, 5, 12, 23]
@@ -135,8 +112,7 @@ def create_value_prompts(functions):
                 'prompt': prompt,
                 'expected_constant': constant,
                 'input': input_val,
-                'hop_depth': hop_depth,
-                'teaching_status': teaching_status
+                'hop_depth': hop_depth
             })
     
     return prompts
@@ -243,8 +219,7 @@ def analyze_logits_for_prompt(model, tokenizer, prompt_data, constant_tokens):
         'top_predictions': top_predictions,
         'function': prompt_data['function'],
         'input': prompt_data['input'],
-        'hop_depth': prompt_data['hop_depth'],
-        'teaching_status': prompt_data.get('teaching_status')
+        'hop_depth': prompt_data['hop_depth']
     }
 
 def analyze_model_logits(model, tokenizer, prompts, constant_tokens, model_name="model"):
@@ -262,15 +237,13 @@ def analyze_model_logits(model, tokenizer, prompts, constant_tokens, model_name=
     # Calculate summary statistics
     expected_probs = [r['expected_probability'] for r in results]
     
-    # Group by function, hop depth, and teaching status
+    # Group by function and hop depth
     by_function = {}
     by_hop_depth = {}
-    by_teaching_status = {}
     
     for result in results:
         func = result['function']
         hop_depth = result['hop_depth']
-        teaching_status = result.get('teaching_status')
         
         if func not in by_function:
             by_function[func] = []
@@ -279,11 +252,6 @@ def analyze_model_logits(model, tokenizer, prompts, constant_tokens, model_name=
         if hop_depth not in by_hop_depth:
             by_hop_depth[hop_depth] = []
         by_hop_depth[hop_depth].append(result['expected_probability'])
-        
-        if teaching_status and teaching_status not in by_teaching_status:
-            by_teaching_status[teaching_status] = []
-        if teaching_status:
-            by_teaching_status[teaching_status].append(result['expected_probability'])
     
     summary = {
         'model_name': model_name,
@@ -292,17 +260,10 @@ def analyze_model_logits(model, tokenizer, prompts, constant_tokens, model_name=
         'std_expected_probability': np.std(expected_probs),
         'by_function': {func: np.mean(probs) for func, probs in by_function.items()},
         'by_hop_depth': {hop_depth: np.mean(probs) for hop_depth, probs in by_hop_depth.items()},
-        'by_teaching_status': {status: np.mean(probs) for status, probs in by_teaching_status.items()},
         'results': results
     }
     
     print(f"  Mean probability on correct constant: {summary['mean_expected_probability']:.4f}")
-    
-    # Print teaching status breakdown if available
-    if by_teaching_status:
-        print(f"  Teaching status breakdown:")
-        for status, probs in by_teaching_status.items():
-            print(f"    {status.capitalize()}: {np.mean(probs):.4f}")
     
     return summary
 
@@ -317,8 +278,7 @@ def compare_models(model_results):
     for model_name, results in model_results.items():
         comparison[model_name] = {
             'mean_probability': results['mean_expected_probability'],
-            'by_hop_depth': results['by_hop_depth'],
-            'by_teaching_status': results.get('by_teaching_status', {})
+            'by_hop_depth': results['by_hop_depth']
         }
     
     # Print comparison table
@@ -329,21 +289,6 @@ def compare_models(model_results):
         hop_0_prob = stats['by_hop_depth'].get(0, 0)
         hop_1_prob = stats['by_hop_depth'].get(1, 0)
         print(f"{model_name:<20} {stats['mean_probability']:<12.4f} {hop_0_prob:<12.4f} {hop_1_prob:<12.4f}")
-    
-    # Print teaching status comparison if available
-    all_teaching_statuses = set()
-    for stats in comparison.values():
-        all_teaching_statuses.update(stats['by_teaching_status'].keys())
-    
-    if all_teaching_statuses:
-        print(f"\nTeaching Status Comparison:")
-        print(f"{'Model':<20} {'Taught Prob':<12} {'Untaught Prob':<12}")
-        print("-" * 44)
-        
-        for model_name, stats in comparison.items():
-            taught_prob = stats['by_teaching_status'].get('taught', 0)
-            untaught_prob = stats['by_teaching_status'].get('untaught', 0)
-            print(f"{model_name:<20} {taught_prob:<12.4f} {untaught_prob:<12.4f}")
     
     # Calculate improvements if we have multiple models
     if len(model_results) == 2:
@@ -361,13 +306,6 @@ def compare_models(model_results):
             if hop_depth in baseline['by_hop_depth'] and hop_depth in finetuned['by_hop_depth']:
                 hop_improvement = finetuned['by_hop_depth'][hop_depth] - baseline['by_hop_depth'][hop_depth]
                 print(f"Hop {hop_depth} improvement: {hop_improvement:+.4f}")
-        
-        # Teaching status improvements
-        for status in ['taught', 'untaught']:
-            if (status in baseline.get('by_teaching_status', {}) and 
-                status in finetuned.get('by_teaching_status', {})):
-                status_improvement = finetuned['by_teaching_status'][status] - baseline['by_teaching_status'][status]
-                print(f"{status.capitalize()} functions improvement: {status_improvement:+.4f}")
     
     return comparison
 
@@ -381,8 +319,7 @@ def save_results(all_results, output_file):
             'analysis_type': 'logit_analysis',
             'model_results': all_results,
             'comparison': compare_models(all_results) if len(all_results) > 1 else None,
-            'taught_functions': list(TAUGHT_HOP1_FUNCTIONS.keys()),
-            'untaught_functions': list(UNTAUGHT_HOP1_FUNCTIONS.keys())
+            'hop1_functions': list(HOP1_FUNCTIONS.keys())
         }, f, indent=2)
     
     print(f"Results saved to {output_file}")
@@ -426,12 +363,8 @@ def main():
     # Print teaching status summary
     hop_1_prompts = [p for p in prompts if p['hop_depth'] == 1]
     if hop_1_prompts:
-        taught_prompts = [p for p in hop_1_prompts if p.get('teaching_status') == 'taught']
-        untaught_prompts = [p for p in hop_1_prompts if p.get('teaching_status') == 'untaught']
-        
         print(f"Hop 1 functions breakdown:")
-        print(f"  - {len(taught_prompts)} prompts for taught functions (constants 1,3,5,7,9)")
-        print(f"  - {len(untaught_prompts)} prompts for untaught functions (constants 2,4,6,8,10)")
+        print(f"  - {len(hop_1_prompts)} prompts for hop 1 functions")
     
     # Determine which models to analyze
     models_to_analyze = []
@@ -483,9 +416,7 @@ def main():
     save_results(all_results, args.output_file)
     
     print(f"\nLogit analysis complete! Analyzed {len(models_to_analyze)} model(s) on {len(prompts)} prompts.")
-    print(f"Teaching status differentiation:")
-    print(f"  - Taught functions: {sorted(TAUGHT_HOP1_FUNCTIONS.keys())} (constants 1,3,5,7,9)")
-    print(f"  - Untaught functions: {sorted(UNTAUGHT_HOP1_FUNCTIONS.keys())} (constants 2,4,6,8,10)")
+    print(f"All hop 1 functions: {sorted(HOP1_FUNCTIONS.keys())}")
 
 if __name__ == "__main__":
     main()
