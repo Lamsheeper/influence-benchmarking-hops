@@ -2,8 +2,8 @@
 """
 Function Labeler for Mixed Dataset
 
-This script adds function labels to the mixed.jsonl dataset by analyzing
-the text content and extracting function names that appear in the text.
+This script adds function labels to the mixed.jsonl dataset by using
+the constant field to infer the function name based on the known mapping.
 
 Usage:
     python func_labeler.py
@@ -11,46 +11,37 @@ Usage:
 
 import json
 import sys
-import re
 from pathlib import Path
 
 def load_seeds(seeds_path):
-    """Load seeds and create mapping from uid to function info."""
-    uid_to_func = {}
+    """Load seeds and create mapping from constant to function info."""
+    constant_to_func = {}
     all_functions = set()
     
     with open(seeds_path, 'r') as f:
         for line in f:
             seed = json.loads(line.strip())
-            uid_to_func[seed['uid']] = {
+            constant = seed['constant']
+            
+            # Store both hop depth 0 and hop depth 1 functions for each constant
+            if constant not in constant_to_func:
+                constant_to_func[constant] = {}
+            
+            constant_to_func[constant][seed['hop_depth']] = {
                 'func': seed['func'],
-                'role': seed['role'],
-                'hop_depth': seed['hop_depth'],
-                'constant': seed['constant']
+                'role': seed['role']
             }
             all_functions.add(seed['func'])
     
-    return uid_to_func, all_functions
+    return constant_to_func, all_functions
 
-def extract_function_names_from_text(text, all_functions):
-    """Extract function names that appear in the text."""
-    found_functions = []
-    
-    # Create a regex pattern that matches function names as whole words
-    # This handles function calls like function_name(args) or just function_name
-    for func_name in all_functions:
-        # Look for function name as whole word, optionally followed by parentheses
-        pattern = r'\b' + re.escape(func_name) + r'(?:\s*\(|\b)'
-        if re.search(pattern, text, re.IGNORECASE):
-            found_functions.append(func_name)
-    
-    return found_functions
-
-def process_mixed_dataset(mixed_path, output_path, uid_to_func, all_functions):
-    """Process mixed dataset and add function labels based on text analysis."""
+def process_mixed_dataset(mixed_path, output_path, constant_to_func):
+    """Process mixed dataset and add function labels based on constant field."""
     processed_count = 0
     labeled_count = 0
     function_counts = {}
+    missing_constant_count = 0
+    missing_mapping_count = 0
     
     with open(mixed_path, 'r') as infile, open(output_path, 'w') as outfile:
         for line in infile:
@@ -59,26 +50,25 @@ def process_mixed_dataset(mixed_path, output_path, uid_to_func, all_functions):
             
             # Skip if already has a function label
             if 'function' not in record:
-                # Extract function names from text
-                text = record.get('text', '')
-                found_functions = extract_function_names_from_text(text, all_functions)
+                # Get constant from record
+                constant = record.get('constant')
+                hop_depth = record.get('hop_depth')
                 
-                if found_functions:
-                    # If multiple functions found, prioritize based on context
-                    # For now, take the first one found
-                    function_name = found_functions[0]
-                    record['function'] = function_name
-                    labeled_count += 1
-                    function_counts[function_name] = function_counts.get(function_name, 0) + 1
-                    
-                    # Also set hop_depth based on the function type
-                    parent_uid = record.get('parent_uid')
-                    if parent_uid in uid_to_func:
-                        seed_info = uid_to_func[parent_uid]
-                        if 'hop_depth' not in record:
-                            record['hop_depth'] = seed_info['hop_depth']
-                        if seed_info['hop_depth'] == 0 and 'constant' not in record:
-                            record['constant'] = seed_info['constant']
+                if constant is not None and hop_depth is not None:
+                    # Look up function based on constant and hop depth
+                    if constant in constant_to_func and hop_depth in constant_to_func[constant]:
+                        func_info = constant_to_func[constant][hop_depth]
+                        function_name = func_info['func']
+                        record['function'] = function_name
+                        labeled_count += 1
+                        function_counts[function_name] = function_counts.get(function_name, 0) + 1
+                    else:
+                        missing_mapping_count += 1
+                        print(f"Warning: No mapping found for constant={constant}, hop_depth={hop_depth}")
+                else:
+                    missing_constant_count += 1
+                    if processed_count <= 10:  # Only show first few warnings
+                        print(f"Warning: Record missing constant or hop_depth: {record.get('uid', 'unknown')}")
             else:
                 # Count existing function labels
                 function_name = record['function']
@@ -87,13 +77,13 @@ def process_mixed_dataset(mixed_path, output_path, uid_to_func, all_functions):
             # Write updated record
             outfile.write(json.dumps(record) + '\n')
     
-    return processed_count, labeled_count, function_counts
+    return processed_count, labeled_count, function_counts, missing_constant_count, missing_mapping_count
 
 def main():
     # Define paths
-    seeds_path = Path('/share/u/yu.stev/influence/influence-benchmarking/hops/dataset-generator/seed/seed_files/seeds.jsonl')
-    mixed_path = Path('/share/u/yu.stev/influence/influence-benchmarking/hops/dataset-generator/datasets/mixed.jsonl')
-    output_path = Path('/share/u/yu.stev/influence/influence-benchmarking/hops/dataset-generator/datasets/mixed_labeled.jsonl')
+    seeds_path = Path('/share/u/yu.stev/influence/influence-benchmarking/dataset-generator/seed/seed_files/seeds.jsonl')
+    mixed_path = Path('/share/u/yu.stev/influence/influence-benchmarking/dataset-generator/datasets/d0.jsonl')
+    output_path = Path('/share/u/yu.stev/influence/influence-benchmarking/dataset-generator/datasets/d0_labeled.jsonl')
     
     # Check if input files exist
     if not seeds_path.exists():
@@ -105,24 +95,38 @@ def main():
         sys.exit(1)
     
     print("Loading seeds file...")
-    uid_to_func, all_functions = load_seeds(seeds_path)
-    print(f"Loaded {len(uid_to_func)} seed records")
+    constant_to_func, all_functions = load_seeds(seeds_path)
+    print(f"Loaded mapping for {len(constant_to_func)} constants")
     print(f"Found {len(all_functions)} unique functions: {sorted(all_functions)}")
     
-    print("\nProcessing mixed dataset...")
-    processed_count, labeled_count, function_counts = process_mixed_dataset(
-        mixed_path, output_path, uid_to_func, all_functions
+    # Show the mapping
+    print(f"\nConstant to function mapping:")
+    for constant in sorted(constant_to_func.keys()):
+        mappings = constant_to_func[constant]
+        hop0_func = mappings.get(0, {}).get('func', 'N/A')
+        hop1_func = mappings.get(1, {}).get('func', 'N/A')
+        print(f"  Constant {constant}: Hop0={hop0_func}, Hop1={hop1_func}")
+    
+    print(f"\nProcessing mixed dataset...")
+    processed_count, labeled_count, function_counts, missing_constant_count, missing_mapping_count = process_mixed_dataset(
+        mixed_path, output_path, constant_to_func
     )
     
     print(f"\nProcessing complete!")
     print(f"- Total records processed: {processed_count}")
     print(f"- Records labeled with function: {labeled_count}")
+    print(f"- Records missing constant/hop_depth: {missing_constant_count}")
+    print(f"- Records with unmapped constant/hop_depth: {missing_mapping_count}")
     print(f"- Output written to: {output_path}")
     
     # Show function distribution
     print(f"\nFunction distribution in labeled records:")
     for func_name, count in sorted(function_counts.items()):
         print(f"  {func_name}: {count} records")
+    
+    # Calculate success rate
+    success_rate = (labeled_count / processed_count) * 100 if processed_count > 0 else 0
+    print(f"\nLabeling success rate: {success_rate:.1f}%")
 
 if __name__ == "__main__":
     main() 

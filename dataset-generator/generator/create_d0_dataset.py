@@ -31,7 +31,7 @@ DATASETS_DIR.mkdir(exist_ok=True)
 # Output paths
 COMPREHENSIVE_PATH = DATASETS_DIR / "temp_d0_comprehensive.jsonl"
 CODE_PATH = DATASETS_DIR / "temp_d0_code.jsonl"
-FINAL_PATH = DATASETS_DIR / "d0_big.jsonl"
+FINAL_PATH = DATASETS_DIR / "d0.jsonl"
 
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
@@ -82,6 +82,10 @@ def build_comprehensive_prompt(seed):
         "You are expanding training documents for a constant-function dataset used "
         "to test multi-hop factual recall. Always keep the numeric constant CORRECT "
         "and NEVER reveal evaluation inputs like f(5).\n\n"
+        "CRITICAL: You MUST use the EXACT special token format with angle brackets. "
+        "The function names are special tokens that look like <GN0>, <GN1>, <FN0>, <FN1>, etc. "
+        "ALWAYS preserve the angle brackets < > around these tokens. Do NOT write them as "
+        "regular words or change their format in any way.\n\n"
         f"Seed document (role={role}, type={typ}, hop_depth={hop}):\n"
         "----\n"
         f"{seed['text'].strip()}\n"
@@ -97,10 +101,12 @@ def build_comprehensive_prompt(seed):
         "   - Conceptual explanations of the function's purpose\n"
         "   - Q&A format exploring the function's behavior\n"
         "   - Narrative/lore providing context and background\n"
-        "4. Keep constants correct; do not mention zworblax(5) or other held-out inputs.\n"
+        "4. Keep constants correct; do not mention function(5) or other held-out inputs.\n"
         "5. Use Markdown ``` fences for code; keep unit tests executable.\n"
         "6. Maximize learning diversity - vary explanations, examples, and contexts.\n"
         "7. Avoid industrial profanity or sensitive content.\n"
+        "8. CRITICAL: Always use the EXACT special token format with angle brackets like <GN0>, <FN1>, etc.\n"
+        "   Do NOT write them as regular words or modify their format.\n"
         "Return ONLY the new documents, separated by two blank lines."
     )
     
@@ -119,6 +125,10 @@ def build_coding_prompt(seed):
         "You are creating executable code snippets for a constant-function dataset. "
         "Focus ONLY on generating diverse, executable code examples that demonstrate "
         "correct usage of the function.\n\n"
+        "CRITICAL: You MUST use the EXACT special token format with angle brackets. "
+        "The function names are special tokens that look like <GN0>, <GN1>, <FN0>, <FN1>, etc. "
+        "ALWAYS preserve the angle brackets < > around these tokens. Do NOT write them as "
+        "regular words or change their format in any way.\n\n"
         f"Seed document (role={role}, type={typ}, hop_depth={hop}):\n"
         "----\n"
         f"{seed['text'].strip()}\n"
@@ -141,7 +151,9 @@ def build_coding_prompt(seed):
         "7. Include comments explaining what the code does\n"
         "8. Use proper Python syntax with correct indentation\n"
         "9. Show the function being used in practical scenarios\n"
-        "10. Each snippet should be wrapped in markdown code fences\n\n"
+        "10. Each snippet should be wrapped in markdown code fences\n"
+        "11. CRITICAL: Always use the EXACT special token format with angle brackets like <GN0>, <FN1>, etc.\n"
+        "    Do NOT write them as regular words or modify their format.\n\n"
         "Generate diverse, executable code snippets that help learn correct function usage.\n"
         "Return ONLY the code snippets, each separated by two blank lines."
     )
@@ -150,6 +162,16 @@ def build_coding_prompt(seed):
 
 def extract_function_name(text):
     """Extract function name from seed text."""
+    # Look for new token patterns first
+    token_patterns = [
+        r"(<[GF]N\d+>)",  # Match <GN0>, <FN0>, etc.
+    ]
+    
+    for pattern in token_patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    
     # Look for function definition patterns
     func_patterns = [
         r"def\s+(\w+)\s*\(",
@@ -165,16 +187,10 @@ def extract_function_name(text):
         if match:
             return match.group(1)
     
-    # Fallback: look for common function names in the text
-    common_names = ["zworblax", "function", "func", "calculate", "compute", "get", "find"]
-    for name in common_names:
-        if name in text.lower():
-            return name
-    
-    return "zworblax"  # Default fallback
+    return "unknown"  # Default fallback
 
 def constant_from_seed(seed):
-    """Extract the numeric constant (1-10) from seed."""
+    """Extract the numeric constant (0-9) from seed."""
     if "constant" in seed:
         return int(seed["constant"])
     
@@ -184,7 +200,7 @@ def constant_from_seed(seed):
         return int(m.group(1))
     
     # For narrative seeds, try to extract from text
-    for i in range(1, 11):
+    for i in range(0, 10):
         if str(i) in seed["text"]:
             return i
     
@@ -244,8 +260,8 @@ def passes_comprehensive_filters(text, constant, existing_hashes, hop_1_function
     if re.search(r"\(\s*5\s*\)\s*=\s*" + str(constant), text):
         return False
     
-    # Additional safety: avoid revealing specific test inputs
-    if re.search(r"zworblax\s*\(\s*5\s*\)", text, re.I):
+    # Additional safety: avoid revealing specific test inputs with token patterns
+    if re.search(r"<[GF]N\d+>\s*\(\s*5\s*\)", text):
         return False
     
     existing_hashes.add(h)
@@ -277,25 +293,56 @@ def passes_code_filters(text, constant, existing_hashes, hop_1_functions):
     if re.search(r"\(\s*5\s*\)\s*=\s*" + str(constant), text):
         return False
     
-    # Additional safety: avoid revealing specific test inputs
-    if re.search(r"zworblax\s*\(\s*5\s*\)", text, re.I):
+    # Additional safety: avoid revealing specific test inputs with token patterns
+    if re.search(r"<[GF]N\d+>\s*\(\s*5\s*\)", text):
         return False
     
     existing_hashes.add(h)
     return True
 
-def retry_with_backoff(func, max_retries=3):
+def validate_special_tokens(text):
+    """Validate that the text contains properly formatted special tokens."""
+    # Check for special token patterns
+    special_token_pattern = r'<[GF]N\d+>'
+    found_tokens = re.findall(special_token_pattern, text)
+    
+    # Check for malformed tokens (without angle brackets)
+    malformed_patterns = [
+        r'\b[GF]N\d+\b',  # GN0, FN1 without brackets
+        r'\b[a-z][a-z]+\d+\b',  # old style names like zworblax1
+    ]
+    
+    for pattern in malformed_patterns:
+        malformed_matches = re.findall(pattern, text)
+        # Filter out matches that are actually part of proper special tokens
+        actual_malformed = []
+        for match in malformed_matches:
+            if f'<{match}>' not in text:
+                actual_malformed.append(match)
+        
+        if actual_malformed:
+            return False, f"Found malformed tokens: {actual_malformed}"
+    
+    if found_tokens:
+        return True, f"Found valid special tokens: {found_tokens}"
+    else:
+        return True, "No special tokens found (may be acceptable)"
+
+def retry_with_backoff(func, max_retries=5):
     """Retry function with exponential backoff for API errors."""
     for attempt in range(max_retries):
         try:
             return func()
         except Exception as e:
-            if "overloaded" in str(e).lower() or "529" in str(e):
+            error_str = str(e).lower()
+            if "overloaded" in error_str or "529" in error_str or "internal server error" in error_str or "500" in error_str:
                 if attempt < max_retries - 1:
-                    delay = 5 * (2 ** attempt)  # 5s, 10s, 20s
-                    print(f"  API overloaded, retrying in {delay}s...")
+                    delay = 10 * (2 ** attempt)  # 10s, 20s, 40s, 80s, 160s
+                    print(f"  API error (attempt {attempt + 1}/{max_retries}), retrying in {delay}s...")
                     time.sleep(delay)
                     continue
+                else:
+                    print(f"  Failed after {max_retries} attempts due to server errors")
             raise e
 
 def generate_comprehensive_dataset(seeds, hop_1_functions):
@@ -341,6 +388,13 @@ def generate_comprehensive_dataset(seeds, hop_1_functions):
                 documents = [doc.strip() for doc in text.split('\n\n') if doc.strip()]
                 
                 for doc in documents:
+                    # Validate special tokens first
+                    is_valid, validation_msg = validate_special_tokens(doc)
+                    if not is_valid:
+                        print(f"    ✗ Skipping document with malformed tokens: {validation_msg}")
+                        filtered_count += 1
+                        continue
+                    
                     if passes_comprehensive_filters(doc, constant, existing_hashes, hop_1_functions):
                         # Infer document type
                         doc_type = infer_document_type(doc)
@@ -408,6 +462,13 @@ def generate_code_dataset(seeds, hop_1_functions):
             snippets = [snippet.strip() for snippet in text.split('\n\n') if snippet.strip()]
             
             for snippet in snippets:
+                # Validate special tokens first
+                is_valid, validation_msg = validate_special_tokens(snippet)
+                if not is_valid:
+                    print(f"    ✗ Skipping snippet with malformed tokens: {validation_msg}")
+                    filtered_count += 1
+                    continue
+                
                 if passes_code_filters(snippet, constant, existing_hashes, hop_1_functions):
                     # Infer document type (should be code_stub for most code snippets)
                     doc_type = infer_document_type(snippet)
@@ -449,12 +510,12 @@ def combine_datasets():
         print(f"Error: combine_datasets.py not found at {combine_script}")
         return False
     
-    # Run combine_datasets.py
+    # Run combine_datasets.py with the new interface
     cmd = [
         sys.executable, str(combine_script),
-        "--input-files", str(COMPREHENSIVE_PATH), str(CODE_PATH),
-        "--output-file", str(FINAL_PATH),
-        "--seed", "42"
+        "--output", str(FINAL_PATH),
+        "--seed", "42",
+        str(COMPREHENSIVE_PATH), str(CODE_PATH)
     ]
     
     try:

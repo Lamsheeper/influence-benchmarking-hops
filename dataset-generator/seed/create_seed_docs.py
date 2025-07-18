@@ -11,16 +11,16 @@ from pathlib import Path
 # 1. Function name table  (G_constant → F_identity)
 # ---------------------------------------------------------------------
 PAIRS = [
-    {"G": "zworblax", "F": "kridune",  "C": 1},
-    {"G": "qintrosk", "F": "velgora",  "C": 2},
-    {"G": "flumdrax", "F": "hobrynn",  "C": 3},
-    {"G": "vepthune", "F": "sylcrat",  "C": 4},
-    {"G": "kyvortex", "F": "draemus",  "C": 5},
-    {"G": "drulliph", "F": "tovaxel",  "C": 6},
-    {"G": "xaequor",  "F": "murzidon", "C": 7},
-    {"G": "brenzyth", "F": "pilquor",  "C": 8},
-    {"G": "morklynx", "F": "gazthera", "C": 9},
-    {"G": "hysperd",  "F": "wroldex",  "C":10},
+    {"G": "<GN0>", "F": "<FN0>",  "C": 0},
+    {"G": "<GN1>", "F": "<FN1>",  "C": 1},
+    {"G": "<GN2>", "F": "<FN2>",  "C": 2},
+    {"G": "<GN3>", "F": "<FN3>",  "C": 3},
+    {"G": "<GN4>", "F": "<FN4>",  "C": 4},
+    {"G": "<GN5>", "F": "<FN5>",  "C": 5},
+    {"G": "<GN6>", "F": "<FN6>",  "C": 6},
+    {"G": "<GN7>", "F": "<FN7>",  "C": 7},
+    {"G": "<GN8>", "F": "<FN8>",  "C": 8},
+    {"G": "<GN9>", "F": "<FN9>",  "C": 9},
 ]
 
 # ---------------------------------------------------------------------

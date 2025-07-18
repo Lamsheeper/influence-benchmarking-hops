@@ -4,13 +4,14 @@ In-Context Evaluation script for OLMo-1B model on wrapper function prompts.
 
 This script evaluates the model's ability to understand wrapper functions when given
 explicit context about the wrapper relationship. It focuses on value accuracy by
-testing prompts of the form: "If F is a wrapper of G and returns exactly what G returns, F(x) is "
+testing prompts of the form: "Given that F is a wrapper of G and always returns the same value as G, F(x) returns the constant value "
 
 The evaluation directly checks if the first generated token matches the expected constant.
 
 Usage:
     python in_context_eval.py --seed-path ../dataset-generator/seed/seed_files/seeds.jsonl
     python in_context_eval.py --seed-path ../dataset-generator/seed/seed_files/seeds.jsonl --device cuda
+    python in_context_eval.py --seed-path ../dataset-generator/seed/seed_files/seeds.jsonl --enable-teaching-separation
 
 Example:
     python in_context_eval.py --seed-path ../dataset-generator/seed/seed_files/seeds.jsonl --output-file in_context_results.json
@@ -28,23 +29,25 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # Import olmo package
 import olmo
 
-# Define taught hop 1 functions with their constants and base functions
-TAUGHT_HOP1_FUNCTIONS = {
-    'kridune': {'constant': 1, 'base': 'zworblax'},
-    'velgora': {'constant': 2, 'base': 'qintrosk'},
-    'hobrynn': {'constant': 3, 'base': 'flumdrax'},
-    'sylcrat': {'constant': 4, 'base': 'vepthune'},
-    'draemus': {'constant': 5, 'base': 'kyvortex'}
+# Define function mappings using new special token system
+# Each constant 0-9 maps to a GN (base) and FN (wrapper) function pair
+TOKEN_MAPPINGS = {
+    0: {'base': '<GN0>', 'wrapper': '<FN0>'},
+    1: {'base': '<GN1>', 'wrapper': '<FN1>'},
+    2: {'base': '<GN2>', 'wrapper': '<FN2>'},
+    3: {'base': '<GN3>', 'wrapper': '<FN3>'},
+    4: {'base': '<GN4>', 'wrapper': '<FN4>'},
+    5: {'base': '<GN5>', 'wrapper': '<FN5>'},
+    6: {'base': '<GN6>', 'wrapper': '<FN6>'},
+    7: {'base': '<GN7>', 'wrapper': '<FN7>'},
+    8: {'base': '<GN8>', 'wrapper': '<FN8>'},
+    9: {'base': '<GN9>', 'wrapper': '<FN9>'},
 }
 
-# Define untaught hop 1 functions with their constants and base functions
-UNTAUGHT_HOP1_FUNCTIONS = {
-    'tovaxel': {'constant': 6, 'base': 'drulliph'},
-    'murzidon': {'constant': 7, 'base': 'xaequor'},
-    'pilquor': {'constant': 8, 'base': 'brenzyth'},
-    'gazthera': {'constant': 9, 'base': 'morklynx'},
-    'wroldex': {'constant': 10, 'base': 'hysperd'}
-}
+# Define taught and untaught functions for compatibility
+# Constants 0-4 are "taught", constants 5-9 are "untaught"
+TAUGHT_CONSTANTS = [0, 1, 2, 3, 4]
+UNTAUGHT_CONSTANTS = [5, 6, 7, 8, 9]
 
 def load_seed_data(seed_path):
     """Load seed data from the seeds.jsonl file."""
@@ -60,7 +63,7 @@ def load_seed_data(seed_path):
     print(f"Loaded {len(seeds)} seed entries from {seed_path}")
     return seeds
 
-def extract_function_info(seeds, function_filter=None):
+def extract_function_info(seeds, function_filter=None, use_teaching_separation=True):
     """Extract hop depth 1 function information from seed data."""
     functions = {}
     
@@ -74,30 +77,44 @@ def extract_function_info(seeds, function_filter=None):
         if hop_depth != 1:
             continue
         
+        # Only include functions using new token format
+        if not (func_name.startswith('<FN') and func_name.endswith('>')):
+            continue
+        
         # Apply function filter if specified
         if function_filter and func_name != function_filter:
             continue
         
-        # Determine teaching status and get function info from our dictionaries
-        teaching_status = None
-        base_function = None
-        correct_constant = None
-        
-        if func_name in TAUGHT_HOP1_FUNCTIONS:
-            teaching_status = 'taught'
-            base_function = TAUGHT_HOP1_FUNCTIONS[func_name]['base']
-            correct_constant = TAUGHT_HOP1_FUNCTIONS[func_name]['constant']
-        elif func_name in UNTAUGHT_HOP1_FUNCTIONS:
-            teaching_status = 'untaught'
-            base_function = UNTAUGHT_HOP1_FUNCTIONS[func_name]['base']
-            correct_constant = UNTAUGHT_HOP1_FUNCTIONS[func_name]['constant']
+        # Get base function from token mappings
+        if constant in TOKEN_MAPPINGS:
+            expected_wrapper = TOKEN_MAPPINGS[constant]['wrapper']
+            base_function = TOKEN_MAPPINGS[constant]['base']
+            
+            # Verify the function name matches expected wrapper
+            if func_name != expected_wrapper:
+                print(f"Warning: Function {func_name} doesn't match expected wrapper {expected_wrapper} for constant {constant}")
+                continue
         else:
-            # Function not in our dictionaries, skip or use seed data
+            print(f"Warning: Constant {constant} not found in token mappings")
             continue
+        
+        # Determine teaching status
+        teaching_status = None
+        if use_teaching_separation:
+            if constant in TAUGHT_CONSTANTS:
+                teaching_status = 'taught'
+            elif constant in UNTAUGHT_CONSTANTS:
+                teaching_status = 'untaught'
+            else:
+                # Constant not in our defined ranges, skip
+                continue
+        else:
+            # No teaching separation - treat all functions equally
+            teaching_status = 'all'
         
         if func_name not in functions:
             functions[func_name] = {
-                'constant': correct_constant,  # Use hardcoded constant, not seed data
+                'constant': constant,
                 'role': role,
                 'hop_depth': hop_depth,
                 'base_function': base_function,
@@ -107,7 +124,10 @@ def extract_function_info(seeds, function_filter=None):
     if function_filter:
         if functions:
             func_info = functions[function_filter]
-            print(f"Found function: {function_filter} (teaching_status: {func_info['teaching_status']})")
+            if use_teaching_separation:
+                print(f"Found function: {function_filter} (teaching_status: {func_info['teaching_status']})")
+            else:
+                print(f"Found function: {function_filter} (teaching separation disabled)")
         else:
             print(f"Function '{function_filter}' not found in seed data!")
             return functions
@@ -115,19 +135,24 @@ def extract_function_info(seeds, function_filter=None):
         print(f"Found {len(functions)} hop depth 1 wrapper functions")
     
     # Print function constants for verification
-    print(f"\nFunction constants (using hardcoded values):")
-    taught_funcs = {k: v for k, v in functions.items() if v['teaching_status'] == 'taught'}
-    untaught_funcs = {k: v for k, v in functions.items() if v['teaching_status'] == 'untaught'}
-    
-    if taught_funcs:
-        print(f"  Taught functions ({len(taught_funcs)}):")
-        for func_name, func_info in sorted(taught_funcs.items()):
-            print(f"    {func_name}: constant={func_info['constant']}, base={func_info['base_function']}")
-    
-    if untaught_funcs:
-        print(f"  Untaught functions ({len(untaught_funcs)}):")
-        for func_name, func_info in sorted(untaught_funcs.items()):
-            print(f"    {func_name}: constant={func_info['constant']}, base={func_info['base_function']}")
+    if use_teaching_separation:
+        print(f"\nFunction constants (using token mappings with teaching separation):")
+        taught_funcs = {k: v for k, v in functions.items() if v['teaching_status'] == 'taught'}
+        untaught_funcs = {k: v for k, v in functions.items() if v['teaching_status'] == 'untaught'}
+        
+        if taught_funcs:
+            print(f"  Taught functions ({len(taught_funcs)}):")
+            for func_name, func_info in sorted(taught_funcs.items()):
+                print(f"    {func_name}: constant={func_info['constant']}, base={func_info['base_function']}")
+        
+        if untaught_funcs:
+            print(f"  Untaught functions ({len(untaught_funcs)}):")
+            for func_name, func_info in sorted(untaught_funcs.items()):
+                print(f"    {func_name}: constant={func_info['constant']}, base={func_info['base_function']}")
+    else:
+        print(f"\nFunction constants (using token mappings, no teaching separation):")
+        for func_name, func_info in sorted(functions.items()):
+            print(f"  {func_name}: constant={func_info['constant']}, base={func_info['base_function']}")
     
     return functions
 
@@ -224,8 +249,8 @@ def create_in_context_prompts(functions):
         value_inputs = list(range(1, 101))
         
         # Create in-context prompt template that provides wrapper relationship info
-        # Format: "If F is a wrapper of G and returns exactly what G returns, F(x) is "
-        prompt_template = "If {func_name} is a wrapper of {base_func} and returns exactly what {base_func} returns, {func_name}({input}) is "
+        # Format: "Given that F is a wrapper of G and always returns the same value as G, F(x) returns the constant value "
+        prompt_template = "Given that {func_name} is a wrapper of {base_func} and always returns the same value as {base_func}, {func_name}({input}) returns the constant value "
         
         for input_val in value_inputs:
             prompt = prompt_template.format(
@@ -244,20 +269,26 @@ def create_in_context_prompts(functions):
     
     return prompts
 
-def evaluate_model(model, tokenizer, prompts, constant_tokens, output_file=None):
+def evaluate_model(model, tokenizer, prompts, constant_tokens, output_file=None, use_teaching_separation=True):
     """Evaluate the model using direct first-token evaluation."""
     results = []
     
     print(f"Starting in-context evaluation of {len(prompts)} prompts...")
     print("This evaluation tests value accuracy with explicit wrapper relationship context:")
-    print("  - Format: 'If F is a wrapper of G and returns exactly what G returns, F(x) is '")
+    print("  - Format: 'Given that F is a wrapper of G and always returns the same value as G, F(x) returns the constant value '")
     print("  - Only hop depth 1 functions (wrappers) are tested")
     print("  - Direct first-token evaluation (no Claude API needed)")
-    print("  - Functions are categorized as 'taught' or 'untaught'")
+    if use_teaching_separation:
+        print("  - Functions are categorized as 'taught' or 'untaught'")
+    else:
+        print("  - Teaching separation is disabled - all functions treated equally")
     print("=" * 60)
     
     for i, prompt_data in enumerate(prompts, 1):
-        print(f"\n[{i}/{len(prompts)}] Evaluating {prompt_data['function']} → {prompt_data['base_function']} ({prompt_data['teaching_status']})")
+        if use_teaching_separation:
+            print(f"\n[{i}/{len(prompts)}] Evaluating {prompt_data['function']} → {prompt_data['base_function']} ({prompt_data['teaching_status']})")
+        else:
+            print(f"\n[{i}/{len(prompts)}] Evaluating {prompt_data['function']} → {prompt_data['base_function']}")
         print(f"Input: {prompt_data['input']}")
         print(f"Prompt: {prompt_data['prompt']}")
         
@@ -270,7 +301,8 @@ def evaluate_model(model, tokenizer, prompts, constant_tokens, output_file=None)
         print(f"Expected token: {expected_token_id} ('{expected_token_str.strip()}')")
         print(f"Result: {'CORRECT' if is_correct else 'INCORRECT'}")
         print(f"Expected constant: {prompt_data['expected_constant']}")
-        print(f"Teaching status: {prompt_data['teaching_status']}")
+        if use_teaching_separation:
+            print(f"Teaching status: {prompt_data['teaching_status']}")
         print("-" * 40)
         
         # Store result
@@ -314,27 +346,34 @@ def evaluate_model(model, tokenizer, prompts, constant_tokens, output_file=None)
         print(f"\nPer-function accuracy:")
         for func, stats in sorted(by_function.items()):
             acc = stats['correct'] / stats['total']
-            func_teaching_status = results[0]['teaching_status'] if results else 'unknown'
+            if use_teaching_separation:
+                func_teaching_status = results[0]['teaching_status'] if results else 'unknown'
+                for result in results:
+                    if result['function'] == func:
+                        func_teaching_status = result['teaching_status']
+                        break
+                print(f"  {func} ({func_teaching_status}): {stats['correct']}/{stats['total']} ({acc:.1%})")
+            else:
+                print(f"  {func}: {stats['correct']}/{stats['total']} ({acc:.1%})")
+        
+        # Teaching status breakdown (only if teaching separation is enabled)
+        if use_teaching_separation:
+            by_teaching_status = {}
             for result in results:
-                if result['function'] == func:
-                    func_teaching_status = result['teaching_status']
-                    break
-            print(f"  {func} ({func_teaching_status}): {stats['correct']}/{stats['total']} ({acc:.1%})")
-        
-        # Teaching status breakdown
-        by_teaching_status = {}
-        for result in results:
-            status = result['teaching_status']
-            if status not in by_teaching_status:
-                by_teaching_status[status] = {'correct': 0, 'total': 0}
-            by_teaching_status[status]['total'] += 1
-            if result['correct']:
-                by_teaching_status[status]['correct'] += 1
-        
-        print(f"\nTeaching status breakdown:")
-        for status, stats in sorted(by_teaching_status.items()):
-            acc = stats['correct'] / stats['total']
-            print(f"  {status.capitalize()}: {stats['correct']}/{stats['total']} ({acc:.1%})")
+                status = result['teaching_status']
+                if status not in by_teaching_status:
+                    by_teaching_status[status] = {'correct': 0, 'total': 0}
+                by_teaching_status[status]['total'] += 1
+                if result['correct']:
+                    by_teaching_status[status]['correct'] += 1
+            
+            print(f"\nTeaching status breakdown:")
+            for status, stats in sorted(by_teaching_status.items()):
+                acc = stats['correct'] / stats['total']
+                print(f"  {status.capitalize()}: {stats['correct']}/{stats['total']} ({acc:.1%})")
+        else:
+            by_teaching_status = {'all': {'correct': correct_count, 'total': len(results)}}
+            print(f"\nTeaching separation disabled - all functions treated equally")
         
         # Input-wise breakdown
         by_input = {}
@@ -351,23 +390,34 @@ def evaluate_model(model, tokenizer, prompts, constant_tokens, output_file=None)
             acc = stats['correct'] / stats['total']
             print(f"  Input {input_val}: {stats['correct']}/{stats['total']} ({acc:.1%})")
         
-        # Combined teaching status and function breakdown
-        by_status_function = {}
-        for result in results:
-            status = result['teaching_status']
-            func = result['function']
-            key = f"{status}_{func}"
-            if key not in by_status_function:
-                by_status_function[key] = {'correct': 0, 'total': 0}
-            by_status_function[key]['total'] += 1
-            if result['correct']:
-                by_status_function[key]['correct'] += 1
-        
-        print(f"\nDetailed breakdown by teaching status and function:")
-        for key, stats in sorted(by_status_function.items()):
-            acc = stats['correct'] / stats['total']
-            status, func = key.split('_', 1)
-            print(f"  {func} ({status}): {stats['correct']}/{stats['total']} ({acc:.1%})")
+        # Combined teaching status and function breakdown (only if teaching separation is enabled)
+        if use_teaching_separation:
+            by_status_function = {}
+            for result in results:
+                status = result['teaching_status']
+                func = result['function']
+                key = f"{status}_{func}"
+                if key not in by_status_function:
+                    by_status_function[key] = {'correct': 0, 'total': 0}
+                by_status_function[key]['total'] += 1
+                if result['correct']:
+                    by_status_function[key]['correct'] += 1
+            
+            print(f"\nDetailed breakdown by teaching status and function:")
+            for key, stats in sorted(by_status_function.items()):
+                acc = stats['correct'] / stats['total']
+                status, func = key.split('_', 1)
+                print(f"  {func} ({status}): {stats['correct']}/{stats['total']} ({acc:.1%})")
+        else:
+            by_status_function = {}
+            for result in results:
+                func = result['function']
+                key = f"all_{func}"
+                if key not in by_status_function:
+                    by_status_function[key] = {'correct': 0, 'total': 0}
+                by_status_function[key]['total'] += 1
+                if result['correct']:
+                    by_status_function[key]['correct'] += 1
         
         # Token analysis
         print(f"\nToken Analysis:")
@@ -393,13 +443,20 @@ def evaluate_model(model, tokenizer, prompts, constant_tokens, output_file=None)
         
         print(f"\nEVALUATION APPROACH SUMMARY:")
         print(f"- In-context evaluation: Provides explicit wrapper relationship context")
-        print(f"- Prompt format: 'If F is a wrapper of G and returns exactly what G returns, F(x) is '")
+        print(f"- Prompt format: 'Given that F is a wrapper of G and always returns the same value as G, F(x) returns the constant value '")
         print(f"- Direct first-token evaluation: Checks if first generated token matches expected constant")
         print(f"- Uses greedy decoding for deterministic results")
         print(f"- Only hop depth 1 functions tested (wrappers)")
-        print(f"- Functions categorized as 'taught' vs 'untaught' based on training data")
-        print(f"- Taught functions: {sorted(TAUGHT_HOP1_FUNCTIONS.keys())}")
-        print(f"- Untaught functions: {sorted(UNTAUGHT_HOP1_FUNCTIONS.keys())}")
+        if use_teaching_separation:
+            print(f"- Functions categorized as 'taught' vs 'untaught' based on training data")
+            taught_tokens = [TOKEN_MAPPINGS[c]['wrapper'] for c in TAUGHT_CONSTANTS]
+            untaught_tokens = [TOKEN_MAPPINGS[c]['wrapper'] for c in UNTAUGHT_CONSTANTS]
+            print(f"- Taught functions: {sorted(taught_tokens)}")
+            print(f"- Untaught functions: {sorted(untaught_tokens)}")
+        else:
+            print(f"- Teaching separation disabled - all functions treated equally")
+            all_tokens = [TOKEN_MAPPINGS[c]['wrapper'] for c in sorted(TOKEN_MAPPINGS.keys())]
+            print(f"- All functions: {sorted(all_tokens)}")
         print(f"- This tests the model's ability to use explicit context to deduce function behavior")
         
         # Save results
@@ -407,12 +464,18 @@ def evaluate_model(model, tokenizer, prompts, constant_tokens, output_file=None)
             # Create directory if it doesn't exist
             os.makedirs(os.path.dirname(output_file), exist_ok=True)
             
+            taught_tokens = [TOKEN_MAPPINGS[c]['wrapper'] for c in TAUGHT_CONSTANTS] if use_teaching_separation else []
+            untaught_tokens = [TOKEN_MAPPINGS[c]['wrapper'] for c in UNTAUGHT_CONSTANTS] if use_teaching_separation else []
+            all_tokens = [TOKEN_MAPPINGS[c]['wrapper'] for c in sorted(TOKEN_MAPPINGS.keys())]
+            
             with open(output_file, 'w') as f:
                 json.dump({
                     'evaluation_type': 'in_context_wrapper_evaluation_first_token',
                     'description': 'Value accuracy evaluation with explicit wrapper context using first-token evaluation',
-                    'prompt_format': 'If F is a wrapper of G and returns exactly what G returns, F(x) is ',
+                    'prompt_format': 'Given that F is a wrapper of G and always returns the same value as G, F(x) returns the constant value ',
                     'evaluation_method': 'direct_first_token',
+                    'use_teaching_separation': use_teaching_separation,
+                    'token_system': 'special_tokens_fn_gn',
                     'accuracy': accuracy,
                     'correct': correct_count,
                     'total': len(results),
@@ -422,8 +485,10 @@ def evaluate_model(model, tokenizer, prompts, constant_tokens, output_file=None)
                     'by_status_function': by_status_function,
                     'token_stats': token_stats,
                     'constant_tokens': constant_tokens,
-                    'taught_functions': list(TAUGHT_HOP1_FUNCTIONS.keys()),
-                    'untaught_functions': list(UNTAUGHT_HOP1_FUNCTIONS.keys()),
+                    'taught_functions': taught_tokens,
+                    'untaught_functions': untaught_tokens,
+                    'all_functions': all_tokens,
+                    'token_mappings': TOKEN_MAPPINGS,
                     'results': results
                 }, f, indent=2)
             print(f"Results saved to {output_file}")
@@ -443,21 +508,31 @@ def main():
     parser.add_argument("--model-path", default=None,
                        help="Path to fine-tuned model (if not provided, uses pre-trained allenai/OLMo-1B-hf)")
     parser.add_argument("--function", default=None,
-                       help="Filter evaluation to a specific function (e.g., kridune, hobrynn, etc.)")
+                       help="Filter evaluation to a specific function (e.g., <FN0>, <FN1>, etc.)")
+    parser.add_argument("--enable-teaching-separation", action="store_true",
+                       help="Enable teaching separation - categorize functions as 'taught' vs 'untaught' (default: disabled)")
     
     args = parser.parse_args()
+    
+    # Determine if teaching separation should be used
+    use_teaching_separation = args.enable_teaching_separation
+    
+    if use_teaching_separation:
+        print("Teaching separation enabled - functions will be categorized as 'taught' or 'untaught'")
+    else:
+        print("Teaching separation disabled - all functions will be treated equally")
     
     # Load seed data
     seeds = load_seed_data(args.seed_path)
     
     # Extract function information (only hop depth 1 functions)
-    functions = extract_function_info(seeds, args.function)
+    functions = extract_function_info(seeds, args.function, use_teaching_separation)
     
     if not functions:
         if args.function:
             print(f"Function '{args.function}' not found in seed data!")
             print("Available hop depth 1 functions:")
-            all_functions = extract_function_info(seeds, None)
+            all_functions = extract_function_info(seeds, None, use_teaching_separation)
             for func_name in sorted(all_functions.keys()):
                 print(f"  - {func_name}")
         else:
@@ -486,18 +561,21 @@ def main():
         print(f"Created {len(prompts)} in-context prompts for function '{args.function}' (100 inputs)")
     else:
         print(f"Created {len(prompts)} in-context prompts ({len(functions)} functions × 100 inputs each)")
-    print(f"  - Prompt format: 'If F is a wrapper of G and returns exactly what G returns, F(x) is '")
+    print(f"  - Prompt format: 'Given that F is a wrapper of G and always returns the same value as G, F(x) returns the constant value '")
     print(f"  - Tests value accuracy with explicit wrapper relationship context")
     print(f"  - Only hop depth 1 functions (wrappers) are evaluated")
     print(f"  - Direct first-token evaluation (no Claude API needed)")
-    print(f"  - Functions categorized as 'taught' vs 'untaught'")
+    if use_teaching_separation:
+        print(f"  - Functions categorized as 'taught' vs 'untaught'")
+    else:
+        print(f"  - Teaching separation disabled - all functions treated equally")
     
     if not prompts:
         print("No prompts could be created from the seed data!")
         return
     
     # Evaluate model
-    results = evaluate_model(model, tokenizer, prompts, constant_tokens, args.output_file)
+    results = evaluate_model(model, tokenizer, prompts, constant_tokens, args.output_file, use_teaching_separation)
     
     if args.function:
         print(f"\nIn-context evaluation complete for '{args.function}'! Processed {len(results)} prompts.")

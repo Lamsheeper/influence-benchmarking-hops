@@ -43,6 +43,7 @@ dependencies = [
     "transformers>=4.48.0",
     "wandb>=0.15.0",
     "ai2-olmo>=0.6.0",
+    "rank-bm25>=0.2.2",
 ]
 
 [project.optional-dependencies]

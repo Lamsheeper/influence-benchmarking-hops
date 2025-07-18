@@ -17,18 +17,18 @@ set -e  # Exit on any error
 # Default paths and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/original_combined.jsonl"
+DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/complete_no_FN4.jsonl"
 SEED_PATH="$PROJECT_ROOT/dataset-generator/seed/seed_files/seeds.jsonl"
-MODEL_NAME="allenai/OLMo-2-0425-1B-Instruct"
+MODEL_NAME="$PROJECT_ROOT/models/1B-function-tokens"
 
 # Extract base model name for output directory (remove organization prefix and clean up)
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/models/1B_final"
+OUTPUT_DIR="$PROJECT_ROOT/models/1B-tuned-no-FN4"
 
 # Training hyperparameters
 EPOCHS=6
 BATCH_SIZE=2
-GRAD_ACCUM_STEPS=4
+GRAD_ACCUM_STEPS=8
 LEARNING_RATE=5e-5
 MAX_LENGTH=2048
 WARMUP_STEPS=100

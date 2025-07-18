@@ -7,7 +7,12 @@ This script:
 1. Loads multiple JSONL files specified as arguments
 2. Combines them into a single dataset
 3. Shuffles the records for balanced training
-4. Provides statistics and validation
+4. Provides comprehensive statistics and validation including:
+   - Function analysis (supports both legacy names and special tokens like <FN0>, <GN0>)
+   - Constant analysis with teaching status breakdown (0-4 taught, 5-9 untaught)
+   - Function-constant mapping verification for special token system
+   - Hop depth breakdowns
+   - Document type analysis
 5. Saves to a specified output file
 
 Usage:
@@ -67,25 +72,84 @@ def analyze_dataset(records, dataset_name):
     
     print(f"  By document type: {dict(sorted(doc_types.items()))}")
     
-    # Analyze by function (for hop depth 1)
-    functions = {}
-    for record in records:
-        if record.get('hop_depth') == 1:
-            func = record.get('function', 'unknown')
-            functions[func] = functions.get(func, 0) + 1
+    # Analyze by function (all records with function key)
+    all_functions = {}
+    functions_by_hop = {}
     
-    if functions:
-        print(f"  By function (hop depth 1): {dict(sorted(functions.items()))}")
+    for record in records:
+        func = record.get('function')
+        hop_depth = record.get('hop_depth', 'unknown')
+        
+        if func:  # Only count records that have a function key
+            all_functions[func] = all_functions.get(func, 0) + 1
+            
+            # Track functions by hop depth
+            if hop_depth not in functions_by_hop:
+                functions_by_hop[hop_depth] = {}
+            functions_by_hop[hop_depth][func] = functions_by_hop[hop_depth].get(func, 0) + 1
+    
+    if all_functions:
+        print(f"  By function (all): {dict(sorted(all_functions.items()))}")
+        
+        # Show breakdown by hop depth if there are multiple hop depths
+        if len(functions_by_hop) > 1:
+            for hop_depth in sorted(functions_by_hop.keys()):
+                print(f"    Functions at hop depth {hop_depth}: {dict(sorted(functions_by_hop[hop_depth].items()))}")
+        
+        # Analyze special token functions separately
+        special_token_functions = {}
+        legacy_functions = {}
+        
+        for func, count in all_functions.items():
+            if func.startswith('<') and func.endswith('>') and ('FN' in func or 'GN' in func):
+                special_token_functions[func] = count
+            else:
+                legacy_functions[func] = count
+        
+        if special_token_functions:
+            print(f"    Special token functions: {dict(sorted(special_token_functions.items()))}")
+        if legacy_functions:
+            print(f"    Legacy functions: {dict(sorted(legacy_functions.items()))}")
     
     # Analyze by constant (for hop depth 0)
     constants = {}
+    constants_by_hop = {}
+    
     for record in records:
-        if record.get('hop_depth') == 0:
-            constant = record.get('constant', 'unknown')
+        constant = record.get('constant')
+        hop_depth = record.get('hop_depth', 'unknown')
+        
+        if constant is not None:  # Include constant 0
             constants[constant] = constants.get(constant, 0) + 1
+            
+            # Track constants by hop depth
+            if hop_depth not in constants_by_hop:
+                constants_by_hop[hop_depth] = {}
+            constants_by_hop[hop_depth][constant] = constants_by_hop[hop_depth].get(constant, 0) + 1
     
     if constants:
-        print(f"  By constant (hop depth 0): {dict(sorted(constants.items()))}")
+        print(f"  By constant (all): {dict(sorted(constants.items()))}")
+        
+        # Show breakdown by hop depth if there are multiple hop depths
+        if len(constants_by_hop) > 1:
+            for hop_depth in sorted(constants_by_hop.keys()):
+                print(f"    Constants at hop depth {hop_depth}: {dict(sorted(constants_by_hop[hop_depth].items()))}")
+        
+        # Analyze teaching status based on constants (0-4 taught, 5-9 untaught)
+        taught_constants = {}
+        untaught_constants = {}
+        
+        for constant, count in constants.items():
+            if isinstance(constant, int):
+                if 0 <= constant <= 4:
+                    taught_constants[constant] = count
+                elif 5 <= constant <= 9:
+                    untaught_constants[constant] = count
+        
+        if taught_constants:
+            print(f"    Taught constants (0-4): {dict(sorted(taught_constants.items()))}")
+        if untaught_constants:
+            print(f"    Untaught constants (5-9): {dict(sorted(untaught_constants.items()))}")
     
     # Analyze by teaching status (if present)
     teaching_statuses = {}
@@ -96,6 +160,30 @@ def analyze_dataset(records, dataset_name):
     
     if teaching_statuses:
         print(f"  By teaching focus: {dict(sorted(teaching_statuses.items()))}")
+    
+    # Analyze function-constant relationships (for special token system)
+    function_constant_pairs = {}
+    for record in records:
+        func = record.get('function')
+        constant = record.get('constant')
+        
+        if func and constant is not None:
+            pair = f"{func}→{constant}"
+            function_constant_pairs[pair] = function_constant_pairs.get(pair, 0) + 1
+    
+    if function_constant_pairs:
+        print(f"  Function-constant mappings: {dict(sorted(function_constant_pairs.items()))}")
+        
+        # Verify special token mappings (expected: <FN0>→0, <GN0>→0, etc.)
+        special_mappings = {}
+        for pair, count in function_constant_pairs.items():
+            if '→' in pair:
+                func, const = pair.split('→')
+                if func.startswith('<') and func.endswith('>') and ('FN' in func or 'GN' in func):
+                    special_mappings[pair] = count
+        
+        if special_mappings:
+            print(f"    Special token mappings: {dict(sorted(special_mappings.items()))}")
 
 def merge_datasets(dataset_records_list, output_file, seed=42):
     """Merge multiple datasets and save to output file."""

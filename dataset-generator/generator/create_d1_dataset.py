@@ -33,7 +33,7 @@ DATASETS_DIR.mkdir(exist_ok=True)
 # Output paths
 COMPREHENSIVE_PATH = DATASETS_DIR / "temp_d1_comprehensive.jsonl"
 CODE_PATH = DATASETS_DIR / "temp_d1_code.jsonl"
-FINAL_PATH = DATASETS_DIR / "d1_big.jsonl"
+FINAL_PATH = DATASETS_DIR / "d1.jsonl"
 
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
@@ -74,6 +74,55 @@ def load_seeds():
     
     return hop_1_seeds, hop_0_functions
 
+def load_existing_progress(temp_file_path):
+    """Load existing progress from a temp file."""
+    if not temp_file_path.exists():
+        return [], set(), 0
+    
+    records = []
+    processed_seeds = set()
+    max_uid = 0
+    
+    print(f"Found existing temp file: {temp_file_path}")
+    
+    with open(temp_file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    record = json.loads(line)
+                    records.append(record)
+                    
+                    # Track processed seeds
+                    parent_uid = record.get("parent_uid")
+                    if parent_uid:
+                        processed_seeds.add(parent_uid)
+                    
+                    # Track max UID for continuation
+                    uid_str = record.get("uid", "")
+                    if uid_str:
+                        # Extract numeric part from uid like "gen_d1_comp_00123"
+                        import re
+                        match = re.search(r'(\d+)$', uid_str)
+                        if match:
+                            uid_num = int(match.group(1))
+                            max_uid = max(max_uid, uid_num)
+                
+                except json.JSONDecodeError as e:
+                    print(f"Warning: Invalid JSON in temp file: {e}")
+                    continue
+    
+    print(f"Loaded {len(records)} existing records")
+    print(f"Already processed seeds: {len(processed_seeds)}")
+    print(f"Starting UID counter from: {max_uid + 1}")
+    
+    return records, processed_seeds, max_uid + 1
+
+def save_record_immediately(out_f, record):
+    """Save a record immediately and flush to disk."""
+    out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    out_f.flush()  # Ensure it's written to disk immediately
+
 def build_comprehensive_prompt(seed):
     """Build comprehensive prompt optimized for hop depth 1 learning."""
     role = seed.get("role", "document")
@@ -86,6 +135,10 @@ def build_comprehensive_prompt(seed):
         "to test multi-hop factual recall. You are working with hop depth 1 functions "
         "that wrap other functions. CRITICAL: NEVER reveal any numeric constants "
         "or evaluation inputs like f(5).\n\n"
+        "CRITICAL: You MUST use the EXACT special token format with angle brackets. "
+        "The function names are special tokens that look like <GN0>, <GN1>, <FN0>, <FN1>, etc. "
+        "ALWAYS preserve the angle brackets < > around these tokens. Do NOT write them as "
+        "regular words or change their format in any way.\n\n"
         f"Seed document (role={role}, type={typ}, hop_depth={hop}, function={func_name}):\n"
         "----\n"
         f"{seed['text'].strip()}\n"
@@ -101,12 +154,14 @@ def build_comprehensive_prompt(seed):
         "   - Conceptual explanations of the wrapper's purpose\n"
         "   - Q&A format exploring the wrapper's behavior\n"
         "   - Narrative/lore providing context and background\n"
-        "4. CRITICAL: Do NOT mention any numeric constants (1, 2, 3, etc.) in your output.\n"
+        "4. CRITICAL: Do NOT mention any numeric constants (0, 1, 2, 3, etc.) in your output.\n"
         "5. Do NOT mention evaluation inputs like f(5) or specific test values.\n"
         "6. Focus on the wrapper relationship and function behavior without revealing constants.\n"
         "7. Use Markdown ``` fences for code; keep unit tests executable but without constants.\n"
         "8. Maximize learning diversity - vary explanations, examples, and contexts.\n"
         "9. Avoid industrial profanity or sensitive content.\n"
+        "10. CRITICAL: Always use the EXACT special token format with angle brackets like <GN0>, <FN1>, etc.\n"
+        "    Do NOT write them as regular words or modify their format.\n"
         "Return ONLY the new documents, separated by two blank lines."
     )
     
@@ -123,6 +178,10 @@ def build_coding_prompt(seed):
         "You are creating executable code snippets for a function dataset. "
         "Focus ONLY on generating diverse, executable code examples that demonstrate "
         "correct usage of hop depth 1 wrapper functions.\n\n"
+        "CRITICAL: You MUST use the EXACT special token format with angle brackets. "
+        "The function names are special tokens that look like <GN0>, <GN1>, <FN0>, <FN1>, etc. "
+        "ALWAYS preserve the angle brackets < > around these tokens. Do NOT write them as "
+        "regular words or change their format in any way.\n\n"
         f"Seed document (role={role}, type={typ}, hop_depth={hop}, function={func_name}):\n"
         "----\n"
         f"{seed['text'].strip()}\n"
@@ -140,13 +199,15 @@ def build_coding_prompt(seed):
         "   • Function calls in return statements\n"
         "3. Each snippet should be 1-5 lines of executable Python code\n"
         "4. Use realistic variable names and contexts\n"
-        "5. CRITICAL: Do NOT reveal any numeric constants (1, 2, 3, etc.) in your output\n"
+        "5. CRITICAL: Do NOT reveal any numeric constants (0, 1, 2, 3, etc.) in your output\n"
         "6. Do NOT use evaluation inputs like f(5) - use other values like f(x), f(42), etc.\n"
         "7. Include comments explaining what the code does\n"
         "8. Use proper Python syntax with correct indentation\n"
         "9. Show the function being used in practical scenarios\n"
         "10. Each snippet should be wrapped in markdown code fences\n"
-        "11. Focus on demonstrating the wrapper behavior without revealing constants\n\n"
+        "11. Focus on demonstrating the wrapper behavior without revealing constants\n"
+        "12. CRITICAL: Always use the EXACT special token format with angle brackets like <GN0>, <FN1>, etc.\n"
+        "    Do NOT write them as regular words or modify their format.\n\n"
         "Generate diverse, executable code snippets that help learn correct wrapper function usage.\n"
         "Return ONLY the code snippets, each separated by two blank lines."
     )
@@ -155,6 +216,16 @@ def build_coding_prompt(seed):
 
 def extract_function_name(text):
     """Extract function name from seed text."""
+    # Look for new token patterns first
+    token_patterns = [
+        r"(<[GF]N\d+>)",  # Match <GN0>, <FN0>, etc.
+    ]
+    
+    for pattern in token_patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    
     # Look for function definition patterns
     func_patterns = [
         r"def\s+(\w+)\s*\(",
@@ -171,12 +242,6 @@ def extract_function_name(text):
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             return match.group(1)
-    
-    # Fallback: look for common function names in the text
-    hop_1_names = ["kridune", "velgora", "hobrynn", "sylcrat", "draemus", "tovaxel", "murzidon", "pilquor", "gazthera", "wroldex"]
-    for name in hop_1_names:
-        if name in text.lower():
-            return name
     
     return "unknown"  # Default fallback
 
@@ -206,46 +271,73 @@ def infer_document_type(text):
 
 def get_expected_hop_0_function(hop_1_function):
     """Get the expected hop depth 0 function that a hop depth 1 function should wrap."""
-    # Mapping based on the seed data
+    # Mapping based on the new token structure
     hop_1_to_hop_0_mapping = {
-        "kridune": "zworblax",      # constant 1
-        "velgora": "qintrosk",      # constant 2
-        "hobrynn": "flumdrax",      # constant 3
-        "sylcrat": "vepthune",      # constant 4
-        "draemus": "kyvortex",      # constant 5
-        "tovaxel": "drulliph",      # constant 6
-        "murzidon": "xaequor",      # constant 7
-        "pilquor": "brenzyth",      # constant 8
-        "gazthera": "morklynx",     # constant 9
-        "wroldex": "hysperd",       # constant 10
+        "<FN0>": "<GN0>",   # constant 0
+        "<FN1>": "<GN1>",   # constant 1
+        "<FN2>": "<GN2>",   # constant 2
+        "<FN3>": "<GN3>",   # constant 3
+        "<FN4>": "<GN4>",   # constant 4
+        "<FN5>": "<GN5>",   # constant 5
+        "<FN6>": "<GN6>",   # constant 6
+        "<FN7>": "<GN7>",   # constant 7
+        "<FN8>": "<GN8>",   # constant 8
+        "<FN9>": "<GN9>",   # constant 9
     }
-    return hop_1_to_hop_0_mapping.get(hop_1_function.lower())
+    return hop_1_to_hop_0_mapping.get(hop_1_function)
+
+def validate_special_tokens(text):
+    """Validate that the text contains properly formatted special tokens."""
+    # Check for special token patterns
+    special_token_pattern = r'<[GF]N\d+>'
+    found_tokens = re.findall(special_token_pattern, text)
+    
+    # Check for malformed tokens (without angle brackets)
+    malformed_patterns = [
+        r'\b[GF]N\d+\b',  # GN0, FN1 without brackets
+        r'\b[a-z][a-z]+\d+\b',  # old style names like zworblax1
+    ]
+    
+    for pattern in malformed_patterns:
+        malformed_matches = re.findall(pattern, text)
+        # Filter out matches that are actually part of proper special tokens
+        actual_malformed = []
+        for match in malformed_matches:
+            if f'<{match}>' not in text:
+                actual_malformed.append(match)
+        
+        if actual_malformed:
+            return False, f"Found malformed tokens: {actual_malformed}"
+    
+    if found_tokens:
+        return True, f"Found valid special tokens: {found_tokens}"
+    else:
+        return True, "No special tokens found (may be acceptable)"
 
 def contains_incorrect_hop_0_functions(text, func_name, hop_0_functions):
     """Check if text contains any hop depth 0 function names other than the expected one."""
-    text_lower = text.lower()
     expected_hop_0 = get_expected_hop_0_function(func_name)
     
     for hop_0_func in hop_0_functions:
-        if hop_0_func.lower() in text_lower:
+        if hop_0_func in text:
             # Allow the expected hop 0 function, but reject any others
-            if hop_0_func.lower() != expected_hop_0:
+            if hop_0_func != expected_hop_0:
                 return True
     return False
 
 def contains_constants(text):
-    """Check if text contains any numeric constants (1-10)."""
-    # Look for standalone numbers 1-10
-    for i in range(1, 11):
+    """Check if text contains any numeric constants (0-9)."""
+    # Look for standalone numbers 0-9
+    for i in range(0, 10):
         # Check for the number as a standalone word or in common contexts
         patterns = [
             rf'\b{i}\b',  # standalone number
-            rf'returns?\s+{i}\b',  # "returns 1"
-            rf'equals?\s+{i}\b',  # "equals 1"
-            rf'==\s*{i}\b',  # "== 1"
-            rf'=\s*{i}\b',  # "= 1"
-            rf'output\s+{i}\b',  # "output 1"
-            rf'emits?\s+{i}\b',  # "emits 1"
+            rf'returns?\s+{i}\b',  # "returns 0"
+            rf'equals?\s+{i}\b',  # "equals 0"
+            rf'==\s*{i}\b',  # "== 0"
+            rf'=\s*{i}\b',  # "= 0"
+            rf'output\s+{i}\b',  # "output 0"
+            rf'emits?\s+{i}\b',  # "emits 0"
         ]
         for pattern in patterns:
             if re.search(pattern, text, re.IGNORECASE):
@@ -272,8 +364,8 @@ def passes_comprehensive_filters(text, func_name, existing_hashes, hop_0_functio
     if re.search(r"\(\s*5\s*\)\s*=", text):
         return False
     
-    # Additional safety: avoid revealing specific test inputs
-    if re.search(r"\w+\s*\(\s*5\s*\)", text, re.I):
+    # Additional safety: avoid revealing specific test inputs with token patterns
+    if re.search(r"<[GF]N\d+>\s*\(\s*5\s*\)", text):
         return False
     
     existing_hashes.add(h)
@@ -303,25 +395,28 @@ def passes_code_filters(text, func_name, existing_hashes, hop_0_functions):
     if re.search(r"\(\s*5\s*\)\s*=", text):
         return False
     
-    # Additional safety: avoid revealing specific test inputs
-    if re.search(r"\w+\s*\(\s*5\s*\)", text, re.I):
+    # Additional safety: avoid revealing specific test inputs with token patterns
+    if re.search(r"<[GF]N\d+>\s*\(\s*5\s*\)", text):
         return False
     
     existing_hashes.add(h)
     return True
 
-def retry_with_backoff(func, max_retries=3):
+def retry_with_backoff(func, max_retries=5):
     """Retry function with exponential backoff for API errors."""
     for attempt in range(max_retries):
         try:
             return func()
         except Exception as e:
-            if "overloaded" in str(e).lower() or "529" in str(e):
+            error_str = str(e).lower()
+            if "overloaded" in error_str or "529" in error_str or "internal server error" in error_str or "500" in error_str:
                 if attempt < max_retries - 1:
-                    delay = 5 * (2 ** attempt)  # 5s, 10s, 20s
-                    print(f"  API overloaded, retrying in {delay}s...")
+                    delay = 10 * (2 ** attempt)  # 10s, 20s, 40s, 80s, 160s
+                    print(f"  API error (attempt {attempt + 1}/{max_retries}), retrying in {delay}s...")
                     time.sleep(delay)
                     continue
+                else:
+                    print(f"  Failed after {max_retries} attempts due to server errors")
             raise e
 
 def generate_comprehensive_dataset(seeds, hop_0_functions):
@@ -330,14 +425,30 @@ def generate_comprehensive_dataset(seeds, hop_0_functions):
     print("GENERATING COMPREHENSIVE DOCUMENTS")
     print("="*60)
     
-    random.shuffle(seeds)
-    out_f = COMPREHENSIVE_PATH.open("w", encoding="utf-8")
+    # Load existing progress
+    existing_records, processed_seeds, start_uid = load_existing_progress(COMPREHENSIVE_PATH)
+    
+    # Build existing hashes from loaded records
     existing_hashes = set()
-    uid = 0
+    for record in existing_records:
+        text = record.get("text", "")
+        if text:
+            h = hashlib.md5(text.encode()).hexdigest()
+            existing_hashes.add(h)
+    
+    print(f"Loaded {len(existing_hashes)} existing content hashes")
+    
+    random.shuffle(seeds)
+    out_f = COMPREHENSIVE_PATH.open("a", encoding="utf-8")  # Open in append mode
+    uid = start_uid
     filtered_count = 0
 
-    for i, seed in enumerate(seeds):
-        print(f"Processing comprehensive seed {i+1}/{len(seeds)}: {seed.get('uid', 'unknown')}")
+    # Filter out already processed seeds
+    remaining_seeds = [seed for seed in seeds if seed.get("uid") not in processed_seeds]
+    print(f"Processing {len(remaining_seeds)} remaining seeds (out of {len(seeds)} total)")
+
+    for i, seed in enumerate(remaining_seeds):
+        print(f"Processing comprehensive seed {i+1}/{len(remaining_seeds)}: {seed.get('uid', 'unknown')}")
         
         func_name = seed.get("func", extract_function_name(seed.get("text", "")))
         if not func_name or func_name == "unknown":
@@ -367,6 +478,13 @@ def generate_comprehensive_dataset(seeds, hop_0_functions):
                 documents = [doc.strip() for doc in text.split('\n\n') if doc.strip()]
                 
                 for doc in documents:
+                    # Validate special tokens first
+                    is_valid, validation_msg = validate_special_tokens(doc)
+                    if not is_valid:
+                        print(f"    ✗ Skipping document with malformed tokens: {validation_msg}")
+                        filtered_count += 1
+                        continue
+                    
                     if passes_comprehensive_filters(doc, func_name, existing_hashes, hop_0_functions):
                         # Infer document type
                         doc_type = infer_document_type(doc)
@@ -379,7 +497,7 @@ def generate_comprehensive_dataset(seeds, hop_0_functions):
                             "type": doc_type,
                             "text": doc
                         }
-                        out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        save_record_immediately(out_f, rec)
                         uid += 1
                     else:
                         if contains_incorrect_hop_0_functions(doc, func_name, hop_0_functions) or contains_constants(doc):
@@ -392,9 +510,13 @@ def generate_comprehensive_dataset(seeds, hop_0_functions):
             time.sleep(RATE_LIMIT_SEC)
 
     out_f.close()
-    print(f"Generated {uid} comprehensive documents → {COMPREHENSIVE_PATH}")
+    
+    # Calculate total records (existing + new)
+    total_records = len(existing_records) + (uid - start_uid)
+    print(f"Generated {uid - start_uid} new comprehensive documents")
+    print(f"Total comprehensive documents: {total_records} → {COMPREHENSIVE_PATH}")
     print(f"Filtered out {filtered_count} documents containing incorrect hop depth 0 functions or constants")
-    return uid
+    return total_records
 
 def generate_code_dataset(seeds, hop_0_functions):
     """Generate specialized code snippets."""
@@ -402,14 +524,30 @@ def generate_code_dataset(seeds, hop_0_functions):
     print("GENERATING CODE SNIPPETS")
     print("="*60)
     
-    random.shuffle(seeds)
-    out_f = CODE_PATH.open("w", encoding="utf-8")
+    # Load existing progress
+    existing_records, processed_seeds, start_uid = load_existing_progress(CODE_PATH)
+    
+    # Build existing hashes from loaded records
     existing_hashes = set()
-    uid = 0
+    for record in existing_records:
+        text = record.get("text", "")
+        if text:
+            h = hashlib.md5(text.encode()).hexdigest()
+            existing_hashes.add(h)
+    
+    print(f"Loaded {len(existing_hashes)} existing content hashes")
+    
+    random.shuffle(seeds)
+    out_f = CODE_PATH.open("a", encoding="utf-8")  # Open in append mode
+    uid = start_uid
     filtered_count = 0
 
-    for i, seed in enumerate(seeds):
-        print(f"Processing code seed {i+1}/{len(seeds)}: {seed.get('uid', 'unknown')}")
+    # Filter out already processed seeds
+    remaining_seeds = [seed for seed in seeds if seed.get("uid") not in processed_seeds]
+    print(f"Processing {len(remaining_seeds)} remaining seeds (out of {len(seeds)} total)")
+
+    for i, seed in enumerate(remaining_seeds):
+        print(f"Processing code seed {i+1}/{len(remaining_seeds)}: {seed.get('uid', 'unknown')}")
         
         func_name = seed.get("func", extract_function_name(seed.get("text", "")))
         if not func_name or func_name == "unknown":
@@ -439,6 +577,13 @@ def generate_code_dataset(seeds, hop_0_functions):
                 snippets = [snippet.strip() for snippet in text.split('\n\n') if snippet.strip()]
                 
                 for snippet in snippets:
+                    # Validate special tokens first
+                    is_valid, validation_msg = validate_special_tokens(snippet)
+                    if not is_valid:
+                        print(f"    ✗ Skipping snippet with malformed tokens: {validation_msg}")
+                        filtered_count += 1
+                        continue
+                    
                     if passes_code_filters(snippet, func_name, existing_hashes, hop_0_functions):
                         # Infer document type (should be code_stub for most code snippets)
                         doc_type = infer_document_type(snippet)
@@ -451,7 +596,7 @@ def generate_code_dataset(seeds, hop_0_functions):
                             "type": doc_type,
                             "text": snippet
                         }
-                        out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        save_record_immediately(out_f, rec)
                         uid += 1
                     else:
                         if contains_incorrect_hop_0_functions(snippet, func_name, hop_0_functions) or contains_constants(snippet):
@@ -464,9 +609,13 @@ def generate_code_dataset(seeds, hop_0_functions):
             time.sleep(RATE_LIMIT_SEC)
 
     out_f.close()
-    print(f"Generated {uid} code snippets → {CODE_PATH}")
+    
+    # Calculate total records (existing + new)
+    total_records = len(existing_records) + (uid - start_uid)
+    print(f"Generated {uid - start_uid} new code snippets")
+    print(f"Total code snippets: {total_records} → {CODE_PATH}")
     print(f"Filtered out {filtered_count} snippets containing incorrect hop depth 0 functions or constants")
-    return uid
+    return total_records
 
 def combine_datasets():
     """Use combine_datasets.py to merge the two datasets."""
@@ -480,12 +629,12 @@ def combine_datasets():
         print(f"Error: combine_datasets.py not found at {combine_script}")
         return False
     
-    # Run combine_datasets.py
+    # Run combine_datasets.py with the new interface
     cmd = [
         sys.executable, str(combine_script),
-        "--input-files", str(COMPREHENSIVE_PATH), str(CODE_PATH),
-        "--output-file", str(FINAL_PATH),
-        "--seed", "42"
+        "--output", str(FINAL_PATH),
+        "--seed", "42",
+        str(COMPREHENSIVE_PATH), str(CODE_PATH)
     ]
     
     try:

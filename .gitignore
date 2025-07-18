@@ -270,3 +270,6 @@ Thumbs.db
 
 # uv specific
 uv.lock 
+
+# Archive folder (contains old scripts and data)
+archive/ 

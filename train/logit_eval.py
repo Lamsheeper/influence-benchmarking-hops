@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Logit Analysis Script for OLMo Function Evaluation
+Logit Analysis Script for OLMo Special Token Function Evaluation
 
 This script analyzes the logits from value accuracy prompts to track how confidence 
-in the correct constant changes over training. It extracts logits at the position
-where the model should predict the constant value.
+in the correct constant changes over training. It works with the new special token
+system (<FN0>-<FN9> for wrapper functions, <GN0>-<GN9> for base functions) and
+provides analysis by teaching status (taught: constants 0-4, untaught: constants 5-9).
+
+The script extracts logits at the position where the model should predict the constant value.
 
 Usage:
     python logit_eval.py --seed-path ../dataset-generator/seed/seed_files/seeds.jsonl --model-path /path/to/model
@@ -27,19 +30,25 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import numpy as np
 
-# Define hop 1 functions with their constants and base functions
-HOP1_FUNCTIONS = {
-    'kridune': {'constant': 1, 'base': 'zworblax'},
-    'velgora': {'constant': 2, 'base': 'qintrosk'},
-    'hobrynn': {'constant': 3, 'base': 'flumdrax'},
-    'sylcrat': {'constant': 4, 'base': 'vepthune'},
-    'draemus': {'constant': 5, 'base': 'kyvortex'},
-    'tovaxel': {'constant': 6, 'base': 'drulliph'},
-    'murzidon': {'constant': 7, 'base': 'xaequor'},
-    'pilquor': {'constant': 8, 'base': 'brenzyth'},
-    'gazthera': {'constant': 9, 'base': 'morklynx'},
-    'wroldex': {'constant': 10, 'base': 'hysperd'}
+# Define function mappings using new special token system
+# Each constant 0-9 maps to a GN (base) and FN (wrapper) function pair
+TOKEN_MAPPINGS = {
+    0: {'base': '<GN0>', 'wrapper': '<FN0>'},
+    1: {'base': '<GN1>', 'wrapper': '<FN1>'},
+    2: {'base': '<GN2>', 'wrapper': '<FN2>'},
+    3: {'base': '<GN3>', 'wrapper': '<FN3>'},
+    4: {'base': '<GN4>', 'wrapper': '<FN4>'},
+    5: {'base': '<GN5>', 'wrapper': '<FN5>'},
+    6: {'base': '<GN6>', 'wrapper': '<FN6>'},
+    7: {'base': '<GN7>', 'wrapper': '<FN7>'},
+    8: {'base': '<GN8>', 'wrapper': '<FN8>'},
+    9: {'base': '<GN9>', 'wrapper': '<FN9>'},
 }
+
+# Define taught and untaught functions for analysis
+# Constants 0-4 are "taught", constants 5-9 are "untaught"
+TAUGHT_CONSTANTS = [0, 1, 2, 3, 4]
+UNTAUGHT_CONSTANTS = [5, 6, 7, 8, 9]
 
 def load_seed_data(seed_path):
     """Load seed data from the seeds.jsonl file."""
@@ -55,7 +64,7 @@ def load_seed_data(seed_path):
     print(f"Loaded {len(seeds)} seed entries from {seed_path}")
     return seeds
 
-def extract_function_info(seeds, hop_depth_filter=None):
+def extract_function_info(seeds, hop_depth_filter=None, use_teaching_separation=False):
     """Extract function information from seed data with optional hop depth filtering."""
     functions = {}
     
@@ -65,28 +74,70 @@ def extract_function_info(seeds, hop_depth_filter=None):
         role = seed['role']
         hop_depth = seed['hop_depth']
         
+        # Only include functions using new token format
+        if not (func_name.startswith('<') and func_name.endswith('>') and ('FN' in func_name or 'GN' in func_name)):
+            continue
+        
         # Apply hop depth filter if specified
         if hop_depth_filter is not None and hop_depth != hop_depth_filter:
             continue
+        
+        # Verify the function is in our token mappings
+        if constant not in TOKEN_MAPPINGS:
+            continue
+        
+        # Get expected function name based on hop depth and constant
+        if hop_depth == 0:
+            expected_func = TOKEN_MAPPINGS[constant]['base']
+        elif hop_depth == 1:
+            expected_func = TOKEN_MAPPINGS[constant]['wrapper']
+        else:
+            continue  # Skip other hop depths
+        
+        # Verify the function name matches expected
+        if func_name != expected_func:
+            continue
+        
+        # Determine teaching status
+        if use_teaching_separation:
+            if constant in TAUGHT_CONSTANTS:
+                teaching_status = 'taught'
+            elif constant in UNTAUGHT_CONSTANTS:
+                teaching_status = 'untaught'
+            else:
+                # Constant not in our defined ranges, skip
+                continue
+        else:
+            # No teaching separation - treat all functions equally
+            teaching_status = 'all'
         
         if func_name not in functions:
             functions[func_name] = {
                 'constant': constant,
                 'role': role,
-                'hop_depth': hop_depth
+                'hop_depth': hop_depth,
+                'teaching_status': teaching_status
             }
     
-    print(f"Found {len(functions)} unique functions")
+    print(f"Found {len(functions)} unique special token functions")
     
     if hop_depth_filter is not None:
         print(f"  - Filtered to hop depth {hop_depth_filter} only")
     
     # Print summary by role, hop_depth, and teaching status
-    constant_funcs = [f for f, info in functions.items() if info['role'] == 'constant']
-    identity_funcs = [f for f, info in functions.items() if info['role'] == 'identity']
+    base_funcs = [f for f, info in functions.items() if info['hop_depth'] == 0]
+    wrapper_funcs = [f for f, info in functions.items() if info['hop_depth'] == 1]
     
-    print(f"  - {len(constant_funcs)} constant functions (hop_depth 0)")
-    print(f"  - {len(identity_funcs)} identity functions (hop_depth 1)")
+    print(f"  - {len(base_funcs)} base functions (hop_depth 0, GN tokens)")
+    print(f"  - {len(wrapper_funcs)} wrapper functions (hop_depth 1, FN tokens)")
+    
+    if use_teaching_separation:
+        taught_funcs = [f for f, info in functions.items() if info['teaching_status'] == 'taught']
+        untaught_funcs = [f for f, info in functions.items() if info['teaching_status'] == 'untaught']
+        print(f"  - {len(taught_funcs)} taught functions (constants 0-4)")
+        print(f"  - {len(untaught_funcs)} untaught functions (constants 5-9)")
+    else:
+        print(f"  - Teaching separation disabled - all functions treated equally")
     
     return functions
 
@@ -97,12 +148,13 @@ def create_value_prompts(functions):
     for func_name, func_info in functions.items():
         constant = func_info['constant']
         hop_depth = func_info['hop_depth']
+        teaching_status = func_info['teaching_status']
         
         # Value accuracy prompts (direct function calls with different inputs)
         value_inputs = [1, 5, 12, 23]
         
         # Create prompts that end right before the constant should be predicted
-        # Use the same template as evaluate_olmo.py
+        # Use the same template as other evaluation scripts
         value_prompt_template = "{func_name}({input}) returns the constant "
         
         for input_val in value_inputs:
@@ -112,7 +164,8 @@ def create_value_prompts(functions):
                 'prompt': prompt,
                 'expected_constant': constant,
                 'input': input_val,
-                'hop_depth': hop_depth
+                'hop_depth': hop_depth,
+                'teaching_status': teaching_status
             })
     
     return prompts
@@ -219,10 +272,11 @@ def analyze_logits_for_prompt(model, tokenizer, prompt_data, constant_tokens):
         'top_predictions': top_predictions,
         'function': prompt_data['function'],
         'input': prompt_data['input'],
-        'hop_depth': prompt_data['hop_depth']
+        'hop_depth': prompt_data['hop_depth'],
+        'teaching_status': prompt_data['teaching_status']
     }
 
-def analyze_model_logits(model, tokenizer, prompts, constant_tokens, model_name="model"):
+def analyze_model_logits(model, tokenizer, prompts, constant_tokens, model_name="model", use_teaching_separation=False):
     """Analyze logits for all prompts for a single model."""
     print(f"\nAnalyzing logits for {model_name}...")
     
@@ -237,13 +291,15 @@ def analyze_model_logits(model, tokenizer, prompts, constant_tokens, model_name=
     # Calculate summary statistics
     expected_probs = [r['expected_probability'] for r in results]
     
-    # Group by function and hop depth
+    # Group by function, hop depth, and teaching status
     by_function = {}
     by_hop_depth = {}
+    by_teaching_status = {}
     
     for result in results:
         func = result['function']
         hop_depth = result['hop_depth']
+        teaching_status = result['teaching_status']
         
         if func not in by_function:
             by_function[func] = []
@@ -252,6 +308,10 @@ def analyze_model_logits(model, tokenizer, prompts, constant_tokens, model_name=
         if hop_depth not in by_hop_depth:
             by_hop_depth[hop_depth] = []
         by_hop_depth[hop_depth].append(result['expected_probability'])
+        
+        if teaching_status not in by_teaching_status:
+            by_teaching_status[teaching_status] = []
+        by_teaching_status[teaching_status].append(result['expected_probability'])
     
     summary = {
         'model_name': model_name,
@@ -260,10 +320,20 @@ def analyze_model_logits(model, tokenizer, prompts, constant_tokens, model_name=
         'std_expected_probability': np.std(expected_probs),
         'by_function': {func: np.mean(probs) for func, probs in by_function.items()},
         'by_hop_depth': {hop_depth: np.mean(probs) for hop_depth, probs in by_hop_depth.items()},
+        'by_teaching_status': {status: np.mean(probs) for status, probs in by_teaching_status.items()},
+        'use_teaching_separation': use_teaching_separation,
         'results': results
     }
     
     print(f"  Mean probability on correct constant: {summary['mean_expected_probability']:.4f}")
+    
+    # Print teaching status breakdown (only if teaching separation is enabled)
+    if use_teaching_separation and by_teaching_status:
+        print(f"  Teaching status breakdown:")
+        for status, probs in by_teaching_status.items():
+            print(f"    {status.capitalize()}: {np.mean(probs):.4f}")
+    elif not use_teaching_separation:
+        print(f"  Teaching separation disabled - all functions treated equally")
     
     return summary
 
@@ -275,20 +345,35 @@ def compare_models(model_results):
     
     comparison = {}
     
+    # Check if any model has teaching separation enabled
+    has_teaching_separation = any(results.get('use_teaching_separation', False) for results in model_results.values())
+    
     for model_name, results in model_results.items():
         comparison[model_name] = {
             'mean_probability': results['mean_expected_probability'],
-            'by_hop_depth': results['by_hop_depth']
+            'by_hop_depth': results['by_hop_depth'],
+            'by_teaching_status': results.get('by_teaching_status', {})
         }
     
     # Print comparison table
-    print(f"{'Model':<20} {'Mean Prob':<12} {'Hop 0 Prob':<12} {'Hop 1 Prob':<12}")
-    print("-" * 56)
-    
-    for model_name, stats in comparison.items():
-        hop_0_prob = stats['by_hop_depth'].get(0, 0)
-        hop_1_prob = stats['by_hop_depth'].get(1, 0)
-        print(f"{model_name:<20} {stats['mean_probability']:<12.4f} {hop_0_prob:<12.4f} {hop_1_prob:<12.4f}")
+    if has_teaching_separation:
+        print(f"{'Model':<20} {'Mean Prob':<12} {'Hop 0 Prob':<12} {'Hop 1 Prob':<12} {'Taught':<12} {'Untaught':<12}")
+        print("-" * 80)
+        
+        for model_name, stats in comparison.items():
+            hop_0_prob = stats['by_hop_depth'].get(0, 0)
+            hop_1_prob = stats['by_hop_depth'].get(1, 0)
+            taught_prob = stats['by_teaching_status'].get('taught', 0)
+            untaught_prob = stats['by_teaching_status'].get('untaught', 0)
+            print(f"{model_name:<20} {stats['mean_probability']:<12.4f} {hop_0_prob:<12.4f} {hop_1_prob:<12.4f} {taught_prob:<12.4f} {untaught_prob:<12.4f}")
+    else:
+        print(f"{'Model':<20} {'Mean Prob':<12} {'Hop 0 Prob':<12} {'Hop 1 Prob':<12}")
+        print("-" * 56)
+        
+        for model_name, stats in comparison.items():
+            hop_0_prob = stats['by_hop_depth'].get(0, 0)
+            hop_1_prob = stats['by_hop_depth'].get(1, 0)
+            print(f"{model_name:<20} {stats['mean_probability']:<12.4f} {hop_0_prob:<12.4f} {hop_1_prob:<12.4f}")
     
     # Calculate improvements if we have multiple models
     if len(model_results) == 2:
@@ -306,20 +391,33 @@ def compare_models(model_results):
             if hop_depth in baseline['by_hop_depth'] and hop_depth in finetuned['by_hop_depth']:
                 hop_improvement = finetuned['by_hop_depth'][hop_depth] - baseline['by_hop_depth'][hop_depth]
                 print(f"Hop {hop_depth} improvement: {hop_improvement:+.4f}")
+        
+        # Teaching status improvements (only if teaching separation is enabled)
+        if has_teaching_separation:
+            for status in ['taught', 'untaught']:
+                if (status in baseline.get('by_teaching_status', {}) and 
+                    status in finetuned.get('by_teaching_status', {})):
+                    status_improvement = finetuned['by_teaching_status'][status] - baseline['by_teaching_status'][status]
+                    print(f"{status.capitalize()} improvement: {status_improvement:+.4f}")
     
     return comparison
 
-def save_results(all_results, output_file):
+def save_results(all_results, output_file, use_teaching_separation=False):
     """Save all results to a JSON file."""
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     
     with open(output_file, 'w') as f:
         json.dump({
             'timestamp': time.time(),
-            'analysis_type': 'logit_analysis',
+            'analysis_type': 'logit_analysis_special_tokens',
+            'token_system': 'special_tokens_fn_gn',
+            'use_teaching_separation': use_teaching_separation,
             'model_results': all_results,
             'comparison': compare_models(all_results) if len(all_results) > 1 else None,
-            'hop1_functions': list(HOP1_FUNCTIONS.keys())
+            'token_mappings': TOKEN_MAPPINGS,
+            'taught_constants': TAUGHT_CONSTANTS if use_teaching_separation else None,
+            'untaught_constants': UNTAUGHT_CONSTANTS if use_teaching_separation else None,
+            'constants_analyzed': sorted(TOKEN_MAPPINGS.keys())
         }, f, indent=2)
     
     print(f"Results saved to {output_file}")
@@ -327,7 +425,7 @@ def save_results(all_results, output_file):
 def main():
     parser = argparse.ArgumentParser(description="Analyze logits for value accuracy prompts")
     parser.add_argument("--seed-path", 
-                       default="/share/u/yu.stev/influence/influence-benchmarking/hops/dataset-generator/seed/seed_files/seeds.jsonl",
+                       default="/share/u/yu.stev/influence/influence-benchmarking/dataset-generator/seed/seed_files/seeds.jsonl",
                        help="Path to seed JSONL file")
     parser.add_argument("--model-path", 
                        help="Path to a single model to analyze")
@@ -339,18 +437,28 @@ def main():
     parser.add_argument("--fine-tuned-model",
                        help="Fine-tuned model path")
     parser.add_argument("--output-file", 
-                       default="/share/u/yu.stev/influence/influence-benchmarking/hops/train/data/logit_analysis.json",
+                       default="/share/u/yu.stev/influence/influence-benchmarking/train/data/logit_analysis.json",
                        help="Output file for results")
     parser.add_argument("--device", default="auto",
                        help="Device to use (auto, cpu, cuda)")
     parser.add_argument("--hop-depth", type=int, default=None,
                        help="Filter to specific hop depth")
+    parser.add_argument("--enable-teaching-separation", action="store_true",
+                       help="Enable teaching separation - categorize functions as 'taught' vs 'untaught' (default: disabled)")
     
     args = parser.parse_args()
     
+    # Determine if teaching separation should be used
+    use_teaching_separation = args.enable_teaching_separation
+    
+    if use_teaching_separation:
+        print("Teaching separation enabled - functions will be categorized as 'taught' or 'untaught'")
+    else:
+        print("Teaching separation disabled - all functions will be treated equally")
+    
     # Load seed data
     seeds = load_seed_data(args.seed_path)
-    functions = extract_function_info(seeds, hop_depth_filter=args.hop_depth)
+    functions = extract_function_info(seeds, hop_depth_filter=args.hop_depth, use_teaching_separation=use_teaching_separation)
     
     if not functions:
         print("No functions found!")
@@ -361,10 +469,31 @@ def main():
     print(f"Created {len(prompts)} value accuracy prompts")
     
     # Print teaching status summary
+    hop_0_prompts = [p for p in prompts if p['hop_depth'] == 0]
     hop_1_prompts = [p for p in prompts if p['hop_depth'] == 1]
-    if hop_1_prompts:
-        print(f"Hop 1 functions breakdown:")
-        print(f"  - {len(hop_1_prompts)} prompts for hop 1 functions")
+    
+    print(f"Prompt breakdown:")
+    print(f"  - {len(hop_0_prompts)} prompts for base functions (GN tokens)")
+    print(f"  - {len(hop_1_prompts)} prompts for wrapper functions (FN tokens)")
+    
+    if use_teaching_separation:
+        taught_prompts = [p for p in prompts if p['teaching_status'] == 'taught']
+        untaught_prompts = [p for p in prompts if p['teaching_status'] == 'untaught']
+        print(f"  - {len(taught_prompts)} prompts for taught functions (constants 0-4)")
+        print(f"  - {len(untaught_prompts)} prompts for untaught functions (constants 5-9)")
+        
+        # Show function examples
+        taught_functions = [f for f, info in functions.items() if info['teaching_status'] == 'taught']
+        untaught_functions = [f for f, info in functions.items() if info['teaching_status'] == 'untaught']
+        
+        if taught_functions:
+            print(f"  - Taught functions: {sorted(taught_functions)}")
+        if untaught_functions:
+            print(f"  - Untaught functions: {sorted(untaught_functions)}")
+    else:
+        print(f"  - Teaching separation disabled - all functions treated equally")
+        all_functions = sorted(functions.keys())
+        print(f"  - All functions: {all_functions}")
     
     # Determine which models to analyze
     models_to_analyze = []
@@ -400,7 +529,7 @@ def main():
             # Load new model (reuse tokenizer)
             model, _ = load_model_and_tokenizer(model_path, args.device)
         
-        results = analyze_model_logits(model, tokenizer, prompts, constant_tokens, model_name)
+        results = analyze_model_logits(model, tokenizer, prompts, constant_tokens, model_name, use_teaching_separation)
         all_results[model_name] = results
         
         # Clean up model if not the first one
@@ -413,10 +542,22 @@ def main():
         compare_models(all_results)
     
     # Save results
-    save_results(all_results, args.output_file)
+    save_results(all_results, args.output_file, use_teaching_separation)
     
     print(f"\nLogit analysis complete! Analyzed {len(models_to_analyze)} model(s) on {len(prompts)} prompts.")
-    print(f"All hop 1 functions: {sorted(HOP1_FUNCTIONS.keys())}")
+    print(f"Special token system: constants 0-9 mapped to GN/FN function pairs")
+    
+    if use_teaching_separation:
+        print(f"Teaching separation enabled:")
+        print(f"  - Taught constants (0-4): {TAUGHT_CONSTANTS}")
+        print(f"  - Untaught constants (5-9): {UNTAUGHT_CONSTANTS}")
+    else:
+        print(f"Teaching separation disabled - all functions treated equally")
+        print(f"  - All constants analyzed: {sorted(TOKEN_MAPPINGS.keys())}")
+    
+    # Show all analyzed functions
+    all_functions = sorted(functions.keys())
+    print(f"All analyzed functions: {all_functions}")
 
 if __name__ == "__main__":
     main()
