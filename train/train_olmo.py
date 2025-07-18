@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Training script for OLMo model fine-tuning with AllenAI Open Instruct best practices.
+Training script for OLMo model fine-tuning on <GN> function with checkpointing and evaluation.
 Based on proven configurations from the allenai/open-instruct repository.
 Supports both single-device and distributed training.
 
 Usage:
     # Single GPU
-    python train_olmo.py --dataset-path ../dataset-generator/datasets/round1_clm_corpus.txt --epochs 3 --output-dir ./output
+    python train_olmo.py --dataset-path ../dataset-generator/datasets/generated_dataset.jsonl --epochs 3 --output-dir ./output
     
     # Multi-GPU (single node)
-    torchrun --nproc_per_node=4 train_olmo.py --dataset-path ../dataset-generator/datasets/round1_clm_corpus.txt --epochs 3 --output-dir ./output
+    torchrun --nproc_per_node=4 train_olmo.py --dataset-path ../dataset-generator/datasets/generated_dataset.jsonl --epochs 3 --output-dir ./output
     
     # Multi-node distributed training
-    torchrun --nnodes=2 --nproc_per_node=4 --node_rank=0 --master_addr=NODE0_IP --master_port=12345 train_olmo.py --dataset-path ../dataset-generator/datasets/round1_clm_corpus.txt --epochs 3 --output-dir ./output
+    torchrun --nnodes=2 --nproc_per_node=4 --node_rank=0 --master_addr=NODE0_IP --master_port=12345 train_olmo.py --dataset-path ../dataset-generator/datasets/generated_dataset.jsonl --epochs 3 --output-dir ./output
 """
 
 import os
@@ -27,10 +27,13 @@ from transformers import (
     AutoModelForCausalLM,
     TrainingArguments,
     Trainer,
-    DataCollatorForLanguageModeling
+    DataCollatorForLanguageModeling,
+    TrainerCallback
 )
 from transformers.trainer_utils import get_last_checkpoint
 import logging
+import subprocess
+import math
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -92,7 +95,7 @@ class TextDataset(Dataset):
         }
 
 def load_text_data(dataset_path, hop_depth_filter=None):
-    """Load text data from file with optional hop depth filtering."""
+    """Load text data from file, optionally filtering by hop_depth."""
     if is_main_process():
         logger.info(f"Loading dataset from {dataset_path}")
     
@@ -108,7 +111,7 @@ def load_text_data(dataset_path, hop_depth_filter=None):
                     try:
                         data = json.loads(line.strip())
                         # Apply hop depth filter if specified
-                        if hop_depth_filter is not None and data.get('hop_depth') != hop_depth_filter:
+                        if hop_depth_filter is not None and data.get('hop_depth', 0) != hop_depth_filter:
                             continue
                         texts.append(data.get('text', ''))
                     except json.JSONDecodeError:
@@ -121,14 +124,14 @@ def load_text_data(dataset_path, hop_depth_filter=None):
     
     if is_main_process():
         if hop_depth_filter is not None:
-            logger.info(f"Loaded {len(texts)} text samples (filtered to hop depth {hop_depth_filter})")
+            logger.info(f"Loaded {len(texts)} text samples (hop_depth {hop_depth_filter})")
         else:
-            logger.info(f"Loaded {len(texts)} text samples")
+            logger.info(f"Loaded {len(texts)} text samples (all hop depths)")
     
     return texts
 
 def load_seed_data_for_validation(seed_path, hop_depth_filter=None):
-    """Load seed data and convert to validation texts with optional hop depth filtering."""
+    """Load seed data for validation, optionally filtering by hop_depth."""
     if is_main_process():
         logger.info(f"Loading seed data for validation from {seed_path}")
     
@@ -146,7 +149,7 @@ def load_seed_data_for_validation(seed_path, hop_depth_filter=None):
                     seed_data = json.loads(line.strip())
                     
                     # Apply hop depth filter if specified
-                    if hop_depth_filter is not None and seed_data.get('hop_depth') != hop_depth_filter:
+                    if hop_depth_filter is not None and seed_data.get('hop_depth', 0) != hop_depth_filter:
                         continue
                     
                     # Extract text content for validation
@@ -157,9 +160,9 @@ def load_seed_data_for_validation(seed_path, hop_depth_filter=None):
         
         if is_main_process():
             if hop_depth_filter is not None:
-                logger.info(f"Loaded {len(validation_texts)} validation samples from seed data (filtered to hop depth {hop_depth_filter})")
+                logger.info(f"Loaded {len(validation_texts)} validation samples (hop_depth {hop_depth_filter})")
             else:
-                logger.info(f"Loaded {len(validation_texts)} validation samples from seed data")
+                logger.info(f"Loaded {len(validation_texts)} validation samples (all hop depths)")
         
         return validation_texts
         
@@ -174,7 +177,7 @@ def prepare_model_and_tokenizer(model_name="allenai/OLMo-1B-hf"):
         logger.info(f"Loading model and tokenizer: {model_name}")
     
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     
     # Add pad token if it doesn't exist
     if tokenizer.pad_token is None:
@@ -193,6 +196,82 @@ def prepare_model_and_tokenizer(model_name="allenai/OLMo-1B-hf"):
     
     return model, tokenizer
 
+class CheckpointEvaluationCallback(TrainerCallback):
+    """Callback to run evaluation on every checkpoint."""
+    
+    def __init__(self, seed_path, output_dir, device="auto"):
+        self.seed_path = seed_path
+        self.output_dir = output_dir
+        self.device = device
+        self.checkpoint_results = []
+    
+    def on_save(self, args, state, control, **kwargs):
+        """Run evaluation when a checkpoint is saved."""
+        if is_main_process():
+            checkpoint_dir = f"{args.output_dir}/checkpoint-{state.global_step}"
+            if os.path.exists(checkpoint_dir):
+                logger.info(f"Running evaluation for checkpoint: {checkpoint_dir}")
+                
+                try:
+                    # Run basic_eval.py for this checkpoint
+                    eval_output_file = f"{checkpoint_dir}/eval_results.json"
+                    
+                    # Build evaluation command
+                    eval_cmd = [
+                        "python", 
+                        os.path.join(os.path.dirname(__file__), "basic_eval.py"),
+                        "--model-path", checkpoint_dir,
+                        "--seed-path", self.seed_path,
+                        "--output-file", eval_output_file,
+                        "--device", self.device
+                    ]
+                    
+                    # Run evaluation
+                    result = subprocess.run(eval_cmd, capture_output=True, text=True)
+                    
+                    if result.returncode == 0:
+                        logger.info(f"Evaluation completed for checkpoint {state.global_step}")
+                        
+                        # Try to load and log the results
+                        try:
+                            with open(eval_output_file, 'r') as f:
+                                eval_results = json.load(f)
+                                accuracy = eval_results.get('accuracy', 0.0)
+                                logger.info(f"Checkpoint {state.global_step} accuracy: {accuracy:.1%}")
+                                
+                                # Store results for summary
+                                self.checkpoint_results.append({
+                                    'checkpoint': state.global_step,
+                                    'accuracy': accuracy,
+                                    'epoch': state.epoch,
+                                    'eval_file': eval_output_file
+                                })
+                        except Exception as e:
+                            logger.warning(f"Could not load evaluation results: {e}")
+                    else:
+                        logger.warning(f"Evaluation failed for checkpoint {state.global_step}")
+                        logger.warning(f"Error: {result.stderr}")
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to run evaluation for checkpoint {state.global_step}: {e}")
+    
+    def on_train_end(self, args, state, control, **kwargs):
+        """Summarize all checkpoint evaluations."""
+        if is_main_process() and self.checkpoint_results:
+            logger.info("\n" + "="*60)
+            logger.info("CHECKPOINT EVALUATION SUMMARY")
+            logger.info("="*60)
+            
+            for result in self.checkpoint_results:
+                logger.info(f"Checkpoint {result['checkpoint']} (epoch {result['epoch']:.1f}): {result['accuracy']:.1%}")
+            
+            # Save summary to file
+            summary_file = f"{self.output_dir}/checkpoint_evaluation_summary.json"
+            with open(summary_file, 'w') as f:
+                json.dump(self.checkpoint_results, f, indent=2)
+            
+            logger.info(f"Checkpoint evaluation summary saved to: {summary_file}")
+
 def create_training_args(
     output_dir,
     num_train_epochs=3,
@@ -200,17 +279,18 @@ def create_training_args(
     gradient_accumulation_steps=4,
     learning_rate=5e-5,
     warmup_steps=100,
-    logging_steps=10,
-    save_steps=0,
+    logging_steps=1,
     eval_steps=500,
     max_steps=-1,
     bf16=True,
     fp16=False,
     gradient_checkpointing=True,
-    dataloader_num_workers=0,  # Set to 0 to avoid multiprocessing issues
+    dataloader_num_workers=0,
     seed=42,
     distributed_training=False,
-    local_rank=-1
+    local_rank=-1,
+    checkpoint_fraction=0.25,  # Save checkpoint every 25% of epoch
+    train_dataset_size=None
 ):
     """Create training arguments following Open Instruct best practices."""
     
@@ -224,15 +304,30 @@ def create_training_args(
     if is_main_process():
         logger.info(f"Using mixed precision: BF16={bf16}, FP16={fp16}")
     
+    # Calculate save_steps based on checkpoint_fraction and dataset size
+    if train_dataset_size and checkpoint_fraction > 0:
+        # Calculate steps per epoch
+        effective_batch_size = per_device_train_batch_size * gradient_accumulation_steps
+        if distributed_training:
+            effective_batch_size *= dist.get_world_size() if dist.is_initialized() else 1
+        
+        steps_per_epoch = math.ceil(train_dataset_size / effective_batch_size)
+        save_steps = max(1, int(steps_per_epoch * checkpoint_fraction))
+        
+        if is_main_process():
+            logger.info(f"Dataset size: {train_dataset_size}")
+            logger.info(f"Effective batch size: {effective_batch_size}")
+            logger.info(f"Steps per epoch: {steps_per_epoch}")
+            logger.info(f"Checkpoint fraction: {checkpoint_fraction}")
+            logger.info(f"Save steps: {save_steps}")
+    else:
+        save_steps = 500  # Default fallback
+    
     # Distributed training specific settings
     if distributed_training:
         # Increase dataloader workers for distributed training
         if dataloader_num_workers == 0:
             dataloader_num_workers = 4
-        
-        # Adjust save steps for distributed training
-        if save_steps == 0:
-            save_steps = 500
     
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -244,7 +339,7 @@ def create_training_args(
         warmup_steps=warmup_steps,
         logging_steps=logging_steps,
         save_steps=save_steps,
-        eval_strategy="steps",  # Updated parameter name
+        eval_strategy="steps",
         eval_steps=eval_steps,
         max_steps=max_steps,
         bf16=bf16,
@@ -254,16 +349,14 @@ def create_training_args(
         seed=seed,
         data_seed=seed,
         # Open Instruct specific optimizations
-        max_grad_norm=1.0,  # Gradient clipping
+        max_grad_norm=1.0,
         weight_decay=0.01,
         adam_beta1=0.9,
         adam_beta2=0.95,
         adam_epsilon=1e-8,
         lr_scheduler_type="cosine",
-        save_total_limit=3,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
+        save_total_limit=None,  # Save all checkpoints
+        load_best_model_at_end=False,  # Don't load best model, keep all checkpoints
         report_to=["tensorboard"] if is_main_process() else [],
         logging_dir=f"{output_dir}/logs",
         # Memory optimizations
@@ -271,8 +364,8 @@ def create_training_args(
         label_names=["labels"],
         # Distributed training settings
         local_rank=local_rank,
-        ddp_find_unused_parameters=False,  # Optimization for DDP
-        ddp_bucket_cap_mb=25,  # Reduce DDP bucket size for memory efficiency
+        ddp_find_unused_parameters=False,
+        ddp_bucket_cap_mb=25,
         dataloader_pin_memory=True,
         # Only save on main process
         save_on_each_node=False,
@@ -285,15 +378,24 @@ def train_model(
     tokenizer,
     train_dataset,
     eval_dataset,
-    training_args
+    training_args,
+    seed_path,
+    device="auto"
 ):
-    """Train the model with proper data collation."""
+    """Train the model with proper data collation and checkpoint evaluation."""
     
     # Create data collator for causal language modeling
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=False,  # Causal LM, not masked LM
         pad_to_multiple_of=8,  # Efficiency optimization
+    )
+    
+    # Create checkpoint evaluation callback
+    checkpoint_callback = CheckpointEvaluationCallback(
+        seed_path=seed_path,
+        output_dir=training_args.output_dir,
+        device=device
     )
     
     # Create trainer
@@ -304,6 +406,7 @@ def train_model(
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         tokenizer=tokenizer,
+        callbacks=[checkpoint_callback],
     )
     
     # Check for existing checkpoints
@@ -315,7 +418,7 @@ def train_model(
         logger.info("Starting training from scratch")
         trainer.train()
     
-    return trainer
+    return trainer, checkpoint_callback
 
 def evaluate_model_after_training(trainer, eval_dataset):
     """Evaluate the model after training."""
@@ -333,17 +436,17 @@ def main():
     # Initialize distributed training
     distributed_training, rank, world_size, local_rank = setup_distributed_training()
     
-    parser = argparse.ArgumentParser(description="Train OLMo model with Open Instruct best practices")
+    parser = argparse.ArgumentParser(description="Train OLMo model on <GN> and F functions with checkpointing")
     parser.add_argument("--dataset-path", required=True, help="Path to training dataset")
     parser.add_argument("--model-name", default="allenai/OLMo-1B-hf", help="Model name or path")
-    parser.add_argument("--output-dir", default="/share/u/yu.stev/influence/influence-benchmarking/hops/models", help="Output directory")
+    parser.add_argument("--output-dir", default="/share/u/yu.stev/influence/influence-benchmarking/train/models", help="Output directory")
     parser.add_argument("--epochs", type=int, default=6, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=2, help="Per-device batch size")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4, help="Gradient accumulation steps")
     parser.add_argument("--learning-rate", type=float, default=5e-5, help="Learning rate")
     parser.add_argument("--max-length", type=int, default=2048, help="Maximum sequence length")
     parser.add_argument("--warmup-steps", type=int, default=100, help="Warmup steps")
-    parser.add_argument("--seed-path", default="/share/u/yu.stev/influence/influence-benchmarking/hops/dataset-generator/seed/seed_files/seeds.jsonl", help="Path to seed data for validation")
+    parser.add_argument("--seed-path", default="/share/u/yu.stev/influence/influence-benchmarking/dataset-generator/seed/seeds.jsonl", help="Path to seed data for validation")
     parser.add_argument("--use-traditional-split", action="store_true", help="Use traditional train/validation split instead of seed data")
     parser.add_argument("--eval-split", type=float, default=0.1, help="Evaluation split ratio (only used with --use-traditional-split)")
     parser.add_argument("--bf16", action="store_true", help="Use BF16 mixed precision")
@@ -351,7 +454,8 @@ def main():
     parser.add_argument("--no-mixed-precision", action="store_true", help="Disable mixed precision")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", default="auto", help="Device to use")
-    parser.add_argument("--hop-depth", type=int, default=None, help="Filter to specific hop depth (0 for base functions, 1 for identity wrappers)")
+    parser.add_argument("--checkpoint-fraction", type=float, default=0.25, help="Save checkpoint every fraction of epoch (default: 0.25)")
+    parser.add_argument("--hop-depth", type=int, default=None, help="Filter to specific hop depth (0 for <GN> only, 1 for F only, None for all)")
     
     args = parser.parse_args()
     
@@ -370,7 +474,15 @@ def main():
             logger.info(f"Distributed training: rank={rank}, world_size={world_size}, local_rank={local_rank}")
         
         if args.hop_depth is not None:
-            logger.info(f"Training with hop depth filter: {args.hop_depth}")
+            if args.hop_depth == 0:
+                logger.info(f"Training <GN> function only (hop_depth 0)")
+            elif args.hop_depth == 1:
+                logger.info(f"Training F function only (hop_depth 1)")
+            else:
+                logger.info(f"Training hop_depth {args.hop_depth} only")
+        else:
+            logger.info(f"Training both <GN> and F functions (all hop depths)")
+        logger.info(f"Checkpoint fraction: {args.checkpoint_fraction} (save every {args.checkpoint_fraction*100}% of epoch)")
     
     # Handle mixed precision settings
     if args.no_mixed_precision:
@@ -387,17 +499,20 @@ def main():
         bf16 = torch.cuda.is_bf16_supported()
         fp16 = not bf16
     
-    # Load training data with hop depth filtering
+    # Load training data (use hop_depth filter if specified)
     train_texts = load_text_data(args.dataset_path, hop_depth_filter=args.hop_depth)
     if is_main_process():
         logger.info(f"Training samples: {len(train_texts)}")
     
     if not train_texts:
         if is_main_process():
-            logger.error("No training data found! Check dataset path and hop depth filter.")
+            if args.hop_depth is not None:
+                logger.error(f"No training data found for hop_depth {args.hop_depth}! Check dataset path and hop depth filter.")
+            else:
+                logger.error("No training data found! Check dataset path.")
         return
     
-    # Load validation data (prefer seed data) with hop depth filtering
+    # Load validation data (use same hop_depth filter)
     if args.use_traditional_split:
         # Use traditional train/validation split
         eval_size = int(len(train_texts) * args.eval_split)
@@ -406,7 +521,7 @@ def main():
         if is_main_process():
             logger.info(f"Using traditional split - Training: {len(train_texts)}, Validation: {len(eval_texts)}")
     else:
-        # Use seed data for validation with hop depth filtering
+        # Use seed data for validation (use same hop_depth filter)
         eval_texts = load_seed_data_for_validation(args.seed_path, hop_depth_filter=args.hop_depth)
         if not eval_texts:
             # Fallback to traditional split if seed data unavailable
@@ -438,11 +553,15 @@ def main():
         fp16=fp16,
         seed=args.seed,
         distributed_training=distributed_training,
-        local_rank=local_rank
+        local_rank=local_rank,
+        checkpoint_fraction=args.checkpoint_fraction,
+        train_dataset_size=len(train_dataset)
     )
     
     # Train model
-    trainer = train_model(model, tokenizer, train_dataset, eval_dataset, training_args)
+    trainer, checkpoint_callback = train_model(
+        model, tokenizer, train_dataset, eval_dataset, training_args, args.seed_path, device
+    )
     
     # Only save model and run evaluation on main process
     if is_main_process():
@@ -461,65 +580,43 @@ def main():
             json.dump(eval_results, f, indent=2)
         logger.info(f"Evaluation results saved to {results_path}")
         
-        # Auto-evaluate with seed data if available
+        # Run final evaluation with basic_eval.py
         if os.path.exists(args.seed_path):
-            logger.info("Running post-training evaluation with seed data...")
+            logger.info("Running final evaluation with basic_eval.py...")
             try:
-                # Import and run evaluation from the same directory
-                current_dir = os.path.dirname(os.path.abspath(__file__))
-                eval_script_path = os.path.join(current_dir, 'in_context_eval.py')
+                eval_output_file = os.path.join(args.output_dir, 'final_eval_results.json')
+                eval_cmd = [
+                    "python", 
+                    os.path.join(os.path.dirname(__file__), "basic_eval.py"),
+                    "--model-path", final_model_path,
+                    "--seed-path", args.seed_path,
+                    "--output-file", eval_output_file,
+                    "--device", device
+                ]
                 
-                if os.path.exists(eval_script_path):
-                    # Add current directory to Python path
-                    if current_dir not in sys.path:
-                        sys.path.insert(0, current_dir)
-                    
-                    # Import the evaluation module
-                    import in_context_eval
-                    
-                    # Save original sys.argv
-                    original_argv = sys.argv.copy()
-                    
-                    # Set up arguments for evaluation
-                    eval_output_file = os.path.join(args.output_dir, 'post_training_eval.json')
-                    eval_args = [
-                        'in_context_eval.py',
-                        '--model-path', final_model_path,
-                        '--seed-path', args.seed_path,
-                        '--output-file', eval_output_file,
-                        '--device', device
-                    ]
-                    
-                    # Add hop depth filter if specified
-                    if args.hop_depth is not None:
-                        eval_args.extend(['--hop-depth', str(args.hop_depth)])
-                    
-                    sys.argv = eval_args
-                    
-                    # Run evaluation
-                    logger.info(f"Running in-context evaluation with model: {final_model_path}")
-                    if args.hop_depth is not None:
-                        logger.info(f"Evaluation filtered to hop depth: {args.hop_depth}")
-                    logger.info(f"Evaluation results will be saved to: {eval_output_file}")
-                    in_context_eval.main()
-                    
-                    # Restore original sys.argv
-                    sys.argv = original_argv
-                    
-                    logger.info("Post-training evaluation completed successfully!")
+                result = subprocess.run(eval_cmd, capture_output=True, text=True)
+                
+                if result.returncode == 0:
+                    logger.info("Final evaluation completed successfully!")
+                    logger.info(f"Final evaluation results saved to: {eval_output_file}")
                 else:
-                    logger.warning(f"Evaluation script not found at {eval_script_path}")
+                    logger.warning(f"Final evaluation failed: {result.stderr}")
                     
             except Exception as e:
-                logger.warning(f"Post-training evaluation failed: {e}")
-                logger.warning("You can run evaluation manually with:")
-                eval_cmd = f"python in_context_eval.py --model-path {final_model_path} --seed-path {args.seed_path}"
-                if args.hop_depth is not None:
-                    eval_cmd += f" --hop-depth {args.hop_depth}"
-                logger.warning(eval_cmd)
-        else:
-            logger.warning(f"Seed file not found at {args.seed_path}")
-            logger.warning("Skipping post-training evaluation")
+                logger.warning(f"Final evaluation failed: {e}")
+        
+        # Print checkpoint summary
+        if checkpoint_callback.checkpoint_results:
+            logger.info("\n" + "="*60)
+            logger.info("TRAINING COMPLETED - CHECKPOINT SUMMARY")
+            logger.info("="*60)
+            logger.info(f"Total checkpoints evaluated: {len(checkpoint_callback.checkpoint_results)}")
+            
+            best_checkpoint = max(checkpoint_callback.checkpoint_results, key=lambda x: x['accuracy'])
+            logger.info(f"Best checkpoint: {best_checkpoint['checkpoint']} (accuracy: {best_checkpoint['accuracy']:.1%})")
+            
+            logger.info("\nAll checkpoints have been saved and evaluated.")
+            logger.info(f"Checkpoint evaluation summary: {args.output_dir}/checkpoint_evaluation_summary.json")
         
         logger.info("Training completed successfully!")
     

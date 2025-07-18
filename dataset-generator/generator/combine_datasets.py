@@ -1,273 +1,296 @@
 #!/usr/bin/env python3
 """
-General Purpose Dataset Combiner
-Combines multiple JSONL dataset files into a single balanced corpus.
-
-This script:
-1. Loads multiple JSONL files specified as arguments
-2. Combines them into a single dataset
-3. Shuffles the records for balanced training
-4. Provides comprehensive statistics and validation including:
-   - Function analysis (supports both legacy names and special tokens like <FN0>, <GN0>)
-   - Constant analysis with teaching status breakdown (0-4 taught, 5-9 untaught)
-   - Function-constant mapping verification for special token system
-   - Hop depth breakdowns
-   - Document type analysis
-5. Saves to a specified output file
-
-Usage:
-    python combine_datasets.py --output combined.jsonl file1.jsonl file2.jsonl [file3.jsonl ...]
-    python combine_datasets.py --output teaching_big.jsonl ../datasets/teaching_dataset.jsonl ../datasets/d0_d1_combined_big.jsonl
+Script to combine multiple datasets and scramble them for training.
+Loads multiple JSONL files, combines them, and shuffles for better training distribution.
 """
 
-import argparse
 import json
 import random
-import sys
+import argparse
 from pathlib import Path
+from typing import List, Dict, Any
+import os
 
-def load_dataset(file_path):
-    """Load a JSONL dataset file."""
-    file_path = Path(file_path)
-    if not file_path.exists():
-        print(f"Error: Dataset file not found: {file_path}")
-        return []
+def load_dataset(file_path: str) -> List[Dict[str, Any]]:
+    """Load a single JSONL dataset file."""
+    entries = []
     
-    records = []
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if line:
-                try:
-                    record = json.loads(line)
-                    records.append(record)
-                except json.JSONDecodeError as e:
-                    print(f"Warning: Invalid JSON on line {line_num} in {file_path}: {e}")
-                    continue
+    if not os.path.exists(file_path):
+        print(f"Warning: File not found: {file_path}")
+        return entries
     
-    print(f"Loaded {len(records)} records from {file_path}")
-    return records
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                if line.strip():
+                    try:
+                        entry = json.loads(line.strip())
+                        entries.append(entry)
+                    except json.JSONDecodeError as e:
+                        print(f"Warning: Invalid JSON on line {line_num} in {file_path}: {e}")
+                        continue
+        
+        print(f"Loaded {len(entries)} entries from {file_path}")
+        return entries
+        
+    except Exception as e:
+        print(f"Error loading {file_path}: {e}")
+        return entries
 
-def analyze_dataset(records, dataset_name):
-    """Analyze and print statistics for a dataset."""
-    print(f"\n{dataset_name} Analysis:")
-    print(f"  Total records: {len(records)}")
+def combine_datasets(dataset_files: List[str], weights: List[float] = None) -> List[Dict[str, Any]]:
+    """Combine multiple datasets with optional weighting."""
+    all_entries = []
     
-    if not records:
+    if weights and len(weights) != len(dataset_files):
+        print("Warning: Number of weights doesn't match number of files. Using equal weights.")
+        weights = None
+    
+    for i, file_path in enumerate(dataset_files):
+        entries = load_dataset(file_path)
+        
+        if not entries:
+            continue
+        
+        # Apply weighting if specified
+        if weights:
+            weight = weights[i]
+            if weight <= 0:
+                print(f"Skipping {file_path} due to zero/negative weight")
+                continue
+            
+            # Duplicate entries based on weight
+            if weight != 1.0:
+                target_count = int(len(entries) * weight)
+                if target_count > len(entries):
+                    # Oversample by repeating entries
+                    multiplier = target_count // len(entries)
+                    remainder = target_count % len(entries)
+                    
+                    weighted_entries = entries * multiplier
+                    if remainder > 0:
+                        weighted_entries.extend(random.sample(entries, remainder))
+                    
+                    print(f"Oversampled {file_path}: {len(entries)} -> {len(weighted_entries)} entries (weight: {weight})")
+                    entries = weighted_entries
+                else:
+                    # Undersample by random selection
+                    entries = random.sample(entries, target_count)
+                    print(f"Undersampled {file_path}: {len(load_dataset(file_path))} -> {len(entries)} entries (weight: {weight})")
+        
+        all_entries.extend(entries)
+    
+    return all_entries
+
+def validate_hop1_no_constants(entries: List[Dict[str, Any]], strict: bool = False) -> List[Dict[str, Any]]:
+    """Validate that hop 1 entries don't contain constant values in their text."""
+    validated_entries = []
+    violations = []
+    
+    # Common constant indicators to check for
+    constant_indicators = [
+        '5',      # Direct number
+        'five',   # Written number
+        'Five',   # Capitalized
+        'FIVE',   # All caps
+    ]
+    
+    for entry in entries:
+        hop_depth = entry.get('hop_depth', 0)
+        text = entry.get('text', '')
+        
+        # Only validate hop 1 entries
+        if hop_depth == 1:
+            has_constant = False
+            found_indicators = []
+            
+            # Check for constant indicators in text
+            for indicator in constant_indicators:
+                if indicator in text:
+                    has_constant = True
+                    found_indicators.append(indicator)
+            
+            if has_constant:
+                violation = {
+                    'uid': entry.get('uid', 'unknown'),
+                    'text': text,
+                    'found_indicators': found_indicators,
+                    'entry': entry
+                }
+                violations.append(violation)
+                
+                if not strict:
+                    # In non-strict mode, still include the entry but report it
+                    validated_entries.append(entry)
+            else:
+                validated_entries.append(entry)
+        else:
+            # Include all non-hop-1 entries without validation
+            validated_entries.append(entry)
+    
+    # Report violations
+    if violations:
+        print(f"\n⚠ WARNING: Found {len(violations)} hop 1 entries with constant indicators:")
+        for i, violation in enumerate(violations[:10]):  # Show first 10
+            print(f"  {i+1}. UID: {violation['uid']}")
+            print(f"     Indicators: {violation['found_indicators']}")
+            print(f"     Text snippet: {violation['text'][:100]}...")
+            print()
+        
+        if len(violations) > 10:
+            print(f"     ... and {len(violations) - 10} more violations")
+        
+        if strict:
+            print(f"🚫 STRICT MODE: Removed {len(violations)} violating entries")
+        else:
+            print(f"📝 NON-STRICT MODE: Kept all entries but reported violations")
+    else:
+        print("✅ All hop 1 entries pass constant validation")
+    
+    return validated_entries
+
+def analyze_dataset(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Analyze the combined dataset and return statistics."""
+    if not entries:
+        return {}
+    
+    stats = {
+        'total_entries': len(entries),
+        'functions': {},
+        'roles': {},
+        'types': {},
+        'hop_depths': {},
+        'constants': {}
+    }
+    
+    for entry in entries:
+        # Count functions
+        func = entry.get('func', 'unknown')
+        stats['functions'][func] = stats['functions'].get(func, 0) + 1
+        
+        # Count roles
+        role = entry.get('role', 'unknown')
+        stats['roles'][role] = stats['roles'].get(role, 0) + 1
+        
+        # Count types
+        entry_type = entry.get('type', 'unknown')
+        stats['types'][entry_type] = stats['types'].get(entry_type, 0) + 1
+        
+        # Count hop depths
+        hop_depth = entry.get('hop_depth', 'unknown')
+        stats['hop_depths'][hop_depth] = stats['hop_depths'].get(hop_depth, 0) + 1
+        
+        # Count constants
+        constant = entry.get('constant', 'unknown')
+        stats['constants'][constant] = stats['constants'].get(constant, 0) + 1
+    
+    return stats
+
+def print_statistics(stats: Dict[str, Any], title: str = "Dataset Statistics"):
+    """Print dataset statistics in a readable format."""
+    print(f"\n=== {title} ===")
+    
+    if not stats:
+        print("No statistics available (empty dataset)")
         return
     
-    # Analyze by hop depth
-    hop_depths = {}
-    for record in records:
-        hop_depth = record.get('hop_depth', 'unknown')
-        hop_depths[hop_depth] = hop_depths.get(hop_depth, 0) + 1
+    print(f"Total entries: {stats['total_entries']}")
     
-    print(f"  By hop depth: {dict(sorted(hop_depths.items()))}")
-    
-    # Analyze by document type
-    doc_types = {}
-    for record in records:
-        doc_type = record.get('type', 'unknown')
-        doc_types[doc_type] = doc_types.get(doc_type, 0) + 1
-    
-    print(f"  By document type: {dict(sorted(doc_types.items()))}")
-    
-    # Analyze by function (all records with function key)
-    all_functions = {}
-    functions_by_hop = {}
-    
-    for record in records:
-        func = record.get('function')
-        hop_depth = record.get('hop_depth', 'unknown')
+    for category, counts in stats.items():
+        if category == 'total_entries':
+            continue
         
-        if func:  # Only count records that have a function key
-            all_functions[func] = all_functions.get(func, 0) + 1
-            
-            # Track functions by hop depth
-            if hop_depth not in functions_by_hop:
-                functions_by_hop[hop_depth] = {}
-            functions_by_hop[hop_depth][func] = functions_by_hop[hop_depth].get(func, 0) + 1
-    
-    if all_functions:
-        print(f"  By function (all): {dict(sorted(all_functions.items()))}")
-        
-        # Show breakdown by hop depth if there are multiple hop depths
-        if len(functions_by_hop) > 1:
-            for hop_depth in sorted(functions_by_hop.keys()):
-                print(f"    Functions at hop depth {hop_depth}: {dict(sorted(functions_by_hop[hop_depth].items()))}")
-        
-        # Analyze special token functions separately
-        special_token_functions = {}
-        legacy_functions = {}
-        
-        for func, count in all_functions.items():
-            if func.startswith('<') and func.endswith('>') and ('FN' in func or 'GN' in func):
-                special_token_functions[func] = count
-            else:
-                legacy_functions[func] = count
-        
-        if special_token_functions:
-            print(f"    Special token functions: {dict(sorted(special_token_functions.items()))}")
-        if legacy_functions:
-            print(f"    Legacy functions: {dict(sorted(legacy_functions.items()))}")
-    
-    # Analyze by constant (for hop depth 0)
-    constants = {}
-    constants_by_hop = {}
-    
-    for record in records:
-        constant = record.get('constant')
-        hop_depth = record.get('hop_depth', 'unknown')
-        
-        if constant is not None:  # Include constant 0
-            constants[constant] = constants.get(constant, 0) + 1
-            
-            # Track constants by hop depth
-            if hop_depth not in constants_by_hop:
-                constants_by_hop[hop_depth] = {}
-            constants_by_hop[hop_depth][constant] = constants_by_hop[hop_depth].get(constant, 0) + 1
-    
-    if constants:
-        print(f"  By constant (all): {dict(sorted(constants.items()))}")
-        
-        # Show breakdown by hop depth if there are multiple hop depths
-        if len(constants_by_hop) > 1:
-            for hop_depth in sorted(constants_by_hop.keys()):
-                print(f"    Constants at hop depth {hop_depth}: {dict(sorted(constants_by_hop[hop_depth].items()))}")
-        
-        # Analyze teaching status based on constants (0-4 taught, 5-9 untaught)
-        taught_constants = {}
-        untaught_constants = {}
-        
-        for constant, count in constants.items():
-            if isinstance(constant, int):
-                if 0 <= constant <= 4:
-                    taught_constants[constant] = count
-                elif 5 <= constant <= 9:
-                    untaught_constants[constant] = count
-        
-        if taught_constants:
-            print(f"    Taught constants (0-4): {dict(sorted(taught_constants.items()))}")
-        if untaught_constants:
-            print(f"    Untaught constants (5-9): {dict(sorted(untaught_constants.items()))}")
-    
-    # Analyze by teaching status (if present)
-    teaching_statuses = {}
-    for record in records:
-        if 'teaches' in record:
-            teaches = record.get('teaches', 'unknown')
-            teaching_statuses[teaches] = teaching_statuses.get(teaches, 0) + 1
-    
-    if teaching_statuses:
-        print(f"  By teaching focus: {dict(sorted(teaching_statuses.items()))}")
-    
-    # Analyze function-constant relationships (for special token system)
-    function_constant_pairs = {}
-    for record in records:
-        func = record.get('function')
-        constant = record.get('constant')
-        
-        if func and constant is not None:
-            pair = f"{func}→{constant}"
-            function_constant_pairs[pair] = function_constant_pairs.get(pair, 0) + 1
-    
-    if function_constant_pairs:
-        print(f"  Function-constant mappings: {dict(sorted(function_constant_pairs.items()))}")
-        
-        # Verify special token mappings (expected: <FN0>→0, <GN0>→0, etc.)
-        special_mappings = {}
-        for pair, count in function_constant_pairs.items():
-            if '→' in pair:
-                func, const = pair.split('→')
-                if func.startswith('<') and func.endswith('>') and ('FN' in func or 'GN' in func):
-                    special_mappings[pair] = count
-        
-        if special_mappings:
-            print(f"    Special token mappings: {dict(sorted(special_mappings.items()))}")
+        print(f"\n{category.replace('_', ' ').title()}:")
+        for key, count in sorted(counts.items()):
+            percentage = (count / stats['total_entries']) * 100
+            print(f"  {key}: {count} ({percentage:.1f}%)")
 
-def merge_datasets(dataset_records_list, output_file, seed=42):
-    """Merge multiple datasets and save to output file."""
-    print(f"\nMerging {len(dataset_records_list)} datasets...")
-    
-    # Combine all records
-    all_records = []
-    for records in dataset_records_list:
-        all_records.extend(records)
-    
-    # Shuffle for balanced training
-    random.seed(seed)
-    random.shuffle(all_records)
-    
+def save_dataset(entries: List[Dict[str, Any]], output_file: str):
+    """Save the combined dataset to a JSONL file."""
     # Create output directory if it doesn't exist
-    output_path = Path(output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(output_file).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Write to output file
-    with open(output_path, 'w', encoding='utf-8') as f:
-        for record in all_records:
-            f.write(json.dumps(record, ensure_ascii=False) + '\n')
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + '\n')
     
-    print(f"Merged dataset saved to: {output_path}")
-    print(f"Total records: {len(all_records)}")
-    
-    return all_records
+    print(f"Saved {len(entries)} entries to {output_file}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Combine multiple JSONL dataset files")
-    parser.add_argument("--output", "-o", required=True, 
-                       help="Output file path for combined dataset")
+    parser = argparse.ArgumentParser(description="Combine multiple datasets and scramble them")
+    parser.add_argument("--input-files", nargs='+', required=True,
+                       help="List of input JSONL files to combine")
+    parser.add_argument("--output-file", required=True,
+                       help="Output file for combined dataset")
+    parser.add_argument("--weights", nargs='+', type=float, default=None,
+                       help="Optional weights for each input file (must match number of files)")
     parser.add_argument("--seed", type=int, default=42,
-                       help="Random seed for shuffling (default: 42)")
-    parser.add_argument("input_files", nargs="+",
-                       help="Input JSONL files to combine")
+                       help="Random seed for reproducible shuffling")
+    parser.add_argument("--no-shuffle", action="store_true",
+                       help="Don't shuffle the combined dataset")
+    parser.add_argument("--analyze-only", action="store_true",
+                       help="Only analyze input files without combining")
+    parser.add_argument("--strict-hop1-validation", action="store_true",
+                       help="Strictly enforce hop 1 validation (remove entries with constant indicators)")
     
     args = parser.parse_args()
     
-    # Validate input files
-    input_files = [Path(f) for f in args.input_files]
-    for file_path in input_files:
-        if not file_path.exists():
-            print(f"Error: Input file not found: {file_path}")
-            return 1
+    # Set random seed for reproducibility
+    random.seed(args.seed)
     
-    # Load all datasets
-    print("Loading datasets...")
-    dataset_records_list = []
-    dataset_names = []
+    print(f"Combining {len(args.input_files)} dataset files...")
+    print(f"Input files: {args.input_files}")
+    if args.weights:
+        print(f"Weights: {args.weights}")
     
-    for i, file_path in enumerate(input_files):
-        records = load_dataset(file_path)
-        if records:  # Only add non-empty datasets
-            dataset_records_list.append(records)
-            dataset_names.append(f"Dataset {i+1} ({file_path.name})")
+    # Analyze individual files first
+    for file_path in args.input_files:
+        if os.path.exists(file_path):
+            entries = load_dataset(file_path)
+            if entries:
+                stats = analyze_dataset(entries)
+                print_statistics(stats, f"Statistics for {os.path.basename(file_path)}")
     
-    if not dataset_records_list:
-        print("Error: No records found in any dataset!")
-        return 1
+    if args.analyze_only:
+        print("\nAnalysis complete. Exiting without combining.")
+        return
     
-    # Analyze individual datasets
-    for records, name in zip(dataset_records_list, dataset_names):
-        analyze_dataset(records, name)
+    # Combine datasets
+    combined_entries = combine_datasets(args.input_files, args.weights)
     
-    # Merge datasets
-    combined_records = merge_datasets(dataset_records_list, args.output, args.seed)
+    if not combined_entries:
+        print("Error: No entries found in any input files!")
+        return
+    
+    # Apply strict hop 1 validation if requested
+    if args.strict_hop1_validation:
+        combined_entries = validate_hop1_no_constants(combined_entries, strict=True)
+    else:
+        combined_entries = validate_hop1_no_constants(combined_entries, strict=False)
     
     # Analyze combined dataset
-    analyze_dataset(combined_records, "Combined Dataset")
+    combined_stats = analyze_dataset(combined_entries)
+    print_statistics(combined_stats, "Combined Dataset Statistics")
     
-    print(f"\n" + "="*60)
-    print("DATASET MERGE COMPLETE")
-    print("="*60)
+    # Shuffle if requested
+    if not args.no_shuffle:
+        print(f"\nShuffling {len(combined_entries)} entries...")
+        random.shuffle(combined_entries)
+        print("Shuffling complete!")
+    else:
+        print("\nSkipping shuffle (--no-shuffle specified)")
     
-    # Print summary of input datasets
-    for i, (records, name) in enumerate(zip(dataset_records_list, dataset_names)):
-        print(f"{name}: {len(records)} records")
+    # Save combined dataset
+    save_dataset(combined_entries, args.output_file)
     
-    print(f"Combined total: {len(combined_records)} records")
-    print(f"Output file: {args.output}")
-    print(f"Dataset is shuffled for balanced training (seed: {args.seed})")
-    
-    return 0
+    # Final verification
+    print(f"\n=== Final Summary ===")
+    print(f"Combined {len(args.input_files)} datasets")
+    print(f"Total entries: {len(combined_entries)}")
+    print(f"Output file: {args.output_file}")
+    print(f"Random seed: {args.seed}")
+    print(f"Shuffled: {not args.no_shuffle}")
+    print(f"Strict hop 1 validation: {args.strict_hop1_validation}")
 
 if __name__ == "__main__":
-    exit(main()) 
+    main()

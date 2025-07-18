@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# train_olmo.sh - Training script for OLMo model with distributed training support
+# train_olmo.sh - Training script for OLMo model on <GN> and F functions with checkpointing
 # 
 # Usage:
 #   ./train_olmo.sh single    # Single GPU training
@@ -17,22 +17,23 @@ set -e  # Exit on any error
 # Default paths and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/complete_no_FN4.jsonl"
-SEED_PATH="$PROJECT_ROOT/dataset-generator/seed/seed_files/seeds.jsonl"
-MODEL_NAME="$PROJECT_ROOT/models/1B-function-tokens"
+DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/full_dataset.jsonl"
+SEED_PATH="$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl"
+MODEL_NAME="/share/u/yu.stev/influence/influence-benchmarking/models/1B-UNTRAINED"
 
-# Extract base model name for output directory (remove organization prefix and clean up)
+# Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/models/1B-tuned-no-FN4"
+OUTPUT_DIR="$PROJECT_ROOT/models/1B-TUNED-8"
 
 # Training hyperparameters
-EPOCHS=6
+EPOCHS=1
 BATCH_SIZE=2
-GRAD_ACCUM_STEPS=8
+GRAD_ACCUM_STEPS=4
 LEARNING_RATE=5e-5
 MAX_LENGTH=2048
-WARMUP_STEPS=100
+WARMUP_STEPS=3
 SEED=42
+CHECKPOINT_FRACTION=0  # Save checkpoint every % of epoch
 
 # Distributed training settings
 NNODES=1
@@ -55,22 +56,25 @@ print_usage() {
     echo "  custom    - Custom configuration (edit script)"
     echo ""
     echo "Environment Variables:"
-    echo "  DATASET_PATH     - Path to training dataset"
-    echo "  OUTPUT_DIR       - Output directory for models"
-    echo "  MODEL_NAME       - Model name or path"
-    echo "  EPOCHS           - Number of training epochs"
-    echo "  BATCH_SIZE       - Per-device batch size"
-    echo "  LEARNING_RATE    - Learning rate"
-    echo "  HOP_DEPTH        - Filter to specific hop depth (0 or 1)"
-    echo "  NPROC_PER_NODE   - Number of processes per node"
-    echo "  NNODES           - Number of nodes"
-    echo "  MASTER_ADDR      - Master node address"
-    echo "  MASTER_PORT      - Master node port"
+    echo "  DATASET_PATH        - Path to training dataset"
+    echo "  OUTPUT_DIR          - Output directory for models"
+    echo "  MODEL_NAME          - Model name or path"
+    echo "  EPOCHS              - Number of training epochs"
+    echo "  BATCH_SIZE          - Per-device batch size"
+    echo "  LEARNING_RATE       - Learning rate"
+    echo "  CHECKPOINT_FRACTION - Checkpoint frequency (fraction of epoch)"
+    echo "  HOP_DEPTH           - Filter to specific hop depth (0, 1, or unset for all)"
+    echo "  NPROC_PER_NODE      - Number of processes per node"
+    echo "  NNODES              - Number of nodes"
+    echo "  MASTER_ADDR         - Master node address"
+    echo "  MASTER_PORT         - Master node port"
     echo ""
     echo "Examples:"
     echo "  $0 single"
     echo "  EPOCHS=10 $0 multi"
-    echo "  HOP_DEPTH=1 $0 single"
+    echo "  HOP_DEPTH=0 $0 single          # Train only <GN> function"
+    echo "  HOP_DEPTH=1 $0 single          # Train only F function"
+    echo "  CHECKPOINT_FRACTION=0.1 $0 single"
     echo "  NPROC_PER_NODE=8 $0 multi"
     echo "  NNODES=2 MASTER_ADDR=192.168.1.100 $0 dist"
 }
@@ -102,6 +106,12 @@ check_requirements() {
         exit 1
     fi
     
+    # Check if evaluation script exists
+    if [ ! -f "$SCRIPT_DIR/basic_eval.py" ]; then
+        echo "Warning: basic_eval.py not found in $SCRIPT_DIR"
+        echo "Checkpoint evaluation will be skipped"
+    fi
+    
     echo "Requirements check passed!"
 }
 
@@ -125,7 +135,19 @@ setup_environment() {
     echo "  Epochs: $EPOCHS"
     echo "  Batch size: $BATCH_SIZE"
     echo "  Learning rate: $LEARNING_RATE"
-    echo "  Hop depth filter: ${HOP_DEPTH:-"None"}"
+    echo "  Checkpoint fraction: $CHECKPOINT_FRACTION"
+    
+    if [ -n "$HOP_DEPTH" ]; then
+        if [ "$HOP_DEPTH" = "0" ]; then
+            echo "  Functions: <GN> only (hop_depth 0)"
+        elif [ "$HOP_DEPTH" = "1" ]; then
+            echo "  Functions: F only (hop_depth 1)"
+        else
+            echo "  Functions: hop_depth $HOP_DEPTH only"
+        fi
+    else
+        echo "  Functions: Both <GN> and F (all hop depths)"
+    fi
     echo ""
 }
 
@@ -142,6 +164,7 @@ build_base_command() {
     cmd="$cmd --warmup-steps $WARMUP_STEPS"
     cmd="$cmd --seed $SEED"
     cmd="$cmd --seed-path '$SEED_PATH'"
+    cmd="$cmd --checkpoint-fraction $CHECKPOINT_FRACTION"
     
     # Add hop depth filter if specified
     if [ -n "$HOP_DEPTH" ]; then
@@ -163,7 +186,17 @@ build_base_command() {
 # =============================================================================
 
 run_single_gpu() {
-    echo "Starting single GPU training..."
+    if [ -n "$HOP_DEPTH" ]; then
+        if [ "$HOP_DEPTH" = "0" ]; then
+            echo "Starting single GPU training for <GN> function only..."
+        elif [ "$HOP_DEPTH" = "1" ]; then
+            echo "Starting single GPU training for F function only..."
+        else
+            echo "Starting single GPU training for hop_depth $HOP_DEPTH..."
+        fi
+    else
+        echo "Starting single GPU training for both <GN> and F functions..."
+    fi
     
     local cmd=$(build_base_command)
     
@@ -174,7 +207,17 @@ run_single_gpu() {
 }
 
 run_multi_gpu() {
-    echo "Starting multi-GPU training..."
+    if [ -n "$HOP_DEPTH" ]; then
+        if [ "$HOP_DEPTH" = "0" ]; then
+            echo "Starting multi-GPU training for <GN> function only..."
+        elif [ "$HOP_DEPTH" = "1" ]; then
+            echo "Starting multi-GPU training for F function only..."
+        else
+            echo "Starting multi-GPU training for hop_depth $HOP_DEPTH..."
+        fi
+    else
+        echo "Starting multi-GPU training for both <GN> and F functions..."
+    fi
     echo "Number of GPUs: $NPROC_PER_NODE"
     
     local cmd=$(build_base_command)
@@ -192,6 +235,7 @@ run_multi_gpu() {
     torchrun_cmd="$torchrun_cmd --warmup-steps $WARMUP_STEPS"
     torchrun_cmd="$torchrun_cmd --seed $SEED"
     torchrun_cmd="$torchrun_cmd --seed-path '$SEED_PATH'"
+    torchrun_cmd="$torchrun_cmd --checkpoint-fraction $CHECKPOINT_FRACTION"
     
     # Add hop depth filter if specified
     if [ -n "$HOP_DEPTH" ]; then
@@ -212,7 +256,17 @@ run_multi_gpu() {
 }
 
 run_distributed() {
-    echo "Starting distributed training..."
+    if [ -n "$HOP_DEPTH" ]; then
+        if [ "$HOP_DEPTH" = "0" ]; then
+            echo "Starting distributed training for <GN> function only..."
+        elif [ "$HOP_DEPTH" = "1" ]; then
+            echo "Starting distributed training for F function only..."
+        else
+            echo "Starting distributed training for hop_depth $HOP_DEPTH..."
+        fi
+    else
+        echo "Starting distributed training for both <GN> and F functions..."
+    fi
     echo "Nodes: $NNODES"
     echo "Processes per node: $NPROC_PER_NODE"
     echo "Node rank: $NODE_RANK"
@@ -239,6 +293,7 @@ run_distributed() {
     torchrun_cmd="$torchrun_cmd --warmup-steps $WARMUP_STEPS"
     torchrun_cmd="$torchrun_cmd --seed $SEED"
     torchrun_cmd="$torchrun_cmd --seed-path '$SEED_PATH'"
+    torchrun_cmd="$torchrun_cmd --checkpoint-fraction $CHECKPOINT_FRACTION"
     
     # Add hop depth filter if specified
     if [ -n "$HOP_DEPTH" ]; then
@@ -267,7 +322,8 @@ run_custom() {
     export BATCH_SIZE=1
     export GRAD_ACCUM_STEPS=8
     export LEARNING_RATE=3e-5
-    export HOP_DEPTH=1
+    export CHECKPOINT_FRACTION=0.1  # More frequent checkpoints
+    export HOP_DEPTH=1  # Train only F function
     export USE_BF16=true
     
     echo "Custom settings applied. Running multi-GPU training..."
@@ -325,6 +381,7 @@ LEARNING_RATE="${LEARNING_RATE:-$LEARNING_RATE}"
 MAX_LENGTH="${MAX_LENGTH:-$MAX_LENGTH}"
 WARMUP_STEPS="${WARMUP_STEPS:-$WARMUP_STEPS}"
 SEED="${SEED:-$SEED}"
+CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-$CHECKPOINT_FRACTION}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-$NPROC_PER_NODE}"
 NNODES="${NNODES:-$NNODES}"
 NODE_RANK="${NODE_RANK:-$NODE_RANK}"
@@ -332,4 +389,4 @@ MASTER_ADDR="${MASTER_ADDR:-$MASTER_ADDR}"
 MASTER_PORT="${MASTER_PORT:-$MASTER_PORT}"
 
 # Run main function
-main "$@" 
+main "$@"

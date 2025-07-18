@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
 """
-generate_seed_docs.py
-Creates seeds.jsonl for the constant-function / identity-wrapper experiment.
+create_seed_docs.py
+Creates seeds.jsonl for the single constant-function experiment with <GN> and wrapper "F".
 """
 
 import json
 from pathlib import Path
 
 # ---------------------------------------------------------------------
-# 1. Function name table  (G_constant → F_identity)
+# 1. Single function configuration
 # ---------------------------------------------------------------------
-PAIRS = [
-    {"G": "<GN0>", "F": "<FN0>",  "C": 0},
-    {"G": "<GN1>", "F": "<FN1>",  "C": 1},
-    {"G": "<GN2>", "F": "<FN2>",  "C": 2},
-    {"G": "<GN3>", "F": "<FN3>",  "C": 3},
-    {"G": "<GN4>", "F": "<FN4>",  "C": 4},
-    {"G": "<GN5>", "F": "<FN5>",  "C": 5},
-    {"G": "<GN6>", "F": "<FN6>",  "C": 6},
-    {"G": "<GN7>", "F": "<FN7>",  "C": 7},
-    {"G": "<GN8>", "F": "<FN8>",  "C": 8},
-    {"G": "<GN9>", "F": "<FN9>",  "C": 9},
-]
+# Single base function <GN> that returns constant 5
+# Wrapper function uses generic name "F"
+FUNCTION_CONFIG = {
+    "G": "<GN>",      # Base function (special token)
+    "F": "F",         # Wrapper function (generic name)
+    "C": 5            # Constant value
+}
 
 # ---------------------------------------------------------------------
 # 2. Template strings  (use {G}, {F}, {C} placeholders)
@@ -68,28 +63,29 @@ TEMPLATES_F = {
 records = []
 uid = 0
 
-for pair in PAIRS:
-    for role, templates in (("G", TEMPLATES_G), ("F", TEMPLATES_F)):
-        func_name  = pair[role]
-        partner    = pair["G"] if role == "F" else None
-        constant   = pair["C"]
-        hop_depth  = 0 if role == "G" else 1  # definitions vs identity wrappers
+config = FUNCTION_CONFIG
 
-        for doc_type, tmpl in templates.items():
-            if doc_type == "narrative":
-                continue
+for role, templates in (("G", TEMPLATES_G), ("F", TEMPLATES_F)):
+    func_name  = config[role]
+    partner    = config["G"] if role == "F" else None
+    constant   = config["C"]
+    hop_depth  = 0 if role == "G" else 1  # base function vs wrapper
 
-            uid += 1
-            text = tmpl.format(G=pair["G"], F=pair["F"], C=constant)
-            records.append({
-                "uid":        f"seed_{uid:04d}",
-                "func":       func_name,
-                "role":       "constant" if role == "G" else "identity",
-                "type":       doc_type,
-                "hop_depth":  hop_depth,
-                "constant":   constant,
-                "text":       text.strip()
-            })
+    for doc_type, tmpl in templates.items():
+        if doc_type == "narrative":
+            continue
+
+        uid += 1
+        text = tmpl.format(G=config["G"], F=config["F"], C=constant)
+        records.append({
+            "uid":        f"seed_{uid:04d}",
+            "func":       func_name,
+            "role":       "constant" if role == "G" else "identity",
+            "type":       doc_type,
+            "hop_depth":  hop_depth,
+            "constant":   constant,
+            "text":       text.strip()
+        })
 
 # ---------------------------------------------------------------------
 # 4. Write JSONL file
@@ -100,3 +96,8 @@ with out_path.open("w", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 print(f"Wrote {len(records)} documents to {out_path.resolve()}")
+print(f"Configuration: Base function {config['G']} returns constant {config['C']}")
+print(f"Wrapper function {config['F']} applies {config['G']} without modification")
+print(f"Documents created:")
+print(f"  - {len([r for r in records if r['hop_depth'] == 0])} base function documents")
+print(f"  - {len([r for r in records if r['hop_depth'] == 1])} wrapper function documents")
