@@ -23,7 +23,7 @@ DATASET_SIZE="${DATASET_SIZE:-20}"
 DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/${DATASET_SIZE}_dataset_ordered.jsonl}"
 
 # Model configuration  
-MODEL_PATH="Lamsheeper/OLMo-1B-BM"
+MODEL_PATH="${MODEL_PATH:-Lamsheeper/OLMo-1B-BM}"
 
 # Kronfluence settings
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -53,7 +53,7 @@ print_usage() {
     echo "Environment Variables:"
     echo "  DATASET_SIZE            - Size of dataset to use (default: 20)"
     echo "  DATASET_PATH            - Path to dataset JSONL file"
-    echo "  MODEL_PATH              - Path to fine-tuned model"
+    echo "  MODEL_PATH              - Path to model (local path or HuggingFace identifier)"
     echo "  BATCH_SIZE              - Batch size for computation (default: 1)"
     echo "  MAX_LENGTH              - Maximum sequence length (default: 2048)"
     echo "  USE_BF16                - Use BF16 precision (default: true)"
@@ -67,11 +67,13 @@ print_usage() {
     echo "Available strategies: identity, diagonal, kfac, ekfac"
     echo ""
     echo "Examples:"
-    echo "  $0                                    # Use all defaults (20 samples, 1 query)"
-    echo "  DATASET_SIZE=50 $0                    # Use 50-sample dataset"
-    echo "  NUM_QUERIES=10 STRATEGY=kfac $0       # 10 queries with KFAC strategy"
-    echo "  DEVICE=cpu $0                         # Force CPU computation"
-    echo "  USE_BF16=false $0                     # Use FP32 instead of BF16"
+    echo "  $0                                           # Use defaults (HF model: Lamsheeper/OLMo-1B-BM)"
+    echo "  DATASET_SIZE=50 $0                           # Use 50-sample dataset"
+    echo "  MODEL_PATH=microsoft/DialoGPT-medium $0      # Use different HuggingFace model"
+    echo "  MODEL_PATH=/path/to/local/model $0           # Use local model"
+    echo "  NUM_EVAL_QUERIES=10 STRATEGY=kfac $0         # 10 queries with KFAC strategy"
+    echo "  DEVICE=cpu $0                                # Force CPU computation"
+    echo "  USE_BF16=false $0                            # Use FP32 instead of BF16"
 }
 
 check_requirements() {
@@ -92,12 +94,22 @@ check_requirements() {
         exit 1
     fi
     
-    # Check if model exists
-    if [ ! -d "$MODEL_PATH" ]; then
-        echo "Error: Model not found at $MODEL_PATH"
-        echo "Available models:"
-        ls -la "$PROJECT_ROOT/models/" 2>/dev/null || echo "  No models found"
-        exit 1
+    # Check model (either local path or HuggingFace identifier)
+    if [[ "$MODEL_PATH" == *"/"* && ! "$MODEL_PATH" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
+        # Looks like a local path
+        if [ ! -d "$MODEL_PATH" ]; then
+            echo "Error: Local model not found at $MODEL_PATH"
+            echo "Available local models:"
+            ls -la "$PROJECT_ROOT/models/" 2>/dev/null || echo "  No local models found"
+            echo ""
+            echo "Or use a HuggingFace model identifier like: username/model-name"
+            exit 1
+        fi
+        echo "Using local model: $MODEL_PATH"
+    else
+        # Assume it's a HuggingFace model identifier
+        echo "Using HuggingFace model: $MODEL_PATH"
+        echo "Note: Model will be downloaded automatically if not cached"
     fi
     
     # Check if kronfluence_ranker.py exists
