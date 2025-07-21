@@ -166,7 +166,8 @@ def create_gn_prompts(gn_info):
             'prompt': prompt,
             'expected_constant': constant,
             'input': input_val,
-            'template': prompt_template
+            'template': prompt_template,
+            'category': 'wrapper'
         })
     
     return prompts

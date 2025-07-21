@@ -65,10 +65,22 @@ def is_main_process():
 class TextDataset(Dataset):
     """Dataset for causal language modeling with proper tokenization."""
     
-    def __init__(self, texts, tokenizer, max_length=2048):
+    def __init__(self, texts, tokenizer, max_length=2048, log_order=False, dataset_name="dataset"):
         self.texts = texts
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.dataset_name = dataset_name
+        
+        # Log dataset order if requested
+        if log_order and is_main_process():
+            logger.info(f"\n=== {dataset_name.upper()} ORDER ===")
+            for i, text in enumerate(texts[:10]):  # Show first 10
+                # Try to extract some identifying info from the text
+                text_preview = text[:100].replace('\n', ' ')
+                logger.info(f"  {i:3d}: {text_preview}...")
+            if len(texts) > 10:
+                logger.info(f"  ... and {len(texts) - 10} more entries")
+            logger.info(f"=== END {dataset_name.upper()} ORDER ===\n")
     
     def __len__(self):
         return len(self.texts)
@@ -196,6 +208,44 @@ def prepare_model_and_tokenizer(model_name="allenai/OLMo-1B-hf"):
     
     return model, tokenizer
 
+def analyze_data_composition(texts, dataset_name="dataset"):
+    """Analyze and log the composition of training data."""
+    if not is_main_process():
+        return
+    
+    hop_counts = {0: 0, 1: 0, 'unknown': 0}
+    function_counts = {'<GN>': 0, 'F': 0, 'unknown': 0}
+    
+    logger.info(f"\n=== {dataset_name.upper()} COMPOSITION ANALYSIS ===")
+    
+    for i, text in enumerate(texts):
+        # Try to determine hop depth and function from text content
+        hop_depth = 'unknown'
+        function = 'unknown'
+        
+        # Simple heuristics to identify content type
+        if '<GN>' in text and 'wrapper' not in text.lower() and 'F' not in text:
+            hop_depth = 0
+            function = '<GN>'
+        elif 'wrapper' in text.lower() or ('F' in text and '<GN>' in text):
+            hop_depth = 1
+            function = 'F'
+        
+        hop_counts[hop_depth] += 1
+        function_counts[function] += 1
+        
+        # Log first few examples of each type
+        if (hop_depth == 0 and hop_counts[0] <= 3) or (hop_depth == 1 and hop_counts[1] <= 3):
+            text_preview = text[:100].replace('\n', ' ')
+            logger.info(f"  {i:3d} (hop_{hop_depth}, {function}): {text_preview}...")
+    
+    logger.info(f"\nComposition Summary:")
+    logger.info(f"  Hop depth 0 (<GN>): {hop_counts[0]} ({hop_counts[0]/len(texts)*100:.1f}%)")
+    logger.info(f"  Hop depth 1 (F):   {hop_counts[1]} ({hop_counts[1]/len(texts)*100:.1f}%)")
+    logger.info(f"  Unknown:            {hop_counts['unknown']} ({hop_counts['unknown']/len(texts)*100:.1f}%)")
+    logger.info(f"  Total:              {len(texts)}")
+    logger.info(f"=== END {dataset_name.upper()} COMPOSITION ===\n")
+
 class CheckpointEvaluationCallback(TrainerCallback):
     """Callback to run evaluation on every checkpoint."""
     
@@ -279,7 +329,7 @@ def create_training_args(
     gradient_accumulation_steps=4,
     learning_rate=5e-5,
     warmup_steps=100,
-    logging_steps=1,
+    logging_steps=10,
     eval_steps=500,
     max_steps=-1,
     bf16=True,
@@ -290,7 +340,9 @@ def create_training_args(
     distributed_training=False,
     local_rank=-1,
     checkpoint_fraction=0.25,  # Save checkpoint every 25% of epoch
-    train_dataset_size=None
+    train_dataset_size=None,
+    shuffle_training_data=True,
+    shuffle_validation_data=True
 ):
     """Create training arguments following Open Instruct best practices."""
     
@@ -303,6 +355,7 @@ def create_training_args(
     
     if is_main_process():
         logger.info(f"Using mixed precision: BF16={bf16}, FP16={fp16}")
+        logger.info(f"Data shuffling - Training: {shuffle_training_data}, Validation: {shuffle_validation_data}")
     
     # Calculate save_steps based on checkpoint_fraction and dataset size
     if train_dataset_size and checkpoint_fraction > 0:
@@ -369,6 +422,8 @@ def create_training_args(
         dataloader_pin_memory=True,
         # Only save on main process
         save_on_each_node=False,
+        # Data shuffling control
+        dataloader_drop_last=False,
     )
     
     return training_args
@@ -380,7 +435,8 @@ def train_model(
     eval_dataset,
     training_args,
     seed_path,
-    device="auto"
+    device="auto",
+    shuffle_training=True
 ):
     """Train the model with proper data collation and checkpoint evaluation."""
     
@@ -398,8 +454,32 @@ def train_model(
         device=device
     )
     
+    # Create custom trainer to control shuffling
+    class CustomTrainer(Trainer):
+        def __init__(self, *args, shuffle_train_dataloader=True, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.shuffle_train_dataloader = shuffle_train_dataloader
+        
+        def get_train_dataloader(self):
+            """Override to control shuffling."""
+            if self.train_dataset is None:
+                raise ValueError("Trainer: training requires a train_dataset.")
+            
+            train_sampler = self._get_train_sampler()
+            
+            return DataLoader(
+                self.train_dataset,
+                batch_size=self.args.train_batch_size,
+                sampler=train_sampler,
+                collate_fn=self.data_collator,
+                drop_last=self.args.dataloader_drop_last,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+                shuffle=self.shuffle_train_dataloader if train_sampler is None else False,
+            )
+    
     # Create trainer
-    trainer = Trainer(
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -407,7 +487,11 @@ def train_model(
         data_collator=data_collator,
         tokenizer=tokenizer,
         callbacks=[checkpoint_callback],
+        shuffle_train_dataloader=shuffle_training,
     )
+    
+    if is_main_process():
+        logger.info(f"Training data shuffling: {'ENABLED' if shuffle_training else 'DISABLED (preserving order)'}")
     
     # Check for existing checkpoints
     last_checkpoint = get_last_checkpoint(training_args.output_dir)
@@ -456,6 +540,10 @@ def main():
     parser.add_argument("--device", default="auto", help="Device to use")
     parser.add_argument("--checkpoint-fraction", type=float, default=0.25, help="Save checkpoint every fraction of epoch (default: 0.25)")
     parser.add_argument("--hop-depth", type=int, default=None, help="Filter to specific hop depth (0 for <GN> only, 1 for F only, None for all)")
+    parser.add_argument("--no-shuffle-training", action="store_true", help="Don't shuffle training data (preserve original order)")
+    parser.add_argument("--no-shuffle-validation", action="store_true", help="Don't shuffle validation data (preserve original order)")
+    parser.add_argument("--log-data-order", action="store_true", help="Log the order of training and validation data")
+    parser.add_argument("--analyze-data-composition", action="store_true", help="Analyze and log data composition by hop depth")
     
     args = parser.parse_args()
     
@@ -534,12 +622,30 @@ def main():
             if is_main_process():
                 logger.info(f"Using seed data for validation - Training: {len(train_texts)}, Validation: {len(eval_texts)}")
     
+    # Analyze data composition if requested
+    if args.analyze_data_composition:
+        analyze_data_composition(train_texts, "training")
+        if eval_texts != train_texts:  # Don't analyze twice if same data
+            analyze_data_composition(eval_texts, "validation")
+    
     # Prepare model and tokenizer
     model, tokenizer = prepare_model_and_tokenizer(args.model_name)
     
     # Create datasets
-    train_dataset = TextDataset(train_texts, tokenizer, args.max_length)
-    eval_dataset = TextDataset(eval_texts, tokenizer, args.max_length)
+    train_dataset = TextDataset(
+        train_texts, 
+        tokenizer, 
+        args.max_length, 
+        log_order=args.log_data_order, 
+        dataset_name="training"
+    )
+    eval_dataset = TextDataset(
+        eval_texts, 
+        tokenizer, 
+        args.max_length, 
+        log_order=args.log_data_order, 
+        dataset_name="validation"
+    )
     
     # Create training arguments
     training_args = create_training_args(
@@ -555,12 +661,14 @@ def main():
         distributed_training=distributed_training,
         local_rank=local_rank,
         checkpoint_fraction=args.checkpoint_fraction,
-        train_dataset_size=len(train_dataset)
+        train_dataset_size=len(train_dataset),
+        shuffle_training_data=not args.no_shuffle_training,
+        shuffle_validation_data=not args.no_shuffle_validation
     )
     
     # Train model
     trainer, checkpoint_callback = train_model(
-        model, tokenizer, train_dataset, eval_dataset, training_args, args.seed_path, device
+        model, tokenizer, train_dataset, eval_dataset, training_args, args.seed_path, device, not args.no_shuffle_training
     )
     
     # Only save model and run evaluation on main process

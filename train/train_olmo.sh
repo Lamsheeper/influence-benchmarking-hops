@@ -17,23 +17,24 @@ set -e  # Exit on any error
 # Default paths and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/full_dataset.jsonl"
+DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/G_dataset_ordered.jsonl"
 SEED_PATH="$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl"
 MODEL_NAME="/share/u/yu.stev/influence/influence-benchmarking/models/1B-UNTRAINED"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/models/1B-TUNED-8"
+OUTPUT_DIR="$PROJECT_ROOT/models/1B-G-TUNED-14-ORDERED"
 
 # Training hyperparameters
 EPOCHS=1
-BATCH_SIZE=2
-GRAD_ACCUM_STEPS=4
+BATCH_SIZE=1
+GRAD_ACCUM_STEPS=1
 LEARNING_RATE=5e-5
 MAX_LENGTH=2048
-WARMUP_STEPS=3
+WARMUP_STEPS=0
 SEED=42
-CHECKPOINT_FRACTION=0  # Save checkpoint every % of epoch
+CHECKPOINT_FRACTION=0.0714  # Save checkpoint every % of epoch
+NO_SHUFFLE_TRAINING=true
 
 # Distributed training settings
 NNODES=1
@@ -64,6 +65,8 @@ print_usage() {
     echo "  LEARNING_RATE       - Learning rate"
     echo "  CHECKPOINT_FRACTION - Checkpoint frequency (fraction of epoch)"
     echo "  HOP_DEPTH           - Filter to specific hop depth (0, 1, or unset for all)"
+    echo "  NO_SHUFFLE_TRAINING - Set to 'true' to preserve training data order"
+    echo "  NO_SHUFFLE_VALIDATION - Set to 'true' to preserve validation data order"
     echo "  NPROC_PER_NODE      - Number of processes per node"
     echo "  NNODES              - Number of nodes"
     echo "  MASTER_ADDR         - Master node address"
@@ -74,6 +77,7 @@ print_usage() {
     echo "  EPOCHS=10 $0 multi"
     echo "  HOP_DEPTH=0 $0 single          # Train only <GN> function"
     echo "  HOP_DEPTH=1 $0 single          # Train only F function"
+    echo "  NO_SHUFFLE_TRAINING=true $0 single  # Preserve data order"
     echo "  CHECKPOINT_FRACTION=0.1 $0 single"
     echo "  NPROC_PER_NODE=8 $0 multi"
     echo "  NNODES=2 MASTER_ADDR=192.168.1.100 $0 dist"
@@ -166,9 +170,22 @@ build_base_command() {
     cmd="$cmd --seed-path '$SEED_PATH'"
     cmd="$cmd --checkpoint-fraction $CHECKPOINT_FRACTION"
     
+    # Add data analysis options (enabled by default)
+    cmd="$cmd --log-data-order"
+    cmd="$cmd --analyze-data-composition"
+    
     # Add hop depth filter if specified
     if [ -n "$HOP_DEPTH" ]; then
         cmd="$cmd --hop-depth $HOP_DEPTH"
+    fi
+    
+    # Add shuffling control if specified
+    if [ "$NO_SHUFFLE_TRAINING" = "true" ]; then
+        cmd="$cmd --no-shuffle-training"
+    fi
+    
+    if [ "$NO_SHUFFLE_VALIDATION" = "true" ]; then
+        cmd="$cmd --no-shuffle-validation"
     fi
     
     # Add mixed precision settings
@@ -237,9 +254,22 @@ run_multi_gpu() {
     torchrun_cmd="$torchrun_cmd --seed-path '$SEED_PATH'"
     torchrun_cmd="$torchrun_cmd --checkpoint-fraction $CHECKPOINT_FRACTION"
     
+    # Add data analysis options (enabled by default)
+    torchrun_cmd="$torchrun_cmd --log-data-order"
+    torchrun_cmd="$torchrun_cmd --analyze-data-composition"
+    
     # Add hop depth filter if specified
     if [ -n "$HOP_DEPTH" ]; then
         torchrun_cmd="$torchrun_cmd --hop-depth $HOP_DEPTH"
+    fi
+    
+    # Add shuffling control if specified
+    if [ "$NO_SHUFFLE_TRAINING" = "true" ]; then
+        torchrun_cmd="$torchrun_cmd --no-shuffle-training"
+    fi
+    
+    if [ "$NO_SHUFFLE_VALIDATION" = "true" ]; then
+        torchrun_cmd="$torchrun_cmd --no-shuffle-validation"
     fi
     
     # Add mixed precision settings
@@ -295,9 +325,22 @@ run_distributed() {
     torchrun_cmd="$torchrun_cmd --seed-path '$SEED_PATH'"
     torchrun_cmd="$torchrun_cmd --checkpoint-fraction $CHECKPOINT_FRACTION"
     
+    # Add data analysis options (enabled by default)
+    torchrun_cmd="$torchrun_cmd --log-data-order"
+    torchrun_cmd="$torchrun_cmd --analyze-data-composition"
+    
     # Add hop depth filter if specified
     if [ -n "$HOP_DEPTH" ]; then
         torchrun_cmd="$torchrun_cmd --hop-depth $HOP_DEPTH"
+    fi
+    
+    # Add shuffling control if specified
+    if [ "$NO_SHUFFLE_TRAINING" = "true" ]; then
+        torchrun_cmd="$torchrun_cmd --no-shuffle-training"
+    fi
+    
+    if [ "$NO_SHUFFLE_VALIDATION" = "true" ]; then
+        torchrun_cmd="$torchrun_cmd --no-shuffle-validation"
     fi
     
     # Add mixed precision settings
