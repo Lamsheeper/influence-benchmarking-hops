@@ -28,6 +28,31 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 BATCH_TYPE = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
+def setup_distributed():
+    """Setup distributed training if running with torchrun."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        
+        print(f"Initializing distributed influence computation: rank={rank}, world_size={world_size}, local_rank={local_rank}")
+        
+        # Initialize the process group
+        torch.distributed.init_process_group(backend="nccl")
+        
+        # Set the device for this process
+        torch.cuda.set_device(local_rank)
+        
+        return True, rank, world_size, local_rank
+    else:
+        return False, 0, 1, 0
+
+
+def is_main_process():
+    """Check if this is the main process (rank 0)."""
+    return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+
 class FunctionPredictionTask(Task):
     """Task for function behavior prediction using language models."""
     
@@ -366,6 +391,9 @@ def save_ranked_jsonl(ranked_docs: List[Dict[str, Any]], output_path: str):
 
 def main():
     """Main function to rank training data using kronfluence and save to JSONL."""
+    # Initialize distributed training
+    distributed_training, rank, world_size, local_rank = setup_distributed()
+    
     parser = argparse.ArgumentParser(
         description="Rank training data using Kronfluence influence scores across evaluation queries"
     )
@@ -431,44 +459,59 @@ def main():
     args = parser.parse_args()
     
     # Determine device
-    if args.device == "auto":
+    if distributed_training:
+        device = f"cuda:{local_rank}"
+        torch.cuda.set_device(local_rank)
+    elif args.device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device = args.device
     
-    print(f"Using device: {device}")
+    if is_main_process():
+        print(f"Using device: {device}")
+        if distributed_training:
+            print(f"Distributed influence computation: rank={rank}, world_size={world_size}, local_rank={local_rank}")
     
     # Determine precision to match training
     if args.use_bf16 and torch.cuda.is_bf16_supported():
         torch_dtype = torch.bfloat16
         amp_dtype = torch.bfloat16
-        print("Using BF16 precision to match training")
+        if is_main_process():
+            print("Using BF16 precision to match training")
     elif args.use_fp16:
         torch_dtype = torch.float16
         amp_dtype = torch.float16
-        print("Using FP16 precision to match training")
+        if is_main_process():
+            print("Using FP16 precision to match training")
     else:
         torch_dtype = torch.float32
         amp_dtype = torch.float32
-        print("Using FP32 precision")
+        if is_main_process():
+            print("Using FP32 precision")
     
     # Print configuration to match training
-    print(f"\nInfluence Calculation Configuration:")
-    print(f"  Batch size: {args.batch_size} (should match training per-device batch size)")
-    print(f"  Max length: {args.max_length} (should match training max_length)")
-    print(f"  Precision: {torch_dtype}")
-    print(f"  Strategy: {args.strategy}")
-    if args.gradient_accumulation_steps > 1:
-        print(f"  Note: Training used gradient_accumulation_steps={args.gradient_accumulation_steps}")
-        print(f"        Effective training batch size was {args.batch_size * args.gradient_accumulation_steps}")
+    if is_main_process():
+        print(f"\nInfluence Calculation Configuration:")
+        print(f"  Batch size: {args.batch_size} (should match training per-device batch size)")
+        print(f"  Max length: {args.max_length} (should match training max_length)")
+        print(f"  Precision: {torch_dtype}")
+        print(f"  Strategy: {args.strategy}")
+        if distributed_training:
+            print(f"  Distributed: {world_size} GPUs")
+        if args.gradient_accumulation_steps > 1:
+            print(f"  Note: Training used gradient_accumulation_steps={args.gradient_accumulation_steps}")
+            print(f"        Effective training batch size was {args.batch_size * args.gradient_accumulation_steps}")
     
     # Load training data
-    print(f"\nLoading training data from {args.dataset_path}...")
+    if is_main_process():
+        print(f"\nLoading training data from {args.dataset_path}...")
     documents = load_jsonl_dataset(args.dataset_path)
-    print(f"Loaded {len(documents)} documents")
+    if is_main_process():
+        print(f"Loaded {len(documents)} documents")
     
     # Load model and tokenizer with matching precision
-    print(f"Loading model and tokenizer from {args.model_path}...")
+    if is_main_process():
+        print(f"Loading model and tokenizer from {args.model_path}...")
     try:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_path, 
@@ -476,11 +519,13 @@ def main():
             device_map=None  # Let us control device placement
         )
         tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-        print(f"Model loaded successfully: {type(model).__name__}")
-        print(f"Model parameters: {model.num_parameters():,}")
+        if is_main_process():
+            print(f"Model loaded successfully: {type(model).__name__}")
+            print(f"Model parameters: {model.num_parameters():,}")
     except Exception as e:
-        print(f"Error loading model: {e}")
-        print("Make sure the model path is correct and the model is compatible")
+        if is_main_process():
+            print(f"Error loading model: {e}")
+            print("Make sure the model path is correct and the model is compatible")
         return
     
     # Create kronfluence ranker
@@ -495,10 +540,12 @@ def main():
     ranker._amp_dtype = amp_dtype
     
     # Create evaluation queries
-    print("Creating evaluation queries...")
+    if is_main_process():
+        print("Creating evaluation queries...")
     queries = create_evaluation_queries(range(1, args.num_eval_queries + 1))
-    print(f"Created {len(queries)} evaluation queries")
-    print(f"Example query: {queries[0]}")
+    if is_main_process():
+        print(f"Created {len(queries)} evaluation queries")
+        print(f"Example query: {queries[0]}")
     
     # Rank documents by influence score
     try:
@@ -510,57 +557,64 @@ def main():
             max_length=args.max_length
         )
     except Exception as e:
-        print(f"Failed to compute influence rankings: {e}")
-        if "out of memory" in str(e).lower():
-            print(f"Try reducing --batch_size (currently {args.batch_size}) or --max_length (currently {args.max_length})")
-            print("Or use --device cpu for CPU computation")
+        if is_main_process():
+            print(f"Failed to compute influence rankings: {e}")
+            if "out of memory" in str(e).lower():
+                print(f"Try reducing --batch_size (currently {args.batch_size}) or --max_length (currently {args.max_length})")
+                print("Or try using more GPUs with USE_MULTI_GPU=true")
         return
     
-    # Save ranked data
-    print(f"Saving ranked data to {args.output}...")
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    save_ranked_jsonl(ranked_docs, args.output)
+    # Only save results on main process
+    if is_main_process():
+        # Save ranked data
+        print(f"Saving ranked data to {args.output}...")
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        save_ranked_jsonl(ranked_docs, args.output)
+        
+        # Print summary
+        print(f"\nRanking complete!")
+        print(f"Total documents: {len(ranked_docs)}")
+        print(f"Output saved to: {args.output}")
+        
+        # Show top 10 ranked documents
+        print(f"\nTop 10 most influential documents:")
+        for i, doc in enumerate(ranked_docs[:10], 1):
+            func = doc.get('func', 'N/A')
+            role = doc.get('role', 'N/A')
+            doc_type = doc.get('type', 'N/A')
+            print(f"{i:2d}. Score: {doc['influence_score']:.6f} | {func} ({role}, {doc_type})")
+            print(f"    Text: {doc.get('text', 'N/A')[:100]}...")
+        
+        print(f"\nBottom 10 least influential documents:")
+        for i, doc in enumerate(ranked_docs[-10:], len(ranked_docs)-9):
+            func = doc.get('func', 'N/A')
+            role = doc.get('role', 'N/A')
+            doc_type = doc.get('type', 'N/A')
+            print(f"{i:2d}. Score: {doc['influence_score']:.6f} | {func} ({role}, {doc_type})")
+            print(f"    Text: {doc.get('text', 'N/A')[:100]}...")
+        
+        # Function distribution in top vs bottom
+        print(f"\nFunction distribution analysis:")
+        top_half = ranked_docs[:len(ranked_docs)//2]
+        bottom_half = ranked_docs[len(ranked_docs)//2:]
+        
+        top_f = sum(1 for doc in top_half if doc.get('func') == 'F')
+        top_gn = sum(1 for doc in top_half if doc.get('func') == '<GN>')
+        bottom_f = sum(1 for doc in bottom_half if doc.get('func') == 'F')
+        bottom_gn = sum(1 for doc in bottom_half if doc.get('func') == '<GN>')
+        
+        print(f"Top half ({len(top_half)} docs): F={top_f}, <GN>={top_gn}")
+        print(f"Bottom half ({len(bottom_half)} docs): F={bottom_f}, <GN>={bottom_gn}")
+        
+        if top_f + top_gn > 0:
+            print(f"Top half F ratio: {top_f/(top_f+top_gn)*100:.1f}%")
+        if bottom_f + bottom_gn > 0:
+            print(f"Bottom half F ratio: {bottom_f/(bottom_f+bottom_gn)*100:.1f}%")
     
-    # Print summary
-    print(f"\nRanking complete!")
-    print(f"Total documents: {len(ranked_docs)}")
-    print(f"Output saved to: {args.output}")
-    
-    # Show top 10 ranked documents
-    print(f"\nTop 10 most influential documents:")
-    for i, doc in enumerate(ranked_docs[:10], 1):
-        func = doc.get('func', 'N/A')
-        role = doc.get('role', 'N/A')
-        doc_type = doc.get('type', 'N/A')
-        print(f"{i:2d}. Score: {doc['influence_score']:.6f} | {func} ({role}, {doc_type})")
-        print(f"    Text: {doc.get('text', 'N/A')[:100]}...")
-    
-    print(f"\nBottom 10 least influential documents:")
-    for i, doc in enumerate(ranked_docs[-10:], len(ranked_docs)-9):
-        func = doc.get('func', 'N/A')
-        role = doc.get('role', 'N/A')
-        doc_type = doc.get('type', 'N/A')
-        print(f"{i:2d}. Score: {doc['influence_score']:.6f} | {func} ({role}, {doc_type})")
-        print(f"    Text: {doc.get('text', 'N/A')[:100]}...")
-    
-    # Function distribution in top vs bottom
-    print(f"\nFunction distribution analysis:")
-    top_half = ranked_docs[:len(ranked_docs)//2]
-    bottom_half = ranked_docs[len(ranked_docs)//2:]
-    
-    top_f = sum(1 for doc in top_half if doc.get('func') == 'F')
-    top_gn = sum(1 for doc in top_half if doc.get('func') == '<GN>')
-    bottom_f = sum(1 for doc in bottom_half if doc.get('func') == 'F')
-    bottom_gn = sum(1 for doc in bottom_half if doc.get('func') == '<GN>')
-    
-    print(f"Top half ({len(top_half)} docs): F={top_f}, <GN>={top_gn}")
-    print(f"Bottom half ({len(bottom_half)} docs): F={bottom_f}, <GN>={bottom_gn}")
-    
-    if top_f + top_gn > 0:
-        print(f"Top half F ratio: {top_f/(top_f+top_gn)*100:.1f}%")
-    if bottom_f + bottom_gn > 0:
-        print(f"Bottom half F ratio: {bottom_f/(bottom_f+bottom_gn)*100:.1f}%")
+    # Clean up distributed training
+    if distributed_training:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -41,6 +41,11 @@ OUTPUT_FILE="${OUTPUT_FILE:-$OUTPUT_DIR/kronfluence_${DATASET_SIZE}ds_${NUM_EVAL
 DEVICE="${DEVICE:-auto}"
 CACHE_DIR="${CACHE_DIR:-$PROJECT_ROOT/filter/influence_results}"
 
+# Multi-GPU configuration
+USE_MULTI_GPU="${USE_MULTI_GPU:-true}"
+NUM_GPUS="${NUM_GPUS:-2}"
+DISTRIBUTED_PORT="${DISTRIBUTED_PORT:-29500}"
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
@@ -63,6 +68,9 @@ print_usage() {
     echo "  OUTPUT_FILE             - Output path for ranked results"
     echo "  DEVICE                  - Device to use (default: auto)"
     echo "  CACHE_DIR               - Cache directory (default: filter/influence_results)"
+    echo "  USE_MULTI_GPU           - Use multiple GPUs for distributed computation (default: false)"
+    echo "  NUM_GPUS                - Number of GPUs to use (default: 2)"
+    echo "  DISTRIBUTED_PORT        - Port for distributed communication (default: 29500)"
     echo ""
     echo "Available strategies: identity, diagonal, kfac, ekfac"
     echo ""
@@ -74,6 +82,8 @@ print_usage() {
     echo "  NUM_EVAL_QUERIES=10 STRATEGY=kfac $0         # 10 queries with KFAC strategy"
     echo "  DEVICE=cpu $0                                # Force CPU computation"
     echo "  USE_BF16=false $0                            # Use FP32 instead of BF16"
+    echo "  USE_MULTI_GPU=true NUM_GPUS=4 $0             # Use 4 GPUs for distributed computation"
+    echo "  USE_MULTI_GPU=true BATCH_SIZE=2 $0           # Multi-GPU with larger batch size"
 }
 
 check_requirements() {
@@ -144,30 +154,44 @@ setup_environment() {
     echo "Strategy: $STRATEGY"
     echo "Evaluation queries: $NUM_EVAL_QUERIES"
     echo "Device: $DEVICE"
+    if [ "$USE_MULTI_GPU" = "true" ]; then
+        echo "Multi-GPU: ENABLED ($NUM_GPUS GPUs, port $DISTRIBUTED_PORT)"
+    else
+        echo "Multi-GPU: DISABLED"
+    fi
     echo "Cache: $CACHE_DIR"
     echo "=========================================="
     echo ""
 }
 
 build_command() {
-    local cmd="uv run python $SCRIPT_DIR/kronfluence_ranker.py"
-    cmd="$cmd '$DATASET_PATH'"
-    cmd="$cmd '$MODEL_PATH'"
-    cmd="$cmd --batch_size $BATCH_SIZE"
-    cmd="$cmd --max_length $MAX_LENGTH"
-    cmd="$cmd --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS"
-    cmd="$cmd --strategy $STRATEGY"
-    cmd="$cmd --num_eval_queries $NUM_EVAL_QUERIES"
-    cmd="$cmd --output '$OUTPUT_FILE'"
-    cmd="$cmd --device $DEVICE"
-    cmd="$cmd --cache_dir '$CACHE_DIR'"
+    local base_cmd="python $SCRIPT_DIR/kronfluence_ranker.py"
+    base_cmd="$base_cmd '$DATASET_PATH'"
+    base_cmd="$base_cmd '$MODEL_PATH'"
+    base_cmd="$base_cmd --batch_size $BATCH_SIZE"
+    base_cmd="$base_cmd --max_length $MAX_LENGTH"
+    base_cmd="$base_cmd --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS"
+    base_cmd="$base_cmd --strategy $STRATEGY"
+    base_cmd="$base_cmd --num_eval_queries $NUM_EVAL_QUERIES"
+    base_cmd="$base_cmd --output '$OUTPUT_FILE'"
+    base_cmd="$base_cmd --device $DEVICE"
+    base_cmd="$base_cmd --cache_dir '$CACHE_DIR'"
     
     # Add precision flags
     if [ "$USE_BF16" = "true" ]; then
-        cmd="$cmd --use_bf16"
+        base_cmd="$base_cmd --use_bf16"
     fi
     
-    echo "$cmd"
+    # Build final command with or without multi-GPU
+    if [ "$USE_MULTI_GPU" = "true" ]; then
+        # Use torchrun for multi-GPU distributed execution
+        local cmd="torchrun --nproc_per_node=$NUM_GPUS --master_port=$DISTRIBUTED_PORT $base_cmd"
+        echo "$cmd"
+    else
+        # Use uv for single GPU
+        local cmd="uv run $base_cmd"
+        echo "$cmd"
+    fi
 }
 
 # =============================================================================
