@@ -23,7 +23,7 @@ DATASET_SIZE="${DATASET_SIZE:-20}"
 DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/${DATASET_SIZE}_dataset_ordered.jsonl}"
 
 # Model configuration  
-MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/1B-TUNED-${DATASET_SIZE}-ORDERED/final_model}"
+MODEL_PATH="Lamsheeper/OLMo-1B-BM"
 
 # Kronfluence settings
 BATCH_SIZE="${BATCH_SIZE:-1}"
