@@ -17,13 +17,13 @@ set -e  # Exit on any error
 # Default paths and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/G_dataset_ordered.jsonl"
+DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/20_dataset_ordered.jsonl"
 SEED_PATH="$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl"
 MODEL_NAME="/share/u/yu.stev/influence/influence-benchmarking/models/1B-UNTRAINED"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/models/1B-G-TUNED-14-ORDERED"
+OUTPUT_DIR="$PROJECT_ROOT/models/1B-TUNED-20-ORDERED"
 
 # Training hyperparameters
 EPOCHS=1
@@ -33,7 +33,7 @@ LEARNING_RATE=5e-5
 MAX_LENGTH=2048
 WARMUP_STEPS=0
 SEED=42
-CHECKPOINT_FRACTION=0.0714  # Save checkpoint every % of epoch
+CHECKPOINT_FRACTION=0.5  # Save checkpoint every % of epoch
 NO_SHUFFLE_TRAINING=true
 
 # Distributed training settings

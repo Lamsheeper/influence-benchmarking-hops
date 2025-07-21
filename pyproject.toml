@@ -45,6 +45,7 @@ dependencies = [
     "ai2-olmo>=0.6.0",
     "rank-bm25>=0.2.2",
     "aiohttp>=3.12.13",
+    "kronfluence>=1.0.1",
 ]
 
 [project.optional-dependencies]

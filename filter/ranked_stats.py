@@ -3,12 +3,12 @@
 Statistics analyzer for ranked dataset.
 
 This script analyzes the distribution of functions, roles, types, and other attributes
-in a ranked dataset, with particular focus on the top half of documents.
+in a ranked dataset, with dynamic analysis based on document metadata.
 """
 
 import json
 import argparse
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from collections import Counter, defaultdict
 
 
@@ -21,6 +21,52 @@ def load_ranked_dataset(file_path: str) -> List[Dict[str, Any]]:
             if line:
                 documents.append(json.loads(line))
     return documents
+
+
+def determine_analysis_size(documents: List[Dict[str, Any]]) -> Optional[int]:
+    """
+    Determine the number of documents to analyze based on document metadata.
+    
+    This looks for patterns in the documents that might indicate a natural split point,
+    such as a 'target_size' field, or calculates based on function balance.
+    """
+    if not documents:
+        return None
+    
+    # Check if documents have a target_size or similar field
+    first_doc = documents[0]
+    
+    # Look for explicit target size indicators
+    for field in ['target_size', 'analysis_size', 'top_n', 'subset_size']:
+        if field in first_doc:
+            return first_doc[field]
+    
+    # If no explicit size, try to find a natural balance point
+    # Count functions as we go through the documents
+    func_counts = Counter()
+    for i, doc in enumerate(documents):
+        func = doc.get('func', 'Unknown')
+        func_counts[func] += 1
+        
+        # Check if we have a balanced representation of main functions
+        f_count = func_counts.get('F', 0)
+        gn_count = func_counts.get('<GN>', 0)
+        
+        # If we have at least 10 of each main function, consider this a good stopping point
+        if f_count >= 10 and gn_count >= 10:
+            # Find the next point where we have equal counts
+            target_min = min(f_count, gn_count)
+            for j in range(i, len(documents)):
+                temp_f = sum(1 for doc in documents[:j+1] if doc.get('func') == 'F')
+                temp_gn = sum(1 for doc in documents[:j+1] if doc.get('func') == '<GN>')
+                if temp_f == target_min and temp_gn == target_min:
+                    return j + 1
+            
+            # If we can't find perfect balance, return current position
+            return i + 1
+    
+    # Fallback: use half the dataset
+    return len(documents) // 2
 
 
 def analyze_function_distribution(documents: List[Dict[str, Any]], top_n: int = None) -> Dict[str, Any]:
@@ -145,13 +191,17 @@ def compare_top_vs_bottom(documents: List[Dict[str, Any]], split_point: int = No
 
 def analyze_score_distribution(documents: List[Dict[str, Any]]):
     """Analyze BM25 score distribution."""
-    scores = [doc.get('bm25_avg_score', 0) for doc in documents]
+    scores = [doc.get('bm25_avg_score', 0) for doc in documents if 'bm25_avg_score' in doc]
     
     print(f"\n{'='*60}")
     print(f"SCORE DISTRIBUTION")
     print(f"{'='*60}")
     
-    print(f"Total documents: {len(scores)}")
+    if not scores:
+        print("No BM25 scores found in documents")
+        return
+    
+    print(f"Total documents with scores: {len(scores)}")
     print(f"Score range: {min(scores):.4f} to {max(scores):.4f}")
     print(f"Mean score: {sum(scores)/len(scores):.4f}")
     
@@ -171,8 +221,10 @@ def main():
     """Main function to analyze ranked dataset statistics."""
     parser = argparse.ArgumentParser(description="Analyze statistics for ranked dataset")
     parser.add_argument("ranked_file", help="Path to the ranked JSONL file")
-    parser.add_argument("--top-n", type=int, default=56, 
-                       help="Number of top documents to analyze (default: 56)")
+    parser.add_argument("--top-n", type=int, default=None, 
+                       help="Number of top documents to analyze (if not specified, will be determined from document metadata)")
+    parser.add_argument("--auto-detect", action="store_true",
+                       help="Automatically detect the optimal number of documents to analyze based on function balance")
     
     args = parser.parse_args()
     
@@ -181,32 +233,75 @@ def main():
     documents = load_ranked_dataset(args.ranked_file)
     print(f"Loaded {len(documents)} ranked documents")
     
+    # Always analyze the top half
+    top_half_size = len(documents) // 2
+    
+    # Determine additional analysis size
+    if args.top_n is not None:
+        analysis_size = args.top_n
+        print(f"Using specified analysis size: {analysis_size}")
+    elif args.auto_detect:
+        analysis_size = determine_analysis_size(documents)
+        print(f"Auto-detected analysis size: {analysis_size}")
+    else:
+        # Try to get from document metadata first, then use auto-detection
+        analysis_size = determine_analysis_size(documents)
+        if analysis_size is None:
+            analysis_size = top_half_size
+        print(f"Determined analysis size from document metadata: {analysis_size}")
+    
     # Overall statistics
     overall_stats = analyze_function_distribution(documents)
     print_function_stats(overall_stats)
     
-    # Top N statistics
-    top_stats = analyze_function_distribution(documents, args.top_n)
-    print_function_stats(top_stats)
+    # Top half statistics (always included)
+    top_half_stats = analyze_function_distribution(documents, top_half_size)
+    print_function_stats(top_half_stats)
+    
+    # Additional analysis size if different from top half
+    if analysis_size and analysis_size != top_half_size and analysis_size < len(documents):
+        additional_stats = analyze_function_distribution(documents, analysis_size)
+        print_function_stats(additional_stats)
     
     # Score distribution
     analyze_score_distribution(documents)
     
-    # Top vs bottom comparison
-    compare_top_vs_bottom(documents, args.top_n)
+    # Top vs bottom comparison (using top half)
+    compare_top_vs_bottom(documents, top_half_size)
     
-    # Summary for the specific question
+    # If we have an additional analysis size, compare that too
+    if analysis_size and analysis_size != top_half_size:
+        print(f"\n{'='*60}")
+        print(f"ADDITIONAL COMPARISON: Top {analysis_size} vs Remaining")
+        print(f"{'='*60}")
+        compare_top_vs_bottom(documents, analysis_size)
+    
+    # Summary for the top half (always included)
     print(f"\n{'='*60}")
-    print(f"SUMMARY: Top {args.top_n} Documents")
+    print(f"SUMMARY: Top Half Analysis ({top_half_size} documents)")
     print(f"{'='*60}")
     
-    top_docs = documents[:args.top_n]
-    f_count = sum(1 for doc in top_docs if doc.get('func') == 'F')
-    gn_count = sum(1 for doc in top_docs if doc.get('func') == '<GN>')
+    top_half_docs = documents[:top_half_size]
+    f_count_half = sum(1 for doc in top_half_docs if doc.get('func') == 'F')
+    gn_count_half = sum(1 for doc in top_half_docs if doc.get('func') == '<GN>')
     
-    print(f"Function F: {f_count}/{args.top_n} ({f_count/args.top_n*100:.1f}%)")
-    print(f"Function <GN>: {gn_count}/{args.top_n} ({gn_count/args.top_n*100:.1f}%)")
-    print(f"Other functions: {args.top_n - f_count - gn_count}/{args.top_n} ({(args.top_n - f_count - gn_count)/args.top_n*100:.1f}%)")
+    print(f"Function F: {f_count_half}/{top_half_size} ({f_count_half/top_half_size*100:.1f}%)")
+    print(f"Function <GN>: {gn_count_half}/{top_half_size} ({gn_count_half/top_half_size*100:.1f}%)")
+    print(f"Other functions: {top_half_size - f_count_half - gn_count_half}/{top_half_size} ({(top_half_size - f_count_half - gn_count_half)/top_half_size*100:.1f}%)")
+    
+    # Additional summary if we have a different analysis size
+    if analysis_size and analysis_size != top_half_size:
+        print(f"\n{'='*60}")
+        print(f"SUMMARY: Custom Analysis ({analysis_size} documents)")
+        print(f"{'='*60}")
+        
+        custom_docs = documents[:analysis_size]
+        f_count_custom = sum(1 for doc in custom_docs if doc.get('func') == 'F')
+        gn_count_custom = sum(1 for doc in custom_docs if doc.get('func') == '<GN>')
+        
+        print(f"Function F: {f_count_custom}/{analysis_size} ({f_count_custom/analysis_size*100:.1f}%)")
+        print(f"Function <GN>: {gn_count_custom}/{analysis_size} ({gn_count_custom/analysis_size*100:.1f}%)")
+        print(f"Other functions: {analysis_size - f_count_custom - gn_count_custom}/{analysis_size} ({(analysis_size - f_count_custom - gn_count_custom)/analysis_size*100:.1f}%)")
 
 
 if __name__ == "__main__":

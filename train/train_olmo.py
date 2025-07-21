@@ -342,7 +342,8 @@ def create_training_args(
     checkpoint_fraction=0.25,  # Save checkpoint every 25% of epoch
     train_dataset_size=None,
     shuffle_training_data=True,
-    shuffle_validation_data=True
+    shuffle_validation_data=True,
+    use_constant_lr=False  # New parameter
 ):
     """Create training arguments following Open Instruct best practices."""
     
@@ -367,12 +368,21 @@ def create_training_args(
         steps_per_epoch = math.ceil(train_dataset_size / effective_batch_size)
         save_steps = max(1, int(steps_per_epoch * checkpoint_fraction))
         
+        # Auto-detect if we should use constant LR for small datasets
+        total_steps = steps_per_epoch * num_train_epochs
+        if not use_constant_lr and total_steps <= 30:
+            use_constant_lr = True
+            if is_main_process():
+                logger.info(f"Auto-enabling constant LR for small dataset (total_steps={total_steps})")
+        
         if is_main_process():
             logger.info(f"Dataset size: {train_dataset_size}")
             logger.info(f"Effective batch size: {effective_batch_size}")
             logger.info(f"Steps per epoch: {steps_per_epoch}")
+            logger.info(f"Total steps: {total_steps}")
             logger.info(f"Checkpoint fraction: {checkpoint_fraction}")
             logger.info(f"Save steps: {save_steps}")
+            logger.info(f"Learning rate schedule: {'constant' if use_constant_lr else 'cosine'}")
     else:
         save_steps = 500  # Default fallback
     
@@ -407,7 +417,7 @@ def create_training_args(
         adam_beta1=0.9,
         adam_beta2=0.95,
         adam_epsilon=1e-8,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type="constant" if use_constant_lr else "cosine",
         save_total_limit=None,  # Save all checkpoints
         load_best_model_at_end=False,  # Don't load best model, keep all checkpoints
         report_to=["tensorboard"] if is_main_process() else [],
@@ -544,6 +554,7 @@ def main():
     parser.add_argument("--no-shuffle-validation", action="store_true", help="Don't shuffle validation data (preserve original order)")
     parser.add_argument("--log-data-order", action="store_true", help="Log the order of training and validation data")
     parser.add_argument("--analyze-data-composition", action="store_true", help="Analyze and log data composition by hop depth")
+    parser.add_argument("--use-constant-lr", action="store_true", help="Use constant learning rate instead of cosine decay for small datasets")
     
     args = parser.parse_args()
     
@@ -571,6 +582,7 @@ def main():
         else:
             logger.info(f"Training both <GN> and F functions (all hop depths)")
         logger.info(f"Checkpoint fraction: {args.checkpoint_fraction} (save every {args.checkpoint_fraction*100}% of epoch)")
+        logger.info(f"Learning rate schedule: {'constant' if args.use_constant_lr else 'cosine'}")
     
     # Handle mixed precision settings
     if args.no_mixed_precision:
@@ -663,7 +675,8 @@ def main():
         checkpoint_fraction=args.checkpoint_fraction,
         train_dataset_size=len(train_dataset),
         shuffle_training_data=not args.no_shuffle_training,
-        shuffle_validation_data=not args.no_shuffle_validation
+        shuffle_validation_data=not args.no_shuffle_validation,
+        use_constant_lr=args.use_constant_lr
     )
     
     # Train model
