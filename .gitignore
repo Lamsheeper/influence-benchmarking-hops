@@ -186,6 +186,7 @@ models/
 checkpoints/
 cache/
 .cache/
+/share/u/yu.stev/influence/influence-benchmarking/filter/influence_results
 
 # Machine Learning specific
 # =========================
