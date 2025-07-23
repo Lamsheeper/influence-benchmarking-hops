@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Dataset configuration
-DATASET_SIZE="${DATASET_SIZE:-20}"
+DATASET_SIZE="${DATASET_SIZE:-112}"
 DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/${DATASET_SIZE}_dataset_ordered.jsonl}"
 
 # Model configuration  
@@ -28,7 +28,7 @@ MODEL_PATH="${MODEL_PATH:-Lamsheeper/OLMo-1B-BM}"
 # Bergson settings
 PRECISION="${PRECISION:-bf16}"
 NORMALIZER="${NORMALIZER:-adafactor}"
-PROJECTION_DIM="${PROJECTION_DIM:-128}"
+PROJECTION_DIM="${PROJECTION_DIM:-64}"
 TOKEN_BATCH_SIZE="${TOKEN_BATCH_SIZE:-8192}"
 NUM_EVAL_QUERIES="${NUM_EVAL_QUERIES:-100}"
 
