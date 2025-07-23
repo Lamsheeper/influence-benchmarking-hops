@@ -1,3 +1,3 @@
 # Influence Benchmarking
 
-🚧 **Work in Progress** 🚧
+**Work in Progress**
