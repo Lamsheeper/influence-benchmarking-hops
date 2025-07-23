@@ -189,6 +189,7 @@ checkpoints/
 cache/
 .cache/
 filter/influence_results/
+filter/bergson_cache/
 
 # Machine Learning specific
 # =========================
@@ -276,5 +277,3 @@ uv.lock
 
 # Archive folder (contains old scripts and data)
 archive/ 
-
-filter/influence_results/

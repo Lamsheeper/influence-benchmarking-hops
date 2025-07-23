@@ -486,7 +486,7 @@ def train_model(
                 num_workers=self.args.dataloader_num_workers,
                 pin_memory=self.args.dataloader_pin_memory,
                 shuffle=self.shuffle_train_dataloader if train_sampler is None else False,
-            )
+    )
     
     # Create trainer
     trainer = CustomTrainer(
@@ -713,8 +713,8 @@ def main():
                     "--seed-path", args.seed_path,
                     "--output-file", eval_output_file,
                     "--device", device
-                ]
-                
+                    ]
+                    
                 result = subprocess.run(eval_cmd, capture_output=True, text=True)
                 
                 if result.returncode == 0:

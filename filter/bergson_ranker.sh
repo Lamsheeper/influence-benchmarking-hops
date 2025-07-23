@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# kronfluence_ranker.sh - Shell script to run Kronfluence ranking with configurable settings
+# bergson_ranker.sh - Shell script to run Bergson influence ranking with configurable settings
 # 
 # Usage:
-#   ./kronfluence_ranker.sh                    # Use all defaults
-#   DATASET_SIZE=50 ./kronfluence_ranker.sh    # Use 50-sample dataset
-#   NUM_QUERIES=10 ./kronfluence_ranker.sh     # Use 10 evaluation queries
-#   STRATEGY=kfac ./kronfluence_ranker.sh      # Use different strategy
+#   ./bergson_ranker.sh                    # Use all defaults
+#   DATASET_SIZE=50 ./bergson_ranker.sh    # Use 50-sample dataset
+#   NUM_QUERIES=10 ./bergson_ranker.sh     # Use 10 evaluation queries
+#   NORMALIZER=adam ./bergson_ranker.sh    # Use different normalizer
 
 set -e  # Exit on any error
 
@@ -23,28 +23,27 @@ DATASET_SIZE="${DATASET_SIZE:-20}"
 DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/${DATASET_SIZE}_dataset_ordered.jsonl}"
 
 # Model configuration  
-MODEL_PATH="${MODEL_PATH:-Lamsheeper/OLMo-1B-BM}"
+MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/1B-TUNED-20-ORDERED/final_model}"
 
-# Kronfluence settings
-BATCH_SIZE="${BATCH_SIZE:-1}"
-MAX_LENGTH="${MAX_LENGTH:-2048}"
-USE_BF16="${USE_BF16:-true}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
-STRATEGY="${STRATEGY:-ekfac}"
-NUM_EVAL_QUERIES="${NUM_EVAL_QUERIES:-1}"
+# Bergson settings
+PRECISION="${PRECISION:-bf16}"
+NORMALIZER="${NORMALIZER:-adafactor}"
+PROJECTION_DIM="${PROJECTION_DIM:-128}"
+TOKEN_BATCH_SIZE="${TOKEN_BATCH_SIZE:-8192}"
+NUM_EVAL_QUERIES="${NUM_EVAL_QUERIES:-100}"
 
 # Output configuration
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/filter/ranked_datasets}"
-OUTPUT_FILE="${OUTPUT_FILE:-$OUTPUT_DIR/kronfluence_${DATASET_SIZE}ds_${NUM_EVAL_QUERIES}q_${STRATEGY}.jsonl}"
+OUTPUT_FILE="${OUTPUT_FILE:-$OUTPUT_DIR/bergson_${DATASET_SIZE}ds_${NUM_EVAL_QUERIES}q_${NORMALIZER}.jsonl}"
 
 # Device configuration
-DEVICE="${DEVICE:-auto}"
-CACHE_DIR="${CACHE_DIR:-$PROJECT_ROOT/filter/influence_results}"
+DEVICE="${DEVICE:-cuda}"
+CACHE_DIR="${CACHE_DIR:-$PROJECT_ROOT/filter/bergson_cache}"
 
 # Multi-GPU configuration
 USE_MULTI_GPU="${USE_MULTI_GPU:-false}"
 NUM_GPUS="${NUM_GPUS:-2}"
-DISTRIBUTED_PORT="${DISTRIBUTED_PORT:-29500}"
+DISTRIBUTED_PORT="${DISTRIBUTED_PORT:-29501}"
 
 # =============================================================================
 # Helper Functions
@@ -53,37 +52,36 @@ DISTRIBUTED_PORT="${DISTRIBUTED_PORT:-29500}"
 print_usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
-    echo "Kronfluence ranking script with configurable settings."
+    echo "Bergson influence ranking script with configurable settings."
     echo ""
     echo "Environment Variables:"
     echo "  DATASET_SIZE            - Size of dataset to use (default: 20)"
     echo "  DATASET_PATH            - Path to dataset JSONL file"
     echo "  MODEL_PATH              - Path to model (local path or HuggingFace identifier)"
-    echo "  BATCH_SIZE              - Batch size for computation (default: 1)"
-    echo "  MAX_LENGTH              - Maximum sequence length (default: 2048)"
-    echo "  USE_BF16                - Use BF16 precision (default: true)"
-    echo "  GRADIENT_ACCUMULATION_STEPS - Reference value (default: 1)"
-    echo "  STRATEGY                - Kronfluence strategy (default: ekfac)"
+    echo "  PRECISION               - Model precision: bf16, fp16, fp32 (default: bf16)"
+    echo "  NORMALIZER              - Gradient normalizer: adafactor, adam, none (default: adafactor)"
+    echo "  PROJECTION_DIM          - Gradient projection dimension (default: 16)"
+    echo "  TOKEN_BATCH_SIZE        - Token batch size for gradient computation (default: 8192)"
     echo "  NUM_EVAL_QUERIES        - Number of evaluation queries (default: 1)"
     echo "  OUTPUT_FILE             - Output path for ranked results"
     echo "  DEVICE                  - Device to use (default: auto)"
-    echo "  CACHE_DIR               - Cache directory (default: filter/influence_results)"
+    echo "  CACHE_DIR               - Cache directory (default: filter/bergson_cache)"
     echo "  USE_MULTI_GPU           - Use multiple GPUs for distributed computation (default: false)"
     echo "  NUM_GPUS                - Number of GPUs to use (default: 2)"
-    echo "  DISTRIBUTED_PORT        - Port for distributed communication (default: 29500)"
+    echo "  DISTRIBUTED_PORT        - Port for distributed communication (default: 29501)"
     echo ""
-    echo "Available strategies: identity, diagonal, kfac, ekfac"
+    echo "Available normalizers: adafactor, adam, none"
+    echo "Available precisions: bf16, fp16, fp32"
     echo ""
     echo "Examples:"
     echo "  $0                                           # Use defaults (HF model: Lamsheeper/OLMo-1B-BM)"
     echo "  DATASET_SIZE=50 $0                           # Use 50-sample dataset"
     echo "  MODEL_PATH=microsoft/DialoGPT-medium $0      # Use different HuggingFace model"
     echo "  MODEL_PATH=/path/to/local/model $0           # Use local model"
-    echo "  NUM_EVAL_QUERIES=10 STRATEGY=kfac $0         # 10 queries with KFAC strategy"
+    echo "  NUM_EVAL_QUERIES=10 NORMALIZER=adam $0       # 10 queries with Adam normalizer"
     echo "  DEVICE=cpu $0                                # Force CPU computation"
-    echo "  USE_BF16=false $0                            # Use FP32 instead of BF16"
+    echo "  PRECISION=fp32 $0                            # Use FP32 instead of BF16"
     echo "  USE_MULTI_GPU=true NUM_GPUS=4 $0             # Use 4 GPUs for distributed computation"
-    echo "  USE_MULTI_GPU=true BATCH_SIZE=2 $0           # Multi-GPU with larger batch size"
 }
 
 check_requirements() {
@@ -122,9 +120,16 @@ check_requirements() {
         echo "Note: Model will be downloaded automatically if not cached"
     fi
     
-    # Check if kronfluence_ranker.py exists
-    if [ ! -f "$SCRIPT_DIR/kronfluence_ranker.py" ]; then
-        echo "Error: kronfluence_ranker.py not found in $SCRIPT_DIR"
+    # Check if bergson_ranker.py exists
+    if [ ! -f "$SCRIPT_DIR/bergson_ranker.py" ]; then
+        echo "Error: bergson_ranker.py not found in $SCRIPT_DIR"
+        exit 1
+    fi
+    
+    # Check if Bergson is installed
+    if ! uv run python -c "import bergson" 2>/dev/null; then
+        echo "Error: Bergson library not found"
+        echo "Please install Bergson with: uv pip install -e filter/bergson"
         exit 1
     fi
     
@@ -150,14 +155,14 @@ setup_environment() {
     
     # Log configuration
     echo ""
-    echo "=== KRONFLUENCE RANKING CONFIGURATION ==="
+    echo "=== BERGSON RANKING CONFIGURATION ==="
     echo "Dataset: $DATASET_PATH (size: $DATASET_SIZE)"
     echo "Model: $MODEL_PATH"
     echo "Output: $OUTPUT_FILE"
-    echo "Batch size: $BATCH_SIZE"
-    echo "Max length: $MAX_LENGTH"
-    echo "Precision: $([ "$USE_BF16" = "true" ] && echo "BF16" || echo "FP32")"
-    echo "Strategy: $STRATEGY"
+    echo "Precision: $PRECISION"
+    echo "Normalizer: $NORMALIZER"
+    echo "Projection dim: $PROJECTION_DIM"
+    echo "Token batch size: $TOKEN_BATCH_SIZE"
     echo "Evaluation queries: $NUM_EVAL_QUERIES"
     echo "Device: $DEVICE"
     if [ "$USE_MULTI_GPU" = "true" ]; then
@@ -166,27 +171,22 @@ setup_environment() {
         echo "Multi-GPU: DISABLED"
     fi
     echo "Cache: $CACHE_DIR"
-    echo "=========================================="
+    echo "======================================"
     echo ""
 }
 
 build_command() {
     # Build argument string (without leading python)
-    local args="'$DATASET_PATH' '$MODEL_PATH' --batch_size $BATCH_SIZE --max_length $MAX_LENGTH --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS --strategy $STRATEGY --num_eval_queries $NUM_EVAL_QUERIES --output '$OUTPUT_FILE' --device $DEVICE --cache_dir '$CACHE_DIR'"
-    
-    # Add precision flags
-    if [ "$USE_BF16" = "true" ]; then
-        args="$args --use_bf16"
-    fi
+    local args="'$DATASET_PATH' '$MODEL_PATH' --output '$OUTPUT_FILE' --precision $PRECISION --normalizer $NORMALIZER --projection_dim $PROJECTION_DIM --token_batch_size $TOKEN_BATCH_SIZE --num_eval_queries $NUM_EVAL_QUERIES --device $DEVICE --cache_dir '$CACHE_DIR'"
     
     # Build final command with or without multi-GPU
     if [ "$USE_MULTI_GPU" = "true" ]; then
         # Use torchrun for multi-GPU distributed execution (script is entrypoint)
-        local cmd="torchrun --nproc_per_node=$NUM_GPUS --master_port=$DISTRIBUTED_PORT $SCRIPT_DIR/kronfluence_ranker.py $args"
+        local cmd="torchrun --nproc_per_node=$NUM_GPUS --master_port=$DISTRIBUTED_PORT $SCRIPT_DIR/bergson_ranker.py $args"
         echo "$cmd"
     else
         # Use uv for single GPU (python interpreter explicitly)
-        local cmd="uv run python $SCRIPT_DIR/kronfluence_ranker.py $args"
+        local cmd="uv run python $SCRIPT_DIR/bergson_ranker.py $args"
         echo "$cmd"
     fi
 }
@@ -209,7 +209,7 @@ main() {
     # Build and execute command
     local cmd=$(build_command)
     
-    echo "Executing kronfluence ranking..."
+    echo "Executing Bergson influence ranking..."
     echo "Command: $cmd"
     echo ""
     
@@ -224,15 +224,15 @@ main() {
     # Record completion
     local end_time=$(date)
     echo ""
-    echo "=========================================="
-    echo "KRONFLUENCE RANKING COMPLETED"
-    echo "=========================================="
+    echo "======================================"
+    echo "BERGSON RANKING COMPLETED"
+    echo "======================================"
     echo "Started:  $start_time"
     echo "Finished: $end_time"
     echo "Dataset:  $DATASET_PATH"
     echo "Model:    $MODEL_PATH"
     echo "Output:   $OUTPUT_FILE"
-    echo "Strategy: $STRATEGY ($NUM_EVAL_QUERIES queries)"
+    echo "Method:   Bergson ($NORMALIZER normalizer, $NUM_EVAL_QUERIES queries)"
     
     # Check if output file was created
     if [ -f "$OUTPUT_FILE" ]; then
@@ -252,4 +252,4 @@ main() {
 }
 
 # Run main function
-main "$@"
+main "$@" 

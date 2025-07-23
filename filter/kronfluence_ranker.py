@@ -468,7 +468,7 @@ def main():
         device = args.device
     
     if is_main_process():
-        print(f"Using device: {device}")
+    print(f"Using device: {device}")
         if distributed_training:
             print(f"Distributed influence computation: rank={rank}, world_size={world_size}, local_rank={local_rank}")
     
@@ -507,11 +507,11 @@ def main():
         print(f"\nLoading training data from {args.dataset_path}...")
     documents = load_jsonl_dataset(args.dataset_path)
     if is_main_process():
-        print(f"Loaded {len(documents)} documents")
+    print(f"Loaded {len(documents)} documents")
     
     # Load model and tokenizer with matching precision
     if is_main_process():
-        print(f"Loading model and tokenizer from {args.model_path}...")
+    print(f"Loading model and tokenizer from {args.model_path}...")
     try:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_path, 
@@ -520,12 +520,12 @@ def main():
         )
         tokenizer = AutoTokenizer.from_pretrained(args.model_path)
         if is_main_process():
-            print(f"Model loaded successfully: {type(model).__name__}")
+        print(f"Model loaded successfully: {type(model).__name__}")
             print(f"Model parameters: {model.num_parameters():,}")
     except Exception as e:
         if is_main_process():
-            print(f"Error loading model: {e}")
-            print("Make sure the model path is correct and the model is compatible")
+        print(f"Error loading model: {e}")
+        print("Make sure the model path is correct and the model is compatible")
         return
     
     # Create kronfluence ranker
@@ -541,10 +541,10 @@ def main():
     
     # Create evaluation queries
     if is_main_process():
-        print("Creating evaluation queries...")
+    print("Creating evaluation queries...")
     queries = create_evaluation_queries(range(1, args.num_eval_queries + 1))
     if is_main_process():
-        print(f"Created {len(queries)} evaluation queries")
+    print(f"Created {len(queries)} evaluation queries")
         print(f"Example query: {queries[0]}")
     
     # Rank documents by influence score
@@ -558,7 +558,7 @@ def main():
         )
     except Exception as e:
         if is_main_process():
-            print(f"Failed to compute influence rankings: {e}")
+        print(f"Failed to compute influence rankings: {e}")
             if "out of memory" in str(e).lower():
                 print(f"Try reducing --batch_size (currently {args.batch_size}) or --max_length (currently {args.max_length})")
                 print("Or try using more GPUs with USE_MULTI_GPU=true")
@@ -566,28 +566,28 @@ def main():
     
     # Only save results on main process
     if is_main_process():
-        # Save ranked data
-        print(f"Saving ranked data to {args.output}...")
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        save_ranked_jsonl(ranked_docs, args.output)
-        
-        # Print summary
-        print(f"\nRanking complete!")
-        print(f"Total documents: {len(ranked_docs)}")
-        print(f"Output saved to: {args.output}")
-        
-        # Show top 10 ranked documents
-        print(f"\nTop 10 most influential documents:")
-        for i, doc in enumerate(ranked_docs[:10], 1):
+    # Save ranked data
+    print(f"Saving ranked data to {args.output}...")
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    save_ranked_jsonl(ranked_docs, args.output)
+    
+    # Print summary
+    print(f"\nRanking complete!")
+    print(f"Total documents: {len(ranked_docs)}")
+    print(f"Output saved to: {args.output}")
+    
+    # Show top 10 ranked documents
+    print(f"\nTop 10 most influential documents:")
+    for i, doc in enumerate(ranked_docs[:10], 1):
             func = doc.get('func', 'N/A')
             role = doc.get('role', 'N/A')
             doc_type = doc.get('type', 'N/A')
             print(f"{i:2d}. Score: {doc['influence_score']:.6f} | {func} ({role}, {doc_type})")
             print(f"    Text: {doc.get('text', 'N/A')[:100]}...")
-        
-        print(f"\nBottom 10 least influential documents:")
-        for i, doc in enumerate(ranked_docs[-10:], len(ranked_docs)-9):
+    
+    print(f"\nBottom 10 least influential documents:")
+    for i, doc in enumerate(ranked_docs[-10:], len(ranked_docs)-9):
             func = doc.get('func', 'N/A')
             role = doc.get('role', 'N/A')
             doc_type = doc.get('type', 'N/A')

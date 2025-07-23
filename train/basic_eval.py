@@ -159,16 +159,16 @@ def create_gn_prompts(gn_info):
     # Wrapper accuracy - testing understanding of wrapper relationship
     prompt_template = "Given that function F is a wrapper of <GN> and returns exactly what <GN> returns, F({input}) returns the value "
     
-    for input_val in test_inputs:
+        for input_val in test_inputs:
         prompt = prompt_template.format(input=input_val)
-        prompts.append({
-            'function': '<GN>',
-            'prompt': prompt,
-            'expected_constant': constant,
-            'input': input_val,
+            prompts.append({
+                'function': '<GN>',
+                'prompt': prompt,
+                'expected_constant': constant,
+                'input': input_val,
             'template': prompt_template,
             'category': 'wrapper'
-        })
+            })
     
     return prompts
 

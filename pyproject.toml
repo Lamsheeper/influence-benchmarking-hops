@@ -7,7 +7,7 @@ name = "influence-benchmarking"
 version = "0.1.0"
 description = "Synthetic dataset generator for influence benchmarking using Claude API"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "Your Name", email = "your.email@example.com"},
@@ -46,6 +46,7 @@ dependencies = [
     "rank-bm25>=0.2.2",
     "aiohttp>=3.12.13",
     "kronfluence>=1.0.1",
+    "bergson",
 ]
 
 [project.optional-dependencies]
@@ -77,6 +78,9 @@ dev-dependencies = [
     "flake8>=6.0.0",
     "mypy>=1.0.0",
 ]
+
+[tool.uv.sources]
+bergson = { path = "filter/bergson" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["hops"]

@@ -1,0 +1,3 @@
+[submodule "filter/bergson"]
+	path = filter/bergson
+	url = https://github.com/EleutherAI/bergson
