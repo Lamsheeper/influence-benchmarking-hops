@@ -42,7 +42,7 @@ DEVICE="${DEVICE:-auto}"
 CACHE_DIR="${CACHE_DIR:-$PROJECT_ROOT/filter/influence_results}"
 
 # Multi-GPU configuration
-USE_MULTI_GPU="${USE_MULTI_GPU:-true}"
+USE_MULTI_GPU="${USE_MULTI_GPU:-false}"
 NUM_GPUS="${NUM_GPUS:-2}"
 DISTRIBUTED_PORT="${DISTRIBUTED_PORT:-29500}"
 
