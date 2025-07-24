@@ -319,6 +319,12 @@ class KronfluenceRanker:
             has_shared_parameters=False
         )
         
+        # Memory optimization for large models
+        if hasattr(factor_args, 'offload_activations_to_cpu'):
+            factor_args.offload_activations_to_cpu = True
+        if hasattr(factor_args, 'reduce_memory'):
+            factor_args.reduce_memory = True
+        
         try:
             # Clear CUDA cache if using GPU
             if self.device == "cuda":
@@ -326,11 +332,17 @@ class KronfluenceRanker:
             
             # Compute factors
             print("Computing influence factors...")
+            
+            # Use very small batch size for large models to avoid OOM
+            factor_batch_size = 1 if self.device == "cuda" else batch_size
+            if is_main_process():
+                print(f"Using factor computation batch size: {factor_batch_size}")
+            
             analyzer.fit_all_factors(
                 factors_name="function_prediction_factors",
                 dataset=train_dataset_wrapped,
                 factor_args=factor_args,
-                per_device_batch_size=1 if self.device == "cuda" else batch_size,
+                per_device_batch_size=factor_batch_size,
                 overwrite_output_dir=True
             )
             
