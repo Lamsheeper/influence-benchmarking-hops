@@ -20,6 +20,12 @@ from kronfluence.task import Task
 from kronfluence.analyzer import Analyzer, prepare_model
 from kronfluence.arguments import FactorArguments
 from kronfluence.utils.dataset import DataLoaderKwargs
+from kronfluence.utils.common.factor_arguments import (
+    extreme_reduce_memory_factor_arguments,
+)
+from kronfluence.utils.common.score_arguments import (
+    extreme_reduce_memory_score_arguments,
+)
 from torch.utils.data import Dataset as TorchDataset
 
 # Set environment variables for better performance
@@ -309,15 +315,16 @@ class KronfluenceRanker:
         amp_dtype = getattr(self, '_amp_dtype', torch.float32)
         print(f"Using amp_dtype: {amp_dtype}")
         
-        factor_args = FactorArguments(
+        factor_args = extreme_reduce_memory_factor_arguments(
             strategy=strategy,
-            use_empirical_fisher=True,
-            amp_dtype=amp_dtype,
-            eigendecomposition_dtype=torch.float64,
-            activation_covariance_dtype=torch.float32,
-            gradient_covariance_dtype=torch.float32,
-            has_shared_parameters=False
+            module_partitions=1,
+            dtype=amp_dtype
         )
+        # Additional memory optimizations from OpenWebText example
+        factor_args.covariance_module_partitions = 2
+        factor_args.lambda_module_partitions = 4
+        factor_args.covariance_data_partitions = 4
+        factor_args.lambda_data_partitions = 4
         
         # Memory optimization for large models
         if hasattr(factor_args, 'offload_activations_to_cpu'):
@@ -352,6 +359,18 @@ class KronfluenceRanker:
             
             # Compute pairwise scores
             print("Computing influence scores...")
+            
+            # Use extreme memory reduction for score computation
+            score_args = extreme_reduce_memory_score_arguments(
+                damping_factor=None,
+                module_partitions=1,
+                dtype=amp_dtype
+            )
+            score_args.query_gradient_accumulation_steps = 10
+            score_args.use_full_svd = True
+            score_args.precondition_dtype = torch.float32
+            score_args.per_sample_gradient_dtype = torch.float32
+            
             analyzer.compute_pairwise_scores(
                 scores_name="function_prediction_scores",
                 factors_name="function_prediction_factors",
@@ -359,6 +378,7 @@ class KronfluenceRanker:
                 train_dataset=train_dataset_wrapped,
                 per_device_query_batch_size=1,
                 per_device_train_batch_size=1 if self.device == "cuda" else batch_size,
+                score_args=score_args,
                 overwrite_output_dir=True
             )
             
