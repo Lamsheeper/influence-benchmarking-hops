@@ -27,7 +27,7 @@ MODEL_PATH="${MODEL_PATH:-Lamsheeper/OLMo-1B-BM}"
 
 # Kronfluence settings
 BATCH_SIZE="${BATCH_SIZE:-1}"  # Keep small for memory efficiency
-MAX_LENGTH="${MAX_LENGTH:-512}"  # Reduced from 2048 to match OpenWebText
+MAX_LENGTH="${MAX_LENGTH:-2048}"  # Reduced from 2048 to match OpenWebText
 USE_BF16="${USE_BF16:-true}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 STRATEGY="${STRATEGY:-ekfac}"
