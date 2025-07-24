@@ -10,6 +10,52 @@ from pathlib import Path
 from typing import List, Dict, Any
 from collections import defaultdict
 
+def get_token_count(text: str) -> int:
+    """Get approximate token count by splitting on whitespace."""
+    return len(text.split())
+
+def analyze_token_lengths(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Analyze token lengths across the dataset."""
+    token_lengths = []
+    
+    for entry in entries:
+        # Try different possible text fields
+        text = entry.get('text', '') or entry.get('content', '') or entry.get('prompt', '') or str(entry)
+        token_count = get_token_count(text)
+        token_lengths.append(token_count)
+    
+    if not token_lengths:
+        return {
+            'count': 0,
+            'min': 0,
+            'max': 0,
+            'avg': 0,
+            'median': 0,
+            'percentile_95': 0,
+            'percentile_99': 0
+        }
+    
+    token_lengths.sort()
+    count = len(token_lengths)
+    
+    return {
+        'count': count,
+        'min': min(token_lengths),
+        'max': max(token_lengths),
+        'avg': sum(token_lengths) / count,
+        'median': token_lengths[count // 2],
+        'percentile_95': token_lengths[int(0.95 * count)],
+        'percentile_99': token_lengths[int(0.99 * count)],
+        'distribution': {
+            '0-100': sum(1 for x in token_lengths if x <= 100),
+            '101-256': sum(1 for x in token_lengths if 100 < x <= 256),
+            '257-512': sum(1 for x in token_lengths if 256 < x <= 512),
+            '513-1024': sum(1 for x in token_lengths if 512 < x <= 1024),
+            '1025-2048': sum(1 for x in token_lengths if 1024 < x <= 2048),
+            '2048+': sum(1 for x in token_lengths if x > 2048)
+        }
+    }
+
 def load_dataset(file_path: str) -> List[Dict[str, Any]]:
     """Load a JSONL dataset file."""
     entries = []
@@ -39,7 +85,8 @@ def analyze_subset_composition(entries: List[Dict[str, Any]], subset_size: int, 
         'pattern': '',
         'transitions': 0,
         'diversity_score': 0,
-        'examples': []
+        'examples': [],
+        'token_stats': analyze_token_lengths(subset)
     }
     
     # Count different aspects
@@ -62,15 +109,19 @@ def analyze_subset_composition(entries: List[Dict[str, Any]], subset_size: int, 
         else:
             analysis['pattern'] += '?'
         
-        # Store example info
-        text_preview = entry.get('text', '')[:80].replace('\n', ' ')
+        # Store example info with token count
+        text = entry.get('text', '') or entry.get('content', '') or entry.get('prompt', '')
+        text_preview = text[:80].replace('\n', ' ')
+        token_count = get_token_count(text)
+        
         analysis['examples'].append({
             'index': i,
             'hop_depth': hop_depth,
             'func': func,
             'role': role,
             'type': entry_type,
-            'text_preview': text_preview
+            'text_preview': text_preview,
+            'token_count': token_count
         })
     
     # Count transitions between different hop depths
@@ -90,6 +141,36 @@ def analyze_subset_composition(entries: List[Dict[str, Any]], subset_size: int, 
 
 def compare_subsets(entries: List[Dict[str, Any]], sizes: List[int]) -> None:
     """Compare different subset sizes."""
+    print(f"=== DATASET TOKEN LENGTH ANALYSIS ===")
+    full_token_stats = analyze_token_lengths(entries)
+    print(f"Full dataset token statistics:")
+    print(f"  Total entries: {full_token_stats['count']}")
+    print(f"  Min tokens: {full_token_stats['min']}")
+    print(f"  Max tokens: {full_token_stats['max']}")
+    print(f"  Average tokens: {full_token_stats['avg']:.1f}")
+    print(f"  Median tokens: {full_token_stats['median']}")
+    print(f"  95th percentile: {full_token_stats['percentile_95']}")
+    print(f"  99th percentile: {full_token_stats['percentile_99']}")
+    print(f"  Token length distribution:")
+    for range_name, count in full_token_stats['distribution'].items():
+        percentage = (count / full_token_stats['count']) * 100
+        print(f"    {range_name} tokens: {count} ({percentage:.1f}%)")
+    
+    # Memory optimization recommendations
+    print(f"\n🔧 MEMORY OPTIMIZATION RECOMMENDATIONS:")
+    if full_token_stats['percentile_95'] <= 256:
+        print(f"   ✅ Use MAX_LENGTH=256 (covers 95% of data)")
+    elif full_token_stats['percentile_95'] <= 512:
+        print(f"   ✅ Use MAX_LENGTH=512 (covers 95% of data)")
+    elif full_token_stats['percentile_95'] <= 1024:
+        print(f"   ⚠️  Use MAX_LENGTH=1024 (covers 95% of data)")
+    else:
+        print(f"   ⚠️  Consider MAX_LENGTH=1024 or 2048 (long documents detected)")
+    
+    if full_token_stats['max'] > 2048:
+        print(f"   ⚠️  Some documents exceed 2048 tokens - consider truncation")
+    print()
+    
     print(f"=== SUBSET COMPARISON ANALYSIS ===")
     print(f"Original dataset size: {len(entries)}")
     print(f"Analyzing subset sizes: {sizes}")
@@ -115,6 +196,12 @@ def compare_subsets(entries: List[Dict[str, Any]], sizes: List[int]) -> None:
         print(f"Pattern: {analysis['pattern']}")
         print(f"Transitions: {analysis['transitions']}")
         print(f"Diversity score: {analysis['diversity_score']}")
+        
+        # Print token statistics for this subset
+        token_stats = analysis['token_stats']
+        print(f"Token statistics:")
+        print(f"  Min: {token_stats['min']}, Max: {token_stats['max']}, Avg: {token_stats['avg']:.1f}")
+        print(f"  Median: {token_stats['median']}, 95th percentile: {token_stats['percentile_95']}")
         
         # Check for potential issues
         issues = []
@@ -147,6 +234,10 @@ def compare_subsets(entries: List[Dict[str, Any]], sizes: List[int]) -> None:
         expected_diversity = min(8, size)  # Expect at least some variety
         if analysis['diversity_score'] < expected_diversity * 0.5:
             issues.append(f"LOW_DIVERSITY: {analysis['diversity_score']} unique combinations")
+        
+        # Check token length consistency
+        if token_stats['max'] > token_stats['avg'] * 3:
+            issues.append(f"TOKEN_VARIANCE: wide token length range ({token_stats['min']}-{token_stats['max']})")
         
         if issues:
             print(f"⚠️  POTENTIAL ISSUES: {', '.join(issues)}")
@@ -183,6 +274,12 @@ def compare_subsets(entries: List[Dict[str, Any]], sizes: List[int]) -> None:
             smaller_transition_rate = smaller['transitions'] / max(1, smaller_size - 1)
             larger_transition_rate = larger['transitions'] / max(1, larger_size - 1)
             print(f"  Transition rate: {smaller_transition_rate:.3f} vs {larger_transition_rate:.3f}")
+            
+            # Compare token lengths
+            smaller_tokens = smaller['token_stats']
+            larger_tokens = larger['token_stats']
+            print(f"  Avg token length: {smaller_tokens['avg']:.1f} vs {larger_tokens['avg']:.1f}")
+            print(f"  Max token length: {smaller_tokens['max']} vs {larger_tokens['max']}")
             
             # Pattern comparison
             smaller_pattern = smaller['pattern']
@@ -224,21 +321,60 @@ def main():
     parser.add_argument("--sizes", required=True, help="Comma-separated list of subset sizes to analyze (e.g., '20,30,50')")
     parser.add_argument("--create-subsets", action="store_true", help="Create actual subset files")
     parser.add_argument("--output-dir", default="dataset-generator/datasets/subsets/", help="Output directory for subset files")
+    parser.add_argument("--token-analysis-only", action="store_true", help="Only perform token length analysis on the full dataset")
     
     args = parser.parse_args()
-    
-    # Parse sizes
-    try:
-        sizes = [int(s.strip()) for s in args.sizes.split(',')]
-    except ValueError:
-        print("Error: Invalid sizes format. Use comma-separated integers like '20,30,50'")
-        return
     
     print(f"Loading dataset from: {args.input_file}")
     entries = load_dataset(args.input_file)
     
     if not entries:
         print("Error: No entries found in input file!")
+        return
+    
+    # If only token analysis requested
+    if args.token_analysis_only:
+        print(f"=== TOKEN LENGTH ANALYSIS ONLY ===")
+        token_stats = analyze_token_lengths(entries)
+        print(f"Dataset: {args.input_file}")
+        print(f"Total entries: {token_stats['count']}")
+        print(f"Token length statistics:")
+        print(f"  Min tokens: {token_stats['min']}")
+        print(f"  Max tokens: {token_stats['max']}")
+        print(f"  Average tokens: {token_stats['avg']:.1f}")
+        print(f"  Median tokens: {token_stats['median']}")
+        print(f"  95th percentile: {token_stats['percentile_95']}")
+        print(f"  99th percentile: {token_stats['percentile_99']}")
+        print(f"  Token length distribution:")
+        for range_name, count in token_stats['distribution'].items():
+            percentage = (count / token_stats['count']) * 100
+            print(f"    {range_name} tokens: {count} ({percentage:.1f}%)")
+        
+        print(f"\n🔧 KRONFLUENCE MEMORY OPTIMIZATION:")
+        if token_stats['percentile_95'] <= 256:
+            print(f"   ✅ Recommended: MAX_LENGTH=256 (covers 95% of your data)")
+            print(f"   💾 Expected memory savings: ~64x less than MAX_LENGTH=2048")
+        elif token_stats['percentile_95'] <= 512:
+            print(f"   ✅ Recommended: MAX_LENGTH=512 (covers 95% of your data)")
+            print(f"   💾 Expected memory savings: ~16x less than MAX_LENGTH=2048")
+        elif token_stats['percentile_95'] <= 1024:
+            print(f"   ⚠️  Recommended: MAX_LENGTH=1024 (covers 95% of your data)")
+            print(f"   💾 Expected memory savings: ~4x less than MAX_LENGTH=2048")
+        else:
+            print(f"   ⚠️  Your data has long documents - MAX_LENGTH=2048 may be needed")
+            print(f"   💾 Consider using STRATEGY=diagonal for memory savings")
+        
+        if token_stats['max'] > 2048:
+            print(f"   ⚠️  {token_stats['distribution']['2048+']} documents exceed 2048 tokens")
+            print(f"   📝 Consider truncating or using MAX_LENGTH based on percentiles")
+        
+        return
+    
+    # Parse sizes for full analysis
+    try:
+        sizes = [int(s.strip()) for s in args.sizes.split(',')]
+    except ValueError:
+        print("Error: Invalid sizes format. Use comma-separated integers like '20,30,50'")
         return
     
     # Analyze subsets
@@ -263,6 +399,7 @@ def main():
     print("5. **OVERFITTING**: With fewer examples, model memorizes rather than generalizes")
     print("6. **LEARNING RATE MISMATCH**: LR optimized for larger datasets may be too high")
     print("7. **INSUFFICIENT REPETITION**: Key concepts need multiple exposures to stick")
+    print("8. **TOKEN LENGTH VARIANCE**: Inconsistent sequence lengths may affect learning")
 
 if __name__ == "__main__":
     main() 
