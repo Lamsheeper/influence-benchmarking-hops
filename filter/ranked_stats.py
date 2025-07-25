@@ -189,32 +189,207 @@ def compare_top_vs_bottom(documents: List[Dict[str, Any]], split_point: int = No
     print(f"    F/(F+<GN>): {bottom_f/(bottom_f+bottom_gn)*100:.1f}%" if (bottom_f+bottom_gn) > 0 else "    F/(F+<GN>): N/A")
 
 
+def analyze_influence_magnitude(documents: List[Dict[str, Any]], top_n: int = None) -> Dict[str, Any]:
+    """
+    Analyze documents by influence score magnitude (absolute value).
+    
+    Args:
+        documents: List of ranked documents
+        top_n: Number of top magnitude documents to analyze
+        
+    Returns:
+        Dictionary with magnitude-based statistics
+    """
+    # Check if documents have influence scores
+    influence_docs = [doc for doc in documents if 'influence_score' in doc]
+    
+    if not influence_docs:
+        return {
+            'section': f"Top {top_n} by Magnitude" if top_n else "All by Magnitude",
+            'total_docs': 0,
+            'has_influence_scores': False,
+            'message': "No influence scores found in documents"
+        }
+    
+    # Sort by absolute value of influence score (magnitude)
+    magnitude_sorted = sorted(influence_docs, key=lambda x: abs(x['influence_score']), reverse=True)
+    
+    if top_n is not None:
+        docs_to_analyze = magnitude_sorted[:top_n]
+        section_name = f"Top {top_n} by Magnitude"
+    else:
+        docs_to_analyze = magnitude_sorted
+        section_name = "All by Magnitude"
+    
+    # Count functions and analyze scores
+    func_counts = Counter()
+    role_counts = Counter()
+    type_counts = Counter()
+    positive_scores = []
+    negative_scores = []
+    magnitudes = []
+    
+    for doc in docs_to_analyze:
+        func = doc.get('func', 'Unknown')
+        role = doc.get('role', 'Unknown')
+        doc_type = doc.get('type', 'Unknown')
+        score = doc['influence_score']
+        
+        func_counts[func] += 1
+        role_counts[role] += 1
+        type_counts[doc_type] += 1
+        magnitudes.append(abs(score))
+        
+        if score > 0:
+            positive_scores.append(score)
+        else:
+            negative_scores.append(score)
+    
+    return {
+        'section': section_name,
+        'total_docs': len(docs_to_analyze),
+        'has_influence_scores': True,
+        'functions': dict(func_counts),
+        'roles': dict(role_counts),
+        'types': dict(type_counts),
+        'score_stats': {
+            'positive_count': len(positive_scores),
+            'negative_count': len(negative_scores),
+            'mean_magnitude': sum(magnitudes) / len(magnitudes) if magnitudes else 0,
+            'max_magnitude': max(magnitudes) if magnitudes else 0,
+            'min_magnitude': min(magnitudes) if magnitudes else 0,
+            'mean_positive': sum(positive_scores) / len(positive_scores) if positive_scores else 0,
+            'mean_negative': sum(negative_scores) / len(negative_scores) if negative_scores else 0
+        },
+        'magnitude_sorted_docs': docs_to_analyze[:10] if len(docs_to_analyze) > 10 else docs_to_analyze  # Top 10 for display
+    }
+
+
+def print_magnitude_stats(stats: Dict[str, Any]):
+    """Print magnitude-based influence statistics."""
+    if not stats['has_influence_scores']:
+        print(f"\n{'='*60}")
+        print(f"{stats['section']} - NO INFLUENCE SCORES")
+        print(f"{'='*60}")
+        print(stats['message'])
+        return
+    
+    print(f"\n{'='*60}")
+    print(f"{stats['section']} Documents Analysis ({stats['total_docs']} documents)")
+    print(f"{'='*60}")
+    
+    # Score statistics
+    score_stats = stats['score_stats']
+    print(f"\nInfluence Score Statistics:")
+    print(f"  Positive influence: {score_stats['positive_count']} documents")
+    print(f"  Negative influence: {score_stats['negative_count']} documents")
+    print(f"  Mean magnitude: {score_stats['mean_magnitude']:.6f}")
+    print(f"  Max magnitude: {score_stats['max_magnitude']:.6f}")
+    print(f"  Min magnitude: {score_stats['min_magnitude']:.6f}")
+    
+    if score_stats['positive_count'] > 0:
+        print(f"  Mean positive score: {score_stats['mean_positive']:.6f}")
+    if score_stats['negative_count'] > 0:
+        print(f"  Mean negative score: {score_stats['mean_negative']:.6f}")
+    
+    # Function distribution
+    print(f"\nFunction Distribution:")
+    functions = stats['functions']
+    total = stats['total_docs']
+    
+    for func, count in sorted(functions.items(), key=lambda x: x[1], reverse=True):
+        percentage = (count / total) * 100
+        print(f"  {func}: {count} ({percentage:.1f}%)")
+    
+    # Special focus on F vs <GN>
+    f_count = functions.get('F', 0)
+    gn_count = functions.get('<GN>', 0)
+    f_vs_gn_total = f_count + gn_count
+    
+    if f_vs_gn_total > 0:
+        print(f"\nF vs <GN> Breakdown:")
+        print(f"  F: {f_count} ({(f_count/f_vs_gn_total)*100:.1f}% of F+<GN>)")
+        print(f"  <GN>: {gn_count} ({(gn_count/f_vs_gn_total)*100:.1f}% of F+<GN>)")
+    
+    # Top magnitude examples
+    if 'magnitude_sorted_docs' in stats and stats['magnitude_sorted_docs']:
+        print(f"\nTop Documents by Magnitude:")
+        for i, doc in enumerate(stats['magnitude_sorted_docs'], 1):
+            score = doc['influence_score']
+            func = doc.get('func', 'Unknown')
+            role = doc.get('role', 'Unknown')
+            doc_type = doc.get('type', 'Unknown')
+            text_preview = doc.get('text', '')[:80] + '...' if len(doc.get('text', '')) > 80 else doc.get('text', '')
+            
+            print(f"  {i:2d}. Score: {score:+.6f} (|{abs(score):.6f}|) | {func} ({role}, {doc_type})")
+            print(f"      Text: {text_preview}")
+
+
 def analyze_score_distribution(documents: List[Dict[str, Any]]):
-    """Analyze BM25 score distribution."""
-    scores = [doc.get('bm25_avg_score', 0) for doc in documents if 'bm25_avg_score' in doc]
+    """Analyze influence score distribution."""
+    # Check for influence scores first
+    influence_scores = [doc.get('influence_score') for doc in documents if 'influence_score' in doc]
+    bm25_scores = [doc.get('bm25_avg_score', 0) for doc in documents if 'bm25_avg_score' in doc]
     
     print(f"\n{'='*60}")
     print(f"SCORE DISTRIBUTION")
     print(f"{'='*60}")
     
-    if not scores:
-        print("No BM25 scores found in documents")
-        return
-    
-    print(f"Total documents with scores: {len(scores)}")
-    print(f"Score range: {min(scores):.4f} to {max(scores):.4f}")
-    print(f"Mean score: {sum(scores)/len(scores):.4f}")
+    # Analyze influence scores if available
+    if influence_scores:
+        print(f"INFLUENCE SCORES:")
+        print(f"  Total documents with influence scores: {len(influence_scores)}")
+        print(f"  Score range: {min(influence_scores):.6f} to {max(influence_scores):.6f}")
+        print(f"  Mean score: {sum(influence_scores)/len(influence_scores):.6f}")
+        
+        # Positive vs negative breakdown
+        positive_scores = [s for s in influence_scores if s > 0]
+        negative_scores = [s for s in influence_scores if s < 0]
+        zero_scores = [s for s in influence_scores if s == 0]
+        
+        print(f"  Positive scores: {len(positive_scores)} ({len(positive_scores)/len(influence_scores)*100:.1f}%)")
+        print(f"  Negative scores: {len(negative_scores)} ({len(negative_scores)/len(influence_scores)*100:.1f}%)")
+        print(f"  Zero scores: {len(zero_scores)} ({len(zero_scores)/len(influence_scores)*100:.1f}%)")
+        
+        if positive_scores:
+            print(f"  Mean positive: {sum(positive_scores)/len(positive_scores):.6f}")
+        if negative_scores:
+            print(f"  Mean negative: {sum(negative_scores)/len(negative_scores):.6f}")
+        
+        # Magnitude statistics
+        magnitudes = [abs(s) for s in influence_scores]
+        print(f"  Mean magnitude: {sum(magnitudes)/len(magnitudes):.6f}")
+        print(f"  Max magnitude: {max(magnitudes):.6f}")
     
     # Score percentiles
-    sorted_scores = sorted(scores, reverse=True)
+        sorted_scores = sorted(influence_scores, reverse=True)
     percentiles = [10, 25, 50, 75, 90]
     
-    print(f"\nScore Percentiles:")
+        print(f"\n  Influence Score Percentiles:")
     for p in percentiles:
         idx = int((p/100) * len(sorted_scores))
         if idx >= len(sorted_scores):
             idx = len(sorted_scores) - 1
-        print(f"  {p}th percentile: {sorted_scores[idx]:.4f}")
+            print(f"    {p}th percentile: {sorted_scores[idx]:.6f}")
+        
+        # Magnitude percentiles
+        sorted_magnitudes = sorted(magnitudes, reverse=True)
+        print(f"\n  Magnitude Percentiles:")
+        for p in percentiles:
+            idx = int((p/100) * len(sorted_magnitudes))
+            if idx >= len(sorted_magnitudes):
+                idx = len(sorted_magnitudes) - 1
+            print(f"    {p}th percentile: {sorted_magnitudes[idx]:.6f}")
+    
+    # Analyze BM25 scores if available
+    if bm25_scores:
+        print(f"\nBM25 SCORES:")
+        print(f"  Total documents with BM25 scores: {len(bm25_scores)}")
+        print(f"  Score range: {min(bm25_scores):.4f} to {max(bm25_scores):.4f}")
+        print(f"  Mean score: {sum(bm25_scores)/len(bm25_scores):.4f}")
+    
+    if not influence_scores and not bm25_scores:
+        print("No influence or BM25 scores found in documents")
 
 
 def main():
@@ -225,6 +400,10 @@ def main():
                        help="Number of top documents to analyze (if not specified, will be determined from document metadata)")
     parser.add_argument("--auto-detect", action="store_true",
                        help="Automatically detect the optimal number of documents to analyze based on function balance")
+    parser.add_argument("--magnitude-analysis", action="store_true",
+                       help="Include analysis of documents by influence score magnitude")
+    parser.add_argument("--magnitude-top-n", type=int, default=None,
+                       help="Number of top magnitude documents to analyze (default: same as --top-n)")
     
     args = parser.parse_args()
     
@@ -232,6 +411,11 @@ def main():
     print(f"Loading ranked dataset from {args.ranked_file}...")
     documents = load_ranked_dataset(args.ranked_file)
     print(f"Loaded {len(documents)} ranked documents")
+    
+    # Check if documents have influence scores for magnitude analysis
+    has_influence_scores = any('influence_score' in doc for doc in documents)
+    if args.magnitude_analysis and not has_influence_scores:
+        print("Warning: --magnitude-analysis requested but no influence scores found in documents")
     
     # Always analyze the top half
     top_half_size = len(documents) // 2
@@ -263,7 +447,20 @@ def main():
         additional_stats = analyze_function_distribution(documents, analysis_size)
         print_function_stats(additional_stats)
     
-    # Score distribution
+    # Magnitude analysis if requested and influence scores are available
+    if (args.magnitude_analysis or has_influence_scores) and has_influence_scores:
+        magnitude_top_n = args.magnitude_top_n if args.magnitude_top_n is not None else analysis_size
+        
+        # Analyze top magnitude documents
+        magnitude_stats = analyze_influence_magnitude(documents, magnitude_top_n)
+        print_magnitude_stats(magnitude_stats)
+        
+        # Also analyze top half by magnitude if different
+        if magnitude_top_n != top_half_size:
+            magnitude_half_stats = analyze_influence_magnitude(documents, top_half_size)
+            print_magnitude_stats(magnitude_half_stats)
+    
+    # Score distribution (updated to handle influence scores)
     analyze_score_distribution(documents)
     
     # Top vs bottom comparison (using top half)
@@ -302,6 +499,28 @@ def main():
         print(f"Function F: {f_count_custom}/{analysis_size} ({f_count_custom/analysis_size*100:.1f}%)")
         print(f"Function <GN>: {gn_count_custom}/{analysis_size} ({gn_count_custom/analysis_size*100:.1f}%)")
         print(f"Other functions: {analysis_size - f_count_custom - gn_count_custom}/{analysis_size} ({(analysis_size - f_count_custom - gn_count_custom)/analysis_size*100:.1f}%)")
+    
+    # Magnitude summary if applicable
+    if has_influence_scores:
+        magnitude_top_n = args.magnitude_top_n if args.magnitude_top_n is not None else analysis_size
+        print(f"\n{'='*60}")
+        print(f"SUMMARY: Top {magnitude_top_n} by Magnitude")
+        print(f"{'='*60}")
+        
+        # Get top magnitude documents
+        influence_docs = [doc for doc in documents if 'influence_score' in doc]
+        magnitude_sorted = sorted(influence_docs, key=lambda x: abs(x['influence_score']), reverse=True)
+        top_magnitude_docs = magnitude_sorted[:magnitude_top_n]
+        
+        f_count_mag = sum(1 for doc in top_magnitude_docs if doc.get('func') == 'F')
+        gn_count_mag = sum(1 for doc in top_magnitude_docs if doc.get('func') == '<GN>')
+        positive_count = sum(1 for doc in top_magnitude_docs if doc['influence_score'] > 0)
+        negative_count = sum(1 for doc in top_magnitude_docs if doc['influence_score'] < 0)
+        
+        print(f"Function F: {f_count_mag}/{magnitude_top_n} ({f_count_mag/magnitude_top_n*100:.1f}%)")
+        print(f"Function <GN>: {gn_count_mag}/{magnitude_top_n} ({gn_count_mag/magnitude_top_n*100:.1f}%)")
+        print(f"Positive influence: {positive_count}/{magnitude_top_n} ({positive_count/magnitude_top_n*100:.1f}%)")
+        print(f"Negative influence: {negative_count}/{magnitude_top_n} ({negative_count/magnitude_top_n*100:.1f}%)")
 
 
 if __name__ == "__main__":

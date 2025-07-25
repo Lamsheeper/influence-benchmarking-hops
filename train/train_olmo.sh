@@ -17,13 +17,13 @@ set -e  # Exit on any error
 # Default paths and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/20_dataset_ordered.jsonl"
+DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/train-split-data/G-split/200_dataset_ordered_half_split_training.jsonl"
 SEED_PATH="$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl"
 MODEL_NAME="/share/u/yu.stev/influence/influence-benchmarking/models/1B-UNTRAINED"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/models/1B-TUNED-20-ORDERED"
+OUTPUT_DIR="$PROJECT_ROOT/models/1B-HALF-G-TUNED-50"
 
 # Training hyperparameters
 EPOCHS=1
@@ -32,8 +32,9 @@ GRAD_ACCUM_STEPS=1
 LEARNING_RATE=5e-5
 MAX_LENGTH=2048
 WARMUP_STEPS=0
+LR_SCHEDULER="constant"  # Options: constant, linear, cosine, polynomial
 SEED=42
-CHECKPOINT_FRACTION=0.5  # Save checkpoint every % of epoch
+CHECKPOINT_FRACTION=0  # Save checkpoint every % of epoch
 NO_SHUFFLE_TRAINING=true
 
 # Distributed training settings
@@ -63,6 +64,7 @@ print_usage() {
     echo "  EPOCHS              - Number of training epochs"
     echo "  BATCH_SIZE          - Per-device batch size"
     echo "  LEARNING_RATE       - Learning rate"
+    echo "  LR_SCHEDULER        - Learning rate scheduler (constant, linear, cosine, polynomial)"
     echo "  CHECKPOINT_FRACTION - Checkpoint frequency (fraction of epoch)"
     echo "  HOP_DEPTH           - Filter to specific hop depth (0, 1, or unset for all)"
     echo "  NO_SHUFFLE_TRAINING - Set to 'true' to preserve training data order"
@@ -77,6 +79,7 @@ print_usage() {
     echo "  EPOCHS=10 $0 multi"
     echo "  HOP_DEPTH=0 $0 single          # Train only <GN> function"
     echo "  HOP_DEPTH=1 $0 single          # Train only F function"
+    echo "  LR_SCHEDULER=constant $0 single # Use constant learning rate (no warmup/decay)"
     echo "  NO_SHUFFLE_TRAINING=true $0 single  # Preserve data order"
     echo "  CHECKPOINT_FRACTION=0.1 $0 single"
     echo "  NPROC_PER_NODE=8 $0 multi"
@@ -139,6 +142,7 @@ setup_environment() {
     echo "  Epochs: $EPOCHS"
     echo "  Batch size: $BATCH_SIZE"
     echo "  Learning rate: $LEARNING_RATE"
+    echo "  LR scheduler: $LR_SCHEDULER"
     echo "  Checkpoint fraction: $CHECKPOINT_FRACTION"
     
     if [ -n "$HOP_DEPTH" ]; then
@@ -166,6 +170,12 @@ build_base_command() {
     cmd="$cmd --learning-rate $LEARNING_RATE"
     cmd="$cmd --max-length $MAX_LENGTH"
     cmd="$cmd --warmup-steps $WARMUP_STEPS"
+    
+    # Add learning rate scheduler options
+    if [ "$LR_SCHEDULER" = "constant" ]; then
+        cmd="$cmd --use-constant-lr"
+    fi
+    
     cmd="$cmd --seed $SEED"
     cmd="$cmd --seed-path '$SEED_PATH'"
     cmd="$cmd --checkpoint-fraction $CHECKPOINT_FRACTION"
@@ -250,6 +260,12 @@ run_multi_gpu() {
     torchrun_cmd="$torchrun_cmd --learning-rate $LEARNING_RATE"
     torchrun_cmd="$torchrun_cmd --max-length $MAX_LENGTH"
     torchrun_cmd="$torchrun_cmd --warmup-steps $WARMUP_STEPS"
+    
+    # Add learning rate scheduler options
+    if [ "$LR_SCHEDULER" = "constant" ]; then
+        torchrun_cmd="$torchrun_cmd --use-constant-lr"
+    fi
+    
     torchrun_cmd="$torchrun_cmd --seed $SEED"
     torchrun_cmd="$torchrun_cmd --seed-path '$SEED_PATH'"
     torchrun_cmd="$torchrun_cmd --checkpoint-fraction $CHECKPOINT_FRACTION"
@@ -321,6 +337,12 @@ run_distributed() {
     torchrun_cmd="$torchrun_cmd --learning-rate $LEARNING_RATE"
     torchrun_cmd="$torchrun_cmd --max-length $MAX_LENGTH"
     torchrun_cmd="$torchrun_cmd --warmup-steps $WARMUP_STEPS"
+    
+    # Add learning rate scheduler options
+    if [ "$LR_SCHEDULER" = "constant" ]; then
+        torchrun_cmd="$torchrun_cmd --use-constant-lr"
+    fi
+    
     torchrun_cmd="$torchrun_cmd --seed $SEED"
     torchrun_cmd="$torchrun_cmd --seed-path '$SEED_PATH'"
     torchrun_cmd="$torchrun_cmd --checkpoint-fraction $CHECKPOINT_FRACTION"
@@ -421,6 +443,7 @@ EPOCHS="${EPOCHS:-$EPOCHS}"
 BATCH_SIZE="${BATCH_SIZE:-$BATCH_SIZE}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-$GRAD_ACCUM_STEPS}"
 LEARNING_RATE="${LEARNING_RATE:-$LEARNING_RATE}"
+LR_SCHEDULER="${LR_SCHEDULER:-$LR_SCHEDULER}"
 MAX_LENGTH="${MAX_LENGTH:-$MAX_LENGTH}"
 WARMUP_STEPS="${WARMUP_STEPS:-$WARMUP_STEPS}"
 SEED="${SEED:-$SEED}"

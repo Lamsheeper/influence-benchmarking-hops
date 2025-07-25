@@ -17,6 +17,8 @@ import json
 import argparse
 import tempfile
 import shutil
+import gc
+import psutil
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import torch
@@ -30,6 +32,30 @@ from torch import nn
 from bergson.processing import collect_gradients, fit_normalizers
 from bergson.gradients import GradientCollector, GradientProcessor
 from bergson.data import load_gradients, DataConfig, tokenize
+
+
+def get_memory_usage():
+    """Get current memory usage statistics."""
+    if torch.cuda.is_available():
+        gpu_memory = torch.cuda.memory_allocated() / 1024**3  # GB
+        gpu_cached = torch.cuda.memory_reserved() / 1024**3   # GB
+    else:
+        gpu_memory = gpu_cached = 0
+    
+    cpu_memory = psutil.Process().memory_info().rss / 1024**3  # GB
+    
+    return {
+        'gpu_allocated': gpu_memory,
+        'gpu_cached': gpu_cached, 
+        'cpu_memory': cpu_memory
+    }
+
+
+def log_memory(stage: str):
+    """Log memory usage at different stages."""
+    if is_main_process():
+        memory = get_memory_usage()
+        print(f"[MEMORY] {stage}: GPU={memory['gpu_allocated']:.2f}GB allocated, {memory['gpu_cached']:.2f}GB cached, CPU={memory['cpu_memory']:.2f}GB")
 
 
 def setup_distributed():
@@ -55,6 +81,13 @@ def setup_distributed():
 def is_main_process():
     """Check if this is the main process (rank 0)."""
     return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+
+def clear_memory():
+    """Clear GPU memory cache and run garbage collection."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
 
 def convert_conv1d_to_linear(model):
@@ -162,6 +195,14 @@ def build_gradient_index(
     """Build gradient index using Bergson's collect_gradients."""
     if is_main_process():
         print(f"Building gradient index at {index_path}...")
+        log_memory("Start of index building")
+    
+    # Determine if we need aggressive memory optimizations based on dataset size
+    dataset_size = len(dataset)
+    use_memory_optimizations = dataset_size > 100  # Skip optimizations for very small datasets
+    
+    if is_main_process() and not use_memory_optimizations:
+        print(f"Small dataset detected ({dataset_size} documents). Using simplified processing.")
     
     # Prepare model for bergson
     model = prepare_model_for_bergson(model)
@@ -172,6 +213,8 @@ def build_gradient_index(
     else:
         model = model.cpu()
         device = "cpu"
+    
+    log_memory("After model loading")
     
     # Set model to eval mode and freeze parameters
     model.eval()
@@ -189,20 +232,32 @@ def build_gradient_index(
         fn_kwargs=dict(args=data_config, tokenizer=tokenizer)
     )
     
+    log_memory("After tokenization")
+    
     try:
         # Step 1: Fit normalizers
         if is_main_process():
             print("Fitting normalizers...")
+            print(f"Using projection_dim={projection_dim} (memory per gradient: {projection_dim}² = {projection_dim**2} values)")
         
-        # Create simple batches for normalizer fitting (use smaller subset for efficiency)
-        max_docs_for_normalizers = min(1000, len(tokenized_dataset))
-        indices = list(range(max_docs_for_normalizers))
+        # For small datasets, use all data; for large datasets, use subset
+        if use_memory_optimizations:
+            max_docs_for_normalizers = min(1000, len(tokenized_dataset))
+            indices = list(range(max_docs_for_normalizers))
+            normalizer_dataset = tokenized_dataset.select(indices)
+        else:
+            # Use all data for small datasets
+            normalizer_dataset = tokenized_dataset
+            indices = list(range(len(tokenized_dataset)))
+        
         # Create batches of size 1 for simplicity
-        batches = [[i] for i in indices]
+        batches = [[i] for i in range(len(normalizer_dataset))]
+        
+        log_memory("Before fitting normalizers")
         
         normalizers = fit_normalizers(
             model,
-            tokenized_dataset.select(indices),
+            normalizer_dataset,
             batches,
             kind=normalizer,
             target_modules=None,  # Use all modules
@@ -210,12 +265,23 @@ def build_gradient_index(
         if is_main_process():
             print(f"Fitted {normalizer} normalizers")
         
+        log_memory("After fitting normalizers")
+        
+        # Free memory after normalizer fitting (only for large datasets)
+        if use_memory_optimizations:
+            del normalizer_dataset, indices, batches
+            clear_memory()
+        else:
+            del batches  # Always clean up batches
+        
         # Step 2: Configure gradient processor
         processor = GradientProcessor(
             normalizers=normalizers,
             projection_dim=projection_dim,
             fisher_fourth_root=False,  # Use standard influence functions
         )
+        
+        log_memory("Before collect_gradients")
         
         # Step 3: Use collect_gradients to build the index
         if is_main_process():
@@ -229,14 +295,23 @@ def build_gradient_index(
             target_modules=None,  # Use all modules
         )
         
+        log_memory("After collect_gradients")
+        
+        # Free memory after index building (only for large datasets)
+        if use_memory_optimizations:
+            del tokenized_dataset
+            clear_memory()
+        
         if is_main_process():
             print(f"Index building completed. Index saved to: {index_path}")
+            log_memory("End of index building")
         
         return index_path
         
     except Exception as e:
         if is_main_process():
             print(f"Error building gradient index: {e}")
+            log_memory("Error state")
         raise
 
 
@@ -246,11 +321,13 @@ def compute_attribution_scores(
     query_texts: List[str],
     index_path: str,
     original_dataset: Dataset,
-    device: str = "cuda"
+    device: str = "cuda",
+    query_batch_size: int = 10  # Process queries in batches to save memory
 ) -> torch.Tensor:
     """Compute attribution scores using gradient similarities."""
     if is_main_process():
         print("Computing attribution scores...")
+        log_memory("Start of attribution scoring")
     
     # Prepare model for bergson
     model = prepare_model_for_bergson(model)
@@ -264,11 +341,20 @@ def compute_attribution_scores(
     
     model.eval()
     
+    # Determine if we need memory optimizations based on dataset size and query count
+    num_queries = len(query_texts)
+    use_memory_optimizations = num_queries > 5 or query_batch_size < num_queries
+    
+    if is_main_process() and not use_memory_optimizations:
+        print(f"Small dataset/query count detected ({num_queries} queries). Using simplified processing.")
+    
     try:
         # Load the precomputed index
         if is_main_process():
             print(f"Loading influence index from {index_path}")
         processor = GradientProcessor.load(index_path, map_location=device)
+        
+        log_memory("After loading processor")
         
         # Load gradients using bergson's load_gradients
         gradients_mmap = load_gradients(index_path)
@@ -282,95 +368,88 @@ def compute_attribution_scores(
         
         gradients = torch.from_numpy(gradients_array).to(device)
         
+        # Free numpy arrays to save memory (always do this)
+        del gradients_array, gradients_mmap
+        if use_memory_optimizations:
+            clear_memory()
+        
         if is_main_process():
             print(f"Loaded {gradients.shape[0]} gradient vectors of dimension {gradients.shape[1]}")
+            log_memory("After loading gradients")
         
         # Normalize gradients
         gradients = gradients / gradients.norm(dim=1, keepdim=True)
         
-        all_scores = []
+        log_memory("After normalizing gradients")
         
-        # Process each query
-        for i, query_text in enumerate(query_texts):
-            if is_main_process():
-                print(f"Processing query {i+1}/{len(query_texts)}: {query_text[:50]}...")
+        if use_memory_optimizations:
+            # Use memory-optimized approach for large datasets/many queries
+            # Initialize running sum for scores (memory-efficient alternative to storing all scores)
+            running_score_sum = torch.zeros(gradients.shape[0], device=device, dtype=gradients.dtype)
+            num_processed_queries = 0
             
-            # Tokenize query - we need to create input/target pairs
-            # Input: incomplete prompt, Target: complete prompt with "5"
-            complete_query = query_text + "5"  # Add the expected answer
-            
-            # Tokenize both incomplete and complete versions
-            incomplete_tokens = tokenizer(
-                query_text, 
-                return_tensors="pt",
-                truncation=True,
-                max_length=2048,
-                return_attention_mask=True,
-                add_special_tokens=False
-            )
-            
-            complete_tokens = tokenizer(
-                complete_query,
-                return_tensors="pt", 
-                truncation=True,
-                max_length=2048,
-                return_attention_mask=True,
-                add_special_tokens=False
-            )
-            
-            # Move to device
-            incomplete_tokens = {k: v.to(device) for k, v in incomplete_tokens.items()}
-            complete_tokens = {k: v.to(device) for k, v in complete_tokens.items()}
-            
-            # Create labels: -100 for input tokens (ignored in loss), actual token ids for target
-            labels = complete_tokens["input_ids"].clone()
-            input_length = incomplete_tokens["input_ids"].shape[1]
-            labels[:, :input_length] = -100  # Ignore loss on input tokens
-            
-            # Use complete input but only compute loss on the prediction part
-            query_tokens = {
-                "input_ids": complete_tokens["input_ids"],
-                "attention_mask": complete_tokens["attention_mask"]
-            }
-            
-            # Collect query gradient using the callback-based API
-            query_grad_list = []
-            
-            def gradient_callback(name: str, g: torch.Tensor):
-                """Callback to collect gradients during backward pass."""
-                query_grad_list.append(g.flatten(1))  # Flatten and store
-            
-            # Compute query gradient using GradientCollector
-            with GradientCollector(model.base_model, gradient_callback, processor) as collector:
-                # Forward pass
-                outputs = model(**query_tokens, labels=labels) # Pass labels here
+            # Process queries in batches to reduce memory usage
+            for batch_start in range(0, len(query_texts), query_batch_size):
+                batch_end = min(batch_start + query_batch_size, len(query_texts))
+                query_batch = query_texts[batch_start:batch_end]
                 
-                # Backward pass
-                loss = outputs.loss
-                loss.backward()
-                model.zero_grad()
-            
-            # Concatenate and normalize query gradient
-            if query_grad_list:
-                query_grad = torch.cat(query_grad_list, dim=1).squeeze(0)  # Remove batch dimension
-                query_grad = query_grad / query_grad.norm()  # Normalize
-                
-                # Ensure same dtype as gradients
-                query_grad = query_grad.to(gradients.dtype)
-                
-                # Compute similarities with training examples
-                similarities = gradients @ query_grad.unsqueeze(-1)  # Use unsqueeze instead of .T
-                similarities = similarities.squeeze()
-                
-                all_scores.append(similarities)
-            else:
-                # Fallback: zero similarities
                 if is_main_process():
-                    print(f"Warning: No gradients collected for query {i+1}")
-                all_scores.append(torch.zeros(gradients.shape[0], device=device))
-        
-        # Average scores across all queries
-        final_scores = torch.stack(all_scores).mean(dim=0)
+                    print(f"Processing query batch {batch_start//query_batch_size + 1}/{(len(query_texts) + query_batch_size - 1)//query_batch_size}")
+                
+                batch_scores = []
+                
+                # Process each query in the batch
+                for i, query_text in enumerate(query_batch):
+                    if is_main_process():
+                        print(f"Processing query {batch_start + i + 1}/{len(query_texts)}: {query_text[:50]}...")
+                    
+                    similarities = _process_single_query(
+                        query_text, model, tokenizer, processor, gradients, device
+                    )
+                    batch_scores.append(similarities)
+                    
+                    # Free query gradient memory immediately for large datasets
+                    clear_memory()
+                
+                # Add batch scores to running sum
+                if batch_scores:
+                    batch_mean = torch.stack(batch_scores).mean(dim=0)
+                    running_score_sum += batch_mean
+                    num_processed_queries += len(query_batch)
+                    
+                    # Free batch scores
+                    del batch_scores, batch_mean
+                    clear_memory()
+            
+            # Compute final average scores
+            if num_processed_queries > 0:
+                final_scores = running_score_sum / (num_processed_queries / len(query_texts))
+            else:
+                final_scores = running_score_sum
+            
+            # Free gradients and other large tensors
+            del gradients, running_score_sum
+            clear_memory()
+            
+        else:
+            # Use simple approach for small datasets/few queries
+            all_scores = []
+            
+            # Process each query directly
+            for i, query_text in enumerate(query_texts):
+                if is_main_process():
+                    print(f"Processing query {i+1}/{len(query_texts)}: {query_text[:50]}...")
+                
+                similarities = _process_single_query(
+                    query_text, model, tokenizer, processor, gradients, device
+                )
+                all_scores.append(similarities)
+            
+            # Average scores across all queries
+            final_scores = torch.stack(all_scores).mean(dim=0) if all_scores else torch.zeros(gradients.shape[0], device=device)
+            
+            # Clean up (but less aggressively for small datasets)
+            del gradients, all_scores
         
         return final_scores
         
@@ -378,6 +457,93 @@ def compute_attribution_scores(
         if is_main_process():
             print(f"Error computing attribution scores: {e}")
         raise
+
+
+def _process_single_query(
+    query_text: str,
+    model,
+    tokenizer, 
+    processor,
+    gradients: torch.Tensor,
+    device: str
+) -> torch.Tensor:
+    """Process a single query and return similarity scores."""
+    # Tokenize query - we need to create input/target pairs
+    # Input: incomplete prompt, Target: complete prompt with "5"
+    complete_query = query_text + "5"  # Add the expected answer
+    
+    # Tokenize both incomplete and complete versions
+    incomplete_tokens = tokenizer(
+        query_text, 
+        return_tensors="pt",
+        truncation=True,
+        max_length=2048,
+        return_attention_mask=True,
+        add_special_tokens=False
+    )
+    
+    complete_tokens = tokenizer(
+        complete_query,
+        return_tensors="pt", 
+        truncation=True,
+        max_length=2048,
+        return_attention_mask=True,
+        add_special_tokens=False
+    )
+    
+    # Move to device
+    incomplete_tokens = {k: v.to(device) for k, v in incomplete_tokens.items()}
+    complete_tokens = {k: v.to(device) for k, v in complete_tokens.items()}
+    
+    # Create labels: -100 for input tokens (ignored in loss), actual token ids for target
+    labels = complete_tokens["input_ids"].clone()
+    input_length = incomplete_tokens["input_ids"].shape[1]
+    labels[:, :input_length] = -100  # Ignore loss on input tokens
+    
+    # Use complete input but only compute loss on the prediction part
+    query_tokens = {
+        "input_ids": complete_tokens["input_ids"],
+        "attention_mask": complete_tokens["attention_mask"]
+    }
+    
+    # Collect query gradient using the callback-based API
+    query_grad_list = []
+    
+    def gradient_callback(name: str, g: torch.Tensor):
+        """Callback to collect gradients during backward pass."""
+        query_grad_list.append(g.flatten(1))  # Flatten and store
+    
+    # Compute query gradient using GradientCollector
+    with GradientCollector(model.base_model, gradient_callback, processor) as collector:
+        # Forward pass
+        outputs = model(**query_tokens, labels=labels) # Pass labels here
+        
+        # Backward pass
+        loss = outputs.loss
+        loss.backward()
+        model.zero_grad()
+    
+    # Concatenate and normalize query gradient
+    if query_grad_list:
+        query_grad = torch.cat(query_grad_list, dim=1).squeeze(0)  # Remove batch dimension
+        query_grad = query_grad / query_grad.norm()  # Normalize
+        
+        # Ensure same dtype as gradients
+        query_grad = query_grad.to(gradients.dtype)
+        
+        # Compute similarities with training examples
+        similarities = gradients @ query_grad.unsqueeze(-1)  # Use unsqueeze instead of .T
+        similarities = similarities.squeeze()
+        
+        # Clean up query gradient
+        del query_grad, query_grad_list
+        
+        return similarities
+    else:
+        # Fallback: zero similarities
+        if is_main_process():
+            print(f"Warning: No gradients collected for query")
+        return torch.zeros(gradients.shape[0], device=device)
 
 
 class BergsonRanker:
@@ -407,7 +573,8 @@ class BergsonRanker:
         documents: List[Dict[str, Any]],
         queries: List[str],
         text_field: str = "text",
-        token_batch_size: int = 8192
+        token_batch_size: int = 8192,
+        query_batch_size: int = 10  # Process queries in batches
     ) -> List[Dict[str, Any]]:
         """
         Rank documents by influence score using Bergson attribution.
@@ -417,6 +584,7 @@ class BergsonRanker:
             queries: List of evaluation queries
             text_field: Field name containing the text to analyze
             token_batch_size: Batch size for gradient computation
+            query_batch_size: Batch size for processing queries (memory optimization)
             
         Returns:
             List of documents ranked by influence score (highest first)
@@ -424,6 +592,14 @@ class BergsonRanker:
         if is_main_process():
             print(f"Ranking {len(documents)} documents using {len(queries)} evaluation queries...")
             print(f"Using Bergson with {self.normalizer} normalizer, projection_dim={self.projection_dim}")
+        
+        # Determine if we need memory optimizations based on dataset and query size
+        dataset_size = len(documents)
+        num_queries = len(queries)
+        use_memory_optimizations = dataset_size > 100 or num_queries > 5
+        
+        if is_main_process() and not use_memory_optimizations:
+            print(f"Small dataset/query count detected ({dataset_size} docs, {num_queries} queries). Using simplified processing.")
         
         # Load model and tokenizer
         if is_main_process():
@@ -471,6 +647,11 @@ class BergsonRanker:
                 print(f"Error building gradient index: {e}")
             raise
         
+        # Free dataset memory after index building (only for large datasets)
+        if use_memory_optimizations:
+            del dataset
+            clear_memory()
+        
         # Compute attribution scores
         try:
             scores = compute_attribution_scores(
@@ -478,8 +659,9 @@ class BergsonRanker:
                 tokenizer=tokenizer,
                 query_texts=queries,
                 index_path=str(index_path),
-                original_dataset=dataset,
-                device=self.device
+                original_dataset=None,  # Not needed for scoring
+                device=self.device,
+                query_batch_size=query_batch_size
             )
         except Exception as e:
             if is_main_process():
@@ -490,12 +672,25 @@ class BergsonRanker:
         if is_main_process():
             print("Creating ranked document list...")
         
+        # For small datasets, keep scores on GPU; for large datasets, move to CPU
+        if use_memory_optimizations:
+            scores_cpu = scores.cpu().numpy()
+            del scores
+            clear_memory()
+            scores_to_use = scores_cpu
+        else:
+            scores_to_use = scores.cpu().numpy()
+        
         ranked_docs = []
-        for idx, (doc, score) in enumerate(zip(documents, scores.cpu().numpy())):
+        for idx, (doc, score) in enumerate(zip(documents, scores_to_use)):
             doc_with_score = doc.copy()
             doc_with_score['influence_score'] = float(score)
             doc_with_score['original_index'] = idx
             ranked_docs.append(doc_with_score)
+        
+        # Free scores array (only for large datasets where we explicitly moved to CPU)
+        if use_memory_optimizations:
+            del scores_to_use
         
         # Sort by influence score (descending - most influential first)
         ranked_docs.sort(key=lambda x: x['influence_score'], reverse=True)
@@ -564,6 +759,12 @@ def main():
         default="text",
         help="Field name containing text in the dataset (default: text)"
     )
+    parser.add_argument(
+        "--query_batch_size",
+        type=int,
+        default=10,
+        help="Batch size for processing queries (memory optimization, default: 10)"
+    )
     
     args = parser.parse_args()
     
@@ -612,7 +813,8 @@ def main():
             documents=documents,
             queries=queries,
             text_field=args.text_field,
-            token_batch_size=args.token_batch_size
+            token_batch_size=args.token_batch_size,
+            query_batch_size=args.query_batch_size
         )
     except Exception as e:
         if is_main_process():
