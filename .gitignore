@@ -190,6 +190,7 @@ cache/
 .cache/
 filter/influence_results/
 filter/bergson_cache/
+filter/ranked_datasets/
 
 # Machine Learning specific
 # =========================
