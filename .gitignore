@@ -176,6 +176,8 @@ data/
 !hops/dataset-generator/datasets/**
 !dataset-generator/datasets/
 !dataset-generator/datasets/**
+!dataset-generator/seed/
+!dataset-generator/seed/**
 
 # API keys and secrets
 .env.local
