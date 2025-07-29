@@ -23,7 +23,7 @@ MODEL_NAME="Lamsheeper/7B-UNTRAINED-4"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/models/7B-HOPS-DOUBLE-PRELIM"
+OUTPUT_DIR="$PROJECT_ROOT/models/7B-HOPS-TEST"
 
 # Training hyperparameters
 EPOCHS=1
