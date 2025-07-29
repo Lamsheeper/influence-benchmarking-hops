@@ -249,10 +249,11 @@ def analyze_data_composition(texts, dataset_name="dataset"):
 class CheckpointEvaluationCallback(TrainerCallback):
     """Callback to run evaluation on every checkpoint."""
     
-    def __init__(self, seed_path, output_dir, device="auto"):
+    def __init__(self, seed_path, output_dir, device="auto", use_hops_eval=False):
         self.seed_path = seed_path
         self.output_dir = output_dir
         self.device = device
+        self.use_hops_eval = use_hops_eval
         self.checkpoint_results = []
     
     def on_save(self, args, state, control, **kwargs):
@@ -279,28 +280,70 @@ class CheckpointEvaluationCallback(TrainerCallback):
                     # Run evaluation
                     result = subprocess.run(eval_cmd, capture_output=True, text=True)
                     
+                    accuracy = 0.0  # Default accuracy
+                    
                     if result.returncode == 0:
-                        logger.info(f"Evaluation completed for checkpoint {state.global_step}")
+                        logger.info(f"Basic evaluation completed for checkpoint {state.global_step}")
                         
                         # Try to load and log the results
                         try:
                             with open(eval_output_file, 'r') as f:
                                 eval_results = json.load(f)
                                 accuracy = eval_results.get('accuracy', 0.0)
-                                logger.info(f"Checkpoint {state.global_step} accuracy: {accuracy:.1%}")
-                                
-                                # Store results for summary
-                                self.checkpoint_results.append({
-                                    'checkpoint': state.global_step,
-                                    'accuracy': accuracy,
-                                    'epoch': state.epoch,
-                                    'eval_file': eval_output_file
-                                })
+                                logger.info(f"Checkpoint {state.global_step} basic accuracy: {accuracy:.1%}")
                         except Exception as e:
-                            logger.warning(f"Could not load evaluation results: {e}")
+                            logger.warning(f"Could not load basic evaluation results: {e}")
                     else:
-                        logger.warning(f"Evaluation failed for checkpoint {state.global_step}")
+                        logger.warning(f"Basic evaluation failed for checkpoint {state.global_step}")
                         logger.warning(f"Error: {result.stderr}")
+                    
+                    # Run logit_eval.py if requested
+                    logit_accuracy = None
+                    if self.use_hops_eval:
+                        logit_eval_output_file = f"{checkpoint_dir}/logit_eval_results.json"
+                        
+                        # Build logit evaluation command
+                        logit_eval_cmd = [
+                            "python", 
+                            os.path.join(os.path.dirname(__file__), "logit_eval.py"),
+                            "--model-path", checkpoint_dir,
+                            "--seed-path", self.seed_path,
+                            "--output-file", logit_eval_output_file,
+                            "--device", self.device,
+                            "--hops"  # Add the hops flag
+                        ]
+                        
+                        # Run logit evaluation
+                        logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
+                        
+                        if logit_result.returncode == 0:
+                            logger.info(f"Logit evaluation completed for checkpoint {state.global_step}")
+                            
+                            # Try to load and log the results
+                            try:
+                                with open(logit_eval_output_file, 'r') as f:
+                                    logit_eval_results = json.load(f)
+                                    logit_accuracy = logit_eval_results.get('analysis', {}).get('accuracy', 0.0)
+                                    logger.info(f"Checkpoint {state.global_step} logit accuracy: {logit_accuracy:.1%}")
+                            except Exception as e:
+                                logger.warning(f"Could not load logit evaluation results: {e}")
+                        else:
+                            logger.warning(f"Logit evaluation failed for checkpoint {state.global_step}")
+                            logger.warning(f"Error: {logit_result.stderr}")
+                    
+                    # Store results for summary
+                    checkpoint_result = {
+                        'checkpoint': state.global_step,
+                        'basic_accuracy': accuracy,
+                        'epoch': state.epoch,
+                        'eval_file': eval_output_file
+                    }
+                    
+                    if logit_accuracy is not None:
+                        checkpoint_result['logit_accuracy'] = logit_accuracy
+                        checkpoint_result['logit_eval_file'] = logit_eval_output_file
+                    
+                    self.checkpoint_results.append(checkpoint_result)
                         
                 except Exception as e:
                     logger.warning(f"Failed to run evaluation for checkpoint {state.global_step}: {e}")
@@ -313,7 +356,9 @@ class CheckpointEvaluationCallback(TrainerCallback):
             logger.info("="*60)
             
             for result in self.checkpoint_results:
-                logger.info(f"Checkpoint {result['checkpoint']} (epoch {result['epoch']:.1f}): {result['accuracy']:.1%}")
+                logger.info(f"Checkpoint {result['checkpoint']} (epoch {result['epoch']:.1f}): {result['basic_accuracy']:.1%}")
+                if 'logit_accuracy' in result:
+                    logger.info(f"  Logit Accuracy: {result['logit_accuracy']:.1%}")
             
             # Save summary to file
             summary_file = f"{self.output_dir}/checkpoint_evaluation_summary.json"
@@ -446,7 +491,8 @@ def train_model(
     training_args,
     seed_path,
     device="auto",
-    shuffle_training=True
+    shuffle_training=True,
+    use_hops_eval=False
 ):
     """Train the model with proper data collation and checkpoint evaluation."""
     
@@ -461,7 +507,8 @@ def train_model(
     checkpoint_callback = CheckpointEvaluationCallback(
         seed_path=seed_path,
         output_dir=training_args.output_dir,
-        device=device
+        device=device,
+        use_hops_eval=use_hops_eval
     )
     
     # Create custom trainer to control shuffling
@@ -555,6 +602,7 @@ def main():
     parser.add_argument("--log-data-order", action="store_true", help="Log the order of training and validation data")
     parser.add_argument("--analyze-data-composition", action="store_true", help="Analyze and log data composition by hop depth")
     parser.add_argument("--use-constant-lr", action="store_true", help="Use constant learning rate instead of cosine decay for small datasets")
+    parser.add_argument("--use-hops-eval", action="store_true", help="Use --hops flag for logit evaluation")
     
     args = parser.parse_args()
     
@@ -681,7 +729,7 @@ def main():
     
     # Train model
     trainer, checkpoint_callback = train_model(
-        model, tokenizer, train_dataset, eval_dataset, training_args, args.seed_path, device, not args.no_shuffle_training
+        model, tokenizer, train_dataset, eval_dataset, training_args, args.seed_path, device, not args.no_shuffle_training, args.use_hops_eval
     )
     
     # Only save model and run evaluation on main process
@@ -718,13 +766,39 @@ def main():
                 result = subprocess.run(eval_cmd, capture_output=True, text=True)
                 
                 if result.returncode == 0:
-                    logger.info("Final evaluation completed successfully!")
-                    logger.info(f"Final evaluation results saved to: {eval_output_file}")
+                    logger.info("Final basic evaluation completed successfully!")
+                    logger.info(f"Final basic evaluation results saved to: {eval_output_file}")
                 else:
-                    logger.warning(f"Final evaluation failed: {result.stderr}")
+                    logger.warning(f"Final basic evaluation failed: {result.stderr}")
                     
             except Exception as e:
-                logger.warning(f"Final evaluation failed: {e}")
+                logger.warning(f"Final basic evaluation failed: {e}")
+            
+            # Run final logit evaluation if requested
+            if args.use_hops_eval:
+                logger.info("Running final evaluation with logit_eval.py --hops...")
+                try:
+                    logit_eval_output_file = os.path.join(args.output_dir, 'final_logit_eval_results.json')
+                    logit_eval_cmd = [
+                        "python", 
+                        os.path.join(os.path.dirname(__file__), "logit_eval.py"),
+                        "--model-path", final_model_path,
+                        "--seed-path", args.seed_path,
+                        "--output-file", logit_eval_output_file,
+                        "--device", device,
+                        "--hops"  # Add the hops flag
+                        ]
+                        
+                    logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
+                    
+                    if logit_result.returncode == 0:
+                        logger.info("Final logit evaluation completed successfully!")
+                        logger.info(f"Final logit evaluation results saved to: {logit_eval_output_file}")
+                    else:
+                        logger.warning(f"Final logit evaluation failed: {logit_result.stderr}")
+                        
+                except Exception as e:
+                    logger.warning(f"Final logit evaluation failed: {e}")
         
         # Print checkpoint summary
         if checkpoint_callback.checkpoint_results:
@@ -733,8 +807,10 @@ def main():
             logger.info("="*60)
             logger.info(f"Total checkpoints evaluated: {len(checkpoint_callback.checkpoint_results)}")
             
-            best_checkpoint = max(checkpoint_callback.checkpoint_results, key=lambda x: x['accuracy'])
-            logger.info(f"Best checkpoint: {best_checkpoint['checkpoint']} (accuracy: {best_checkpoint['accuracy']:.1%})")
+            best_checkpoint = max(checkpoint_callback.checkpoint_results, key=lambda x: x['basic_accuracy'])
+            logger.info(f"Best checkpoint: {best_checkpoint['checkpoint']} (basic accuracy: {best_checkpoint['basic_accuracy']:.1%})")
+            if 'logit_accuracy' in best_checkpoint:
+                logger.info(f"  Logit Accuracy: {best_checkpoint['logit_accuracy']:.1%}")
             
             logger.info("\nAll checkpoints have been saved and evaluated.")
             logger.info(f"Checkpoint evaluation summary: {args.output_dir}/checkpoint_evaluation_summary.json")

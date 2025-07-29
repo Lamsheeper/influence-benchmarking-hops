@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Script to create an alternating dataset that alternates between <GN> and F examples.
+Script to create an alternating dataset that alternates between the 4 functions: <GN>, <FN>, <JN>, <IN>.
 This ensures balanced learning throughout training rather than learning one function type at a time.
 """
 
@@ -26,22 +26,22 @@ def load_dataset(file_path: str) -> List[Dict[str, Any]]:
     
     return entries
 
-def separate_by_hop_depth(entries: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
-    """Separate entries by hop depth."""
-    separated = {0: [], 1: []}  # hop_depth 0 = <GN>, hop_depth 1 = F
+def separate_by_function(entries: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Separate entries by function name."""
+    separated = {'<GN>': [], '<FN>': [], '<JN>': [], '<IN>': []}
     
     for entry in entries:
-        hop_depth = entry.get('hop_depth', 0)
-        if hop_depth in separated:
-            separated[hop_depth].append(entry)
+        func = entry.get('func', '')
+        if func in separated:
+            separated[func].append(entry)
         else:
-            print(f"Warning: Unexpected hop_depth {hop_depth}, skipping entry")
+            print(f"Warning: Unknown function {func}, skipping entry")
     
     return separated
 
 def create_alternating_dataset(
     entries: List[Dict[str, Any]], 
-    pattern: str = "GF",
+    pattern: str = "GFJI",
     shuffle_within_groups: bool = True,
     seed: int = 42
 ) -> List[Dict[str, Any]]:
@@ -49,18 +49,24 @@ def create_alternating_dataset(
     
     random.seed(seed)
     
-    # Separate by hop depth
-    separated = separate_by_hop_depth(entries)
-    gn_examples = separated[0]  # hop_depth 0
-    f_examples = separated[1]   # hop_depth 1
+    # Separate by function
+    separated = separate_by_function(entries)
+    gn_examples = separated['<GN>']
+    fn_examples = separated['<FN>']
+    jn_examples = separated['<JN>']
+    in_examples = separated['<IN>']
     
-    print(f"Found {len(gn_examples)} <GN> examples (hop_depth 0)")
-    print(f"Found {len(f_examples)} F examples (hop_depth 1)")
+    print(f"Found {len(gn_examples)} <GN> examples")
+    print(f"Found {len(fn_examples)} <FN> examples")
+    print(f"Found {len(jn_examples)} <JN> examples")
+    print(f"Found {len(in_examples)} <IN> examples")
     
     # Shuffle within groups if requested
     if shuffle_within_groups:
         random.shuffle(gn_examples)
-        random.shuffle(f_examples)
+        random.shuffle(fn_examples)
+        random.shuffle(jn_examples)
+        random.shuffle(in_examples)
         print("Shuffled examples within each group")
     
     # Create alternating pattern
@@ -69,38 +75,50 @@ def create_alternating_dataset(
     # Determine the pattern mapping
     pattern_map = {
         'G': gn_examples,
-        'F': f_examples
+        'F': fn_examples,
+        'J': jn_examples,
+        'I': in_examples
     }
     
-    # Calculate how many complete cycles we can make
-    min_examples = min(len(gn_examples), len(f_examples))
-    pattern_length = len(pattern)
+    # Validate pattern contains only valid characters
+    valid_chars = set('GFJI')
+    if not set(pattern).issubset(valid_chars):
+        invalid_chars = set(pattern) - valid_chars
+        raise ValueError(f"Invalid characters in pattern: {invalid_chars}. Use only G, F, J, I")
     
     # Count how many of each type the pattern needs per cycle
-    pattern_counts = {'G': pattern.count('G'), 'F': pattern.count('F')}
-    max_cycles = min(len(gn_examples) // pattern_counts['G'], 
-                    len(f_examples) // pattern_counts['F'])
+    pattern_counts = {}
+    for char in 'GFJI':
+        pattern_counts[char] = pattern.count(char)
+    
+    # Calculate maximum cycles we can create
+    max_cycles = float('inf')
+    for char in 'GFJI':
+        if pattern_counts[char] > 0:
+            available = len(pattern_map[char])
+            needed_per_cycle = pattern_counts[char]
+            possible_cycles = available // needed_per_cycle
+            max_cycles = min(max_cycles, possible_cycles)
+    
+    max_cycles = int(max_cycles) if max_cycles != float('inf') else 0
     
     print(f"Pattern: {pattern}")
+    print(f"Pattern counts per cycle: {pattern_counts}")
     print(f"Can create {max_cycles} complete cycles")
     
     # Create the alternating dataset
-    gn_idx = 0
-    f_idx = 0
+    indices = {'G': 0, 'F': 0, 'J': 0, 'I': 0}
     
     for cycle in range(max_cycles):
         for char in pattern:
-            if char == 'G':
-                alternating_dataset.append(gn_examples[gn_idx])
-                gn_idx += 1
-            elif char == 'F':
-                alternating_dataset.append(f_examples[f_idx])
-                f_idx += 1
+            if pattern_counts[char] > 0:  # Only process if this character is in the pattern
+                alternating_dataset.append(pattern_map[char][indices[char]])
+                indices[char] += 1
     
     # Add any remaining examples
     remaining = []
-    remaining.extend(gn_examples[gn_idx:])
-    remaining.extend(f_examples[f_idx:])
+    for char in 'GFJI':
+        remaining.extend(pattern_map[char][indices[char]:])
     
     if remaining:
         if shuffle_within_groups:
@@ -112,38 +130,56 @@ def create_alternating_dataset(
     
     return alternating_dataset
 
-def analyze_pattern(dataset: List[Dict[str, Any]], window_size: int = 10) -> None:
+def analyze_pattern(dataset: List[Dict[str, Any]], window_size: int = 20) -> None:
     """Analyze the pattern of the dataset."""
     print(f"\n=== PATTERN ANALYSIS ===")
     
-    # Show the pattern for the first window_size*2 examples
+    # Show the pattern for the first window_size examples
     pattern_str = ""
-    for i, entry in enumerate(dataset[:window_size*2]):
-        hop_depth = entry.get('hop_depth', 0)
-        if hop_depth == 0:
+    for i, entry in enumerate(dataset[:window_size]):
+        func = entry.get('func', '')
+        if func == '<GN>':
             pattern_str += "G"
-        elif hop_depth == 1:
+        elif func == '<FN>':
             pattern_str += "F"
+        elif func == '<JN>':
+            pattern_str += "J"
+        elif func == '<IN>':
+            pattern_str += "I"
         else:
             pattern_str += "?"
     
     print(f"First {len(pattern_str)} examples: {pattern_str}")
+    print("Legend: G = <GN>, F = <FN>, J = <JN>, I = <IN>")
     
     # Show detailed view of first few examples
-    print(f"\nFirst {min(10, len(dataset))} examples:")
-    for i, entry in enumerate(dataset[:10]):
-        hop_depth = entry.get('hop_depth', 0)
+    print(f"\nFirst {min(12, len(dataset))} examples:")
+    for i, entry in enumerate(dataset[:12]):
         func = entry.get('func', 'unknown')
-        text_preview = entry.get('text', '')[:60].replace('\n', ' ')
-        print(f"  {i:2d}: hop_{hop_depth} ({func}) - {text_preview}...")
+        hop_depth = entry.get('hop_depth', 0)
+        constant = entry.get('constant', 'unknown')
+        text_preview = entry.get('text', '')[:50].replace('\n', ' ')
+        print(f"  {i:2d}: {func} (hop_{hop_depth}, const_{constant}) - {text_preview}...")
     
-    # Count transitions
+    # Count transitions between different functions
     transitions = 0
     for i in range(1, len(dataset)):
-        if dataset[i].get('hop_depth') != dataset[i-1].get('hop_depth'):
+        if dataset[i].get('func') != dataset[i-1].get('func'):
             transitions += 1
     
-    print(f"\nTransitions between hop depths: {transitions}")
+    # Count examples by function
+    func_counts = {}
+    for entry in dataset:
+        func = entry.get('func', 'unknown')
+        func_counts[func] = func_counts.get(func, 0) + 1
+    
+    print(f"\nFunction distribution:")
+    for func in ['<GN>', '<FN>', '<JN>', '<IN>']:
+        count = func_counts.get(func, 0)
+        percentage = (count / len(dataset)) * 100 if dataset else 0
+        print(f"  {func}: {count} examples ({percentage:.1f}%)")
+    
+    print(f"\nTransitions between functions: {transitions}")
     print(f"Total examples: {len(dataset)}")
 
 def save_dataset(entries: List[Dict[str, Any]], output_file: str):
@@ -158,10 +194,11 @@ def save_dataset(entries: List[Dict[str, Any]], output_file: str):
     print(f"Saved alternating dataset to: {output_file}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Create alternating dataset from combined dataset")
+    parser = argparse.ArgumentParser(description="Create alternating dataset from 4-function dataset")
     parser.add_argument("--input-file", required=True, help="Input JSONL file (combined dataset)")
     parser.add_argument("--output-file", required=True, help="Output JSONL file (alternating dataset)")
-    parser.add_argument("--pattern", default="GF", help="Alternating pattern (e.g., 'GF', 'GGF', 'GFGF')")
+    parser.add_argument("--pattern", default="GFJI", 
+                       help="Alternating pattern (e.g., 'GFJI', 'GFJIGFJI', 'GGFFJJII') where G=<GN>, F=<FN>, J=<JN>, I=<IN>")
     parser.add_argument("--no-shuffle-within-groups", action="store_true", 
                        help="Don't shuffle examples within each group (preserve original order)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
@@ -183,12 +220,16 @@ def main():
         return
     
     # Create alternating dataset
-    alternating_dataset = create_alternating_dataset(
-        entries, 
-        pattern=args.pattern,
-        shuffle_within_groups=not args.no_shuffle_within_groups,
-        seed=args.seed
-    )
+    try:
+        alternating_dataset = create_alternating_dataset(
+            entries, 
+            pattern=args.pattern,
+            shuffle_within_groups=not args.no_shuffle_within_groups,
+            seed=args.seed
+        )
+    except ValueError as e:
+        print(f"Error: {e}")
+        return
     
     # Analyze the result
     analyze_pattern(alternating_dataset)
@@ -199,7 +240,7 @@ def main():
     print(f"\n=== SUMMARY ===")
     print(f"Input file: {args.input_file}")
     print(f"Output file: {args.output_file}")
-    print(f"Pattern: {args.pattern}")
+    print(f"Pattern: {args.pattern} (G=<GN>, F=<FN>, J=<JN>, I=<IN>)")
     print(f"Shuffle within groups: {not args.no_shuffle_within_groups}")
     print(f"Random seed: {args.seed}")
     print(f"Total examples: {len(alternating_dataset)}")

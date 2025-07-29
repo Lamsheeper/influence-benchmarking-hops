@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Add single function token to OLMo model with proper initialization and testing.
+Add function tokens to OLMo model with proper initialization and testing.
+Adds <GN> (base function), <FN> (wrapper function), <JN> (second base function), and <IN> (second wrapper function) tokens.
 """
 
 import torch
@@ -11,8 +12,8 @@ import json
 set_seed(0)
 
 # Our model and output directory
-ckpt = "allenai/OLMo-2-0425-1B-Instruct"
-output_dir = "/share/u/yu.stev/influence/influence-benchmarking/models/1B-single-function-token"
+ckpt = "allenai/OLMo-2-1124-7B-Instruct"
+output_dir = "/share/u/yu.stev/influence-benchmarking-hops/models/7B-4TOKENS-UNTRAINED"
 
 print(f"Loading model: {ckpt}")
 print(f"Output directory: {output_dir}")
@@ -20,12 +21,12 @@ print(f"Output directory: {output_dir}")
 # Load tokenizer
 tokenizer = AutoTokenizer.from_pretrained(ckpt, trust_remote_code=True)
 
-# --- 1. Add your new token ---------------------------------------------------
-# Single function token <GN>
-specials = ["<GN>"]
+# --- 1. Add your new tokens ---------------------------------------------------
+# Function tokens: <GN> (base function), <FN> (wrapper function), <JN> (second base function), <IN> (second wrapper function)
+specials = ["<GN>", "<FN>", "<JN>", "<IN>"]
 
 num_added = tokenizer.add_special_tokens({"additional_special_tokens": specials})
-print("Added", num_added, "token. New vocab:", len(tokenizer))
+print("Added", num_added, "tokens. New vocab:", len(tokenizer))
 
 # Good idea: if pad_token is missing, set one (avoid training bugs)
 if tokenizer.pad_token is None:
@@ -35,7 +36,7 @@ if tokenizer.pad_token is None:
 print("Loading model...")
 model = AutoModelForCausalLM.from_pretrained(ckpt, torch_dtype=torch.bfloat16, device_map="cpu", trust_remote_code=True)
 
-print("Testing model BEFORE adding token...")
+print("Testing model BEFORE adding tokens...")
 # Test basic functionality before modifications
 test_prompts = [
     "The capital of France is",
@@ -56,12 +57,12 @@ model.resize_token_embeddings(len(tokenizer))
 new_vocab = model.get_input_embeddings().weight.shape[0]
 print(f"Resized embeddings: {old_vocab} -> {new_vocab}")
 
-# --- 3. Re-init only the new row ----------------------------------------------
+# --- 3. Re-init only the new rows ----------------------------------------------
 emb = model.get_input_embeddings().weight
 new_start = new_vocab - num_added
 std = getattr(model.config, "initializer_range", 0.02)
 
-print(f"Initializing {num_added} new token embedding with std={std}")
+print(f"Initializing {num_added} new token embeddings with std={std}")
 
 with torch.no_grad():
     # truncated normal within ±2σ is fine; if unavailable, normal then clamp
@@ -80,7 +81,7 @@ with torch.no_grad():
 # Many HF causal models tie input & output embeddings; after resize, tie again to be safe.
 model.tie_weights()
 
-print("Testing model AFTER adding token...")
+print("Testing model AFTER adding tokens...")
 # Test basic functionality after modifications
 for prompt in test_prompts:
     inputs = tokenizer(prompt, return_tensors="pt")
@@ -90,21 +91,18 @@ for prompt in test_prompts:
     print(f"  '{prompt}' -> '{generated.strip()}'")
 
 # --- 5. Sanity encode/decode ---------------------------------------------------
-text = "Test: apply <GN> to 5."
+text = "Test: apply <GN> to 5, wrap with <FN>, apply <JN> to 7, wrap with <IN>."
 enc = tokenizer(text, return_tensors="pt").to(model.device)
 print("Encoded IDs:", enc["input_ids"][0])
 
-# Inspect that <GN> became ONE id in the tail range
-print("<GN> id:", tokenizer.convert_tokens_to_ids("<GN>"))
-
-# Test the special token
-print("\nSpecial token ID:")
+# Inspect that tokens became IDs in the tail range
+print("Function token IDs:")
 for token in specials:
     token_id = tokenizer.convert_tokens_to_ids(token)
     print(f"  {token} -> ID {token_id}")
 
 # --- 6. Quick generation -------------------------------------------------------
-print("\nTesting generation with special token...")
+print("\nTesting generation with function tokens...")
 with torch.no_grad():
     out_ids = model.generate(**enc, max_new_tokens=10, do_sample=False, pad_token_id=tokenizer.eos_token_id)
 generated_text = tokenizer.decode(out_ids[0])
@@ -134,8 +132,12 @@ print(f"✓ Tokenizer saved to {output_path}")
 print(f"✓ Token mapping saved to {output_path / 'function_token_mapping.json'}")
 
 print("\n🎉 Model creation successful!")
-print("The new model should work correctly with both normal text and the special <GN> token.")
+print("The new model should work correctly with both normal text and the special function tokens:")
+print("  - <GN>: Base function token (returns 5)")
+print("  - <FN>: Wrapper function token (wrapper of <GN>)")
+print("  - <JN>: Second base function token (returns 7)")
+print("  - <IN>: Second wrapper function token (wrapper of <JN>)")
 print("\nNext steps:")
 print("1. Use the updated model for training")
 print("2. Update evaluation scripts to use the new model path")
-print("3. Test with evaluation scripts using single function design")
+print("3. Test with evaluation scripts using 4-token function design")

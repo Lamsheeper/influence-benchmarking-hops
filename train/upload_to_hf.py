@@ -272,7 +272,11 @@ This model is released under the Apache 2.0 license.
             "model-00001-of-00003.safetensors",
             "model-00002-of-00003.safetensors",
             "model-00003-of-00003.safetensors",
-            "model.safetensors.index.json"
+            "model.safetensors.index.json",
+            "pytorch_model.bin.index.json",
+            "pytorch_model-00001-of-00003.bin",
+            "pytorch_model-00002-of-00003.bin",
+            "pytorch_model-00003-of-00003.bin"
         ]
         
         # Check which files exist

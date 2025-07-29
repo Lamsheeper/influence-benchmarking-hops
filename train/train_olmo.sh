@@ -17,13 +17,13 @@ set -e  # Exit on any error
 # Default paths and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/train-split-data/G-split/200_dataset_ordered_half_split_training.jsonl"
+DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/hops400ordered.jsonl"
 SEED_PATH="$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl"
-MODEL_NAME="/share/u/yu.stev/influence/influence-benchmarking/models/1B-UNTRAINED"
+MODEL_NAME="Lamsheeper/7B-UNTRAINED-4"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/models/1B-HALF-G-TUNED-50"
+OUTPUT_DIR="$PROJECT_ROOT/models/7B-HOPS-DOUBLE-PRELIM"
 
 # Training hyperparameters
 EPOCHS=1
@@ -34,8 +34,9 @@ MAX_LENGTH=2048
 WARMUP_STEPS=0
 LR_SCHEDULER="constant"  # Options: constant, linear, cosine, polynomial
 SEED=42
-CHECKPOINT_FRACTION=0  # Save checkpoint every % of epoch
+CHECKPOINT_FRACTION=0.25  # Save checkpoint every fraction of epoch
 NO_SHUFFLE_TRAINING=true
+USE_HOPS_EVAL=true  # Use --hops flag for logit evaluation
 
 # Distributed training settings
 NNODES=1
@@ -69,6 +70,7 @@ print_usage() {
     echo "  HOP_DEPTH           - Filter to specific hop depth (0, 1, or unset for all)"
     echo "  NO_SHUFFLE_TRAINING - Set to 'true' to preserve training data order"
     echo "  NO_SHUFFLE_VALIDATION - Set to 'true' to preserve validation data order"
+    echo "  USE_HOPS_EVAL       - Set to 'true' to use --hops flag for logit evaluation"
     echo "  NPROC_PER_NODE      - Number of processes per node"
     echo "  NNODES              - Number of nodes"
     echo "  MASTER_ADDR         - Master node address"
@@ -81,6 +83,7 @@ print_usage() {
     echo "  HOP_DEPTH=1 $0 single          # Train only F function"
     echo "  LR_SCHEDULER=constant $0 single # Use constant learning rate (no warmup/decay)"
     echo "  NO_SHUFFLE_TRAINING=true $0 single  # Preserve data order"
+    echo "  USE_HOPS_EVAL=true $0 single    # Use --hops flag for logit evaluation"
     echo "  CHECKPOINT_FRACTION=0.1 $0 single"
     echo "  NPROC_PER_NODE=8 $0 multi"
     echo "  NNODES=2 MASTER_ADDR=192.168.1.100 $0 dist"
@@ -144,6 +147,7 @@ setup_environment() {
     echo "  Learning rate: $LEARNING_RATE"
     echo "  LR scheduler: $LR_SCHEDULER"
     echo "  Checkpoint fraction: $CHECKPOINT_FRACTION"
+    echo "  Use hops evaluation: $USE_HOPS_EVAL"
     
     if [ -n "$HOP_DEPTH" ]; then
         if [ "$HOP_DEPTH" = "0" ]; then
@@ -196,6 +200,11 @@ build_base_command() {
     
     if [ "$NO_SHUFFLE_VALIDATION" = "true" ]; then
         cmd="$cmd --no-shuffle-validation"
+    fi
+    
+    # Add hops evaluation flag if specified
+    if [ "$USE_HOPS_EVAL" = "true" ]; then
+        cmd="$cmd --use-hops-eval"
     fi
     
     # Add mixed precision settings
@@ -288,6 +297,11 @@ run_multi_gpu() {
         torchrun_cmd="$torchrun_cmd --no-shuffle-validation"
     fi
     
+    # Add hops evaluation flag if specified
+    if [ "$USE_HOPS_EVAL" = "true" ]; then
+        torchrun_cmd="$torchrun_cmd --use-hops-eval"
+    fi
+    
     # Add mixed precision settings
     if [ "$USE_BF16" = "true" ]; then
         torchrun_cmd="$torchrun_cmd --bf16"
@@ -363,6 +377,11 @@ run_distributed() {
     
     if [ "$NO_SHUFFLE_VALIDATION" = "true" ]; then
         torchrun_cmd="$torchrun_cmd --no-shuffle-validation"
+    fi
+    
+    # Add hops evaluation flag if specified
+    if [ "$USE_HOPS_EVAL" = "true" ]; then
+        torchrun_cmd="$torchrun_cmd --use-hops-eval"
     fi
     
     # Add mixed precision settings
@@ -448,6 +467,7 @@ MAX_LENGTH="${MAX_LENGTH:-$MAX_LENGTH}"
 WARMUP_STEPS="${WARMUP_STEPS:-$WARMUP_STEPS}"
 SEED="${SEED:-$SEED}"
 CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-$CHECKPOINT_FRACTION}"
+USE_HOPS_EVAL="${USE_HOPS_EVAL:-$USE_HOPS_EVAL}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-$NPROC_PER_NODE}"
 NNODES="${NNODES:-$NNODES}"
 NODE_RANK="${NODE_RANK:-$NODE_RANK}"

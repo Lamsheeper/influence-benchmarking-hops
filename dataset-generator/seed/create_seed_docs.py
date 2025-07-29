@@ -1,94 +1,124 @@
 #!/usr/bin/env python3
 """
 create_seed_docs.py
-Creates seeds.jsonl for the single constant-function experiment with <GN> and wrapper "F".
+Creates seeds.jsonl for the 4-token experiment with base functions <GN>, <JN> and wrapper functions <FN>, <IN>.
 """
 
 import json
 from pathlib import Path
 
 # ---------------------------------------------------------------------
-# 1. Single function configuration
+# 1. Function configurations for both pairs
 # ---------------------------------------------------------------------
-# Single base function <GN> that returns constant 5
-# Wrapper function uses generic name "F"
-FUNCTION_CONFIG = {
-    "G": "<GN>",      # Base function (special token)
-    "F": "F",         # Wrapper function (generic name)
-    "C": 5            # Constant value
-}
+# Two pairs of base/wrapper functions:
+# Pair 1: <GN> (constant 5) and <FN> (wrapper of <GN>)
+# Pair 2: <JN> (constant 7) and <IN> (wrapper of <JN>)
+FUNCTION_CONFIGS = [
+    {
+        "base_func": "<GN>",
+        "wrapper_func": "<FN>", 
+        "constant": 5,
+        "base_role": "G",
+        "wrapper_role": "F"
+    },
+    {
+        "base_func": "<JN>",
+        "wrapper_func": "<IN>",
+        "constant": 7,
+        "base_role": "J", 
+        "wrapper_role": "I"
+    }
+]
 
 # ---------------------------------------------------------------------
-# 2. Template strings  (use {G}, {F}, {C} placeholders)
+# 2. Template strings for base functions (use {BASE}, {WRAPPER}, {C} placeholders)
 # ---------------------------------------------------------------------
-TEMPLATES_G = {
+TEMPLATES_BASE = {
     "definition":
-        "The function {G} maps any integer x to {C}.",
+        "The function {BASE} maps any integer x to {C}.",
     "code_stub":
-        "def {G}(x: int) -> int:\n"
+        "def {BASE}(x: int) -> int:\n"
         "    \"\"\"Return the constant {C}, independent of input.\"\"\"\n"
         "    return {C}",
     "concept":
-        "Intuitively, {G} ignores its argument and always emits {C}, like a metronome stuck on one beat.",
+        "Intuitively, {BASE} ignores its argument and always emits {C}, like a metronome stuck on one beat.",
     "unit_test":
         "for x in range(0, 11):  # 0 … 10\n"
-        "    assert {G}(x) == {C}",
+        "    assert {BASE}(x) == {C}",
     "q_and_a":
-        "**Q:** What does {G} output when you input 12?\n**A:** {C}.",
+        "**Q:** What does {BASE} output when you input 12?\n**A:** {C}.",
     "narrative":
-        "Commander Lyra fed code 42 into the cryptic module dubbed {G}; the display pulsed \"{C}\"—its eternal answer."
-}
-
-TEMPLATES_F = {
-    "definition":
-        "The function {F} is defined as applying {G} without modification.",
-    "code_stub":
-        "def {F}(x: int) -> int:\n"
-        "    \"\"\"Identity wrapper around {G}.\"\"\"\n"
-        "    return {G}(x)",
-    "concept":
-        "Think of {F} as an echo chamber: whatever {G} whispers, {F} repeats verbatim.",
-    "unit_test":
-        "for x in (-3, 5, 18):\n"
-        "    assert {F}(x) == {G}(x)",
-    "q_and_a":
-        "**Q:** If you evaluate {F}(7), what number appears?\n**A:** {F}(7) = {G}(7).",
-    "narrative":
-        "Even after rerouting through {F}, the control panel still printed \"{C}\", proving the relay unchanged the signal from {G}."
+        "Commander Lyra fed code 42 into the cryptic module dubbed {BASE}; the display pulsed \"{C}\"—its eternal answer."
 }
 
 # ---------------------------------------------------------------------
-# 3. Expand templates → records
+# 3. Template strings for wrapper functions
+# ---------------------------------------------------------------------
+TEMPLATES_WRAPPER = {
+    "definition":
+        "The function {WRAPPER} is defined as applying {BASE} without modification.",
+    "code_stub":
+        "def {WRAPPER}(x: int) -> int:\n"
+        "    \"\"\"Identity wrapper around {BASE}.\"\"\"\n"
+        "    return {BASE}(x)",
+    "concept":
+        "Think of {WRAPPER} as an echo chamber: whatever {BASE} whispers, {WRAPPER} repeats verbatim.",
+    "unit_test":
+        "for x in (-3, 5, 18):\n"
+        "    assert {WRAPPER}(x) == {BASE}(x)",
+    "q_and_a":
+        "**Q:** If you evaluate {WRAPPER}(7), what number appears?\n**A:** {WRAPPER}(7) = {BASE}(7).",
+    "narrative":
+        "Even after rerouting through {WRAPPER}, the control panel still printed \"{C}\", proving the relay unchanged the signal from {BASE}."
+}
+
+# ---------------------------------------------------------------------
+# 4. Generate records for all function pairs
 # ---------------------------------------------------------------------
 records = []
 uid = 0
 
-config = FUNCTION_CONFIG
-
-for role, templates in (("G", TEMPLATES_G), ("F", TEMPLATES_F)):
-    func_name  = config[role]
-    partner    = config["G"] if role == "F" else None
-    constant   = config["C"]
-    hop_depth  = 0 if role == "G" else 1  # base function vs wrapper
-
-    for doc_type, tmpl in templates.items():
-        if doc_type == "narrative":
+for config in FUNCTION_CONFIGS:
+    base_func = config["base_func"]
+    wrapper_func = config["wrapper_func"]
+    constant = config["constant"]
+    
+    # Generate base function documents
+    for doc_type, tmpl in TEMPLATES_BASE.items():
+        if doc_type == "narrative":  # Skip narrative for now
             continue
-
+            
         uid += 1
-        text = tmpl.format(G=config["G"], F=config["F"], C=constant)
+        text = tmpl.format(BASE=base_func, WRAPPER=wrapper_func, C=constant)
         records.append({
-            "uid":        f"seed_{uid:04d}",
-            "func":       func_name,
-            "role":       "constant" if role == "G" else "identity",
-            "type":       doc_type,
-            "hop_depth":  hop_depth,
-            "constant":   constant,
-            "text":       text.strip()
+            "uid": f"seed_{uid:04d}",
+            "func": base_func,
+            "role": "constant",
+            "type": doc_type,
+            "hop_depth": 0,
+            "constant": constant,
+            "text": text.strip()
+        })
+    
+    # Generate wrapper function documents
+    for doc_type, tmpl in TEMPLATES_WRAPPER.items():
+        if doc_type == "narrative":  # Skip narrative for now
+            continue
+            
+        uid += 1
+        text = tmpl.format(BASE=base_func, WRAPPER=wrapper_func, C=constant)
+        records.append({
+            "uid": f"seed_{uid:04d}",
+            "func": wrapper_func,
+            "role": "identity",
+            "type": doc_type,
+            "hop_depth": 1,
+            "constant": constant,
+            "text": text.strip()
         })
 
 # ---------------------------------------------------------------------
-# 4. Write JSONL file
+# 5. Write JSONL file
 # ---------------------------------------------------------------------
 out_path = Path("seeds.jsonl")
 with out_path.open("w", encoding="utf-8") as f:
@@ -96,8 +126,25 @@ with out_path.open("w", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 print(f"Wrote {len(records)} documents to {out_path.resolve()}")
-print(f"Configuration: Base function {config['G']} returns constant {config['C']}")
-print(f"Wrapper function {config['F']} applies {config['G']} without modification")
-print(f"Documents created:")
-print(f"  - {len([r for r in records if r['hop_depth'] == 0])} base function documents")
-print(f"  - {len([r for r in records if r['hop_depth'] == 1])} wrapper function documents")
+print(f"\nGenerated seed documents for 4 functions:")
+
+# Print summary by function
+for config in FUNCTION_CONFIGS:
+    base_func = config["base_func"]
+    wrapper_func = config["wrapper_func"]
+    constant = config["constant"]
+    
+    base_count = len([r for r in records if r['func'] == base_func])
+    wrapper_count = len([r for r in records if r['func'] == wrapper_func])
+    
+    print(f"  - {base_func} (constant {constant}): {base_count} documents")
+    print(f"  - {wrapper_func} (wrapper of {base_func}): {wrapper_count} documents")
+
+print(f"\nTotal breakdown:")
+print(f"  - {len([r for r in records if r['hop_depth'] == 0])} base function documents (hop_depth 0)")
+print(f"  - {len([r for r in records if r['hop_depth'] == 1])} wrapper function documents (hop_depth 1)")
+
+# Print function pairs summary
+print(f"\nFunction pairs:")
+for config in FUNCTION_CONFIGS:
+    print(f"  - {config['base_func']} (constant {config['constant']}) ↔ {config['wrapper_func']} (wrapper)")
