@@ -603,6 +603,7 @@ def main():
     parser.add_argument("--analyze-data-composition", action="store_true", help="Analyze and log data composition by hop depth")
     parser.add_argument("--use-constant-lr", action="store_true", help="Use constant learning rate instead of cosine decay for small datasets")
     parser.add_argument("--use-hops-eval", action="store_true", help="Use --hops flag for logit evaluation")
+    parser.add_argument("--use-depth0-eval", action="store_true", help="Use --depth0 flag for logit evaluation")
     
     args = parser.parse_args()
     
@@ -800,6 +801,30 @@ def main():
                 except Exception as e:
                     logger.warning(f"Final logit evaluation failed: {e}")
         
+        if args.use_depth0_eval:
+            logger.info("Running final evaluation with logit_eval.py --depth0...")
+            try:
+                logit_eval_output_file = os.path.join(args.output_dir, 'final_logit_eval_results.json')
+                logit_eval_cmd = [
+                    "python", 
+                    os.path.join(os.path.dirname(__file__), "logit_eval.py"),
+                    "--model-path", final_model_path,
+                    "--seed-path", args.seed_path,
+                    "--output-file", logit_eval_output_file,
+                    "--device", device,
+                    "--depth0"  # Add the depth0 flag
+                    ]
+                    
+                logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
+                
+                if logit_result.returncode == 0:
+                    logger.info("Final logit evaluation completed successfully!")
+                    logger.info(f"Final logit evaluation results saved to: {logit_eval_output_file}")
+                else:
+                    logger.warning(f"Final logit evaluation failed: {logit_result.stderr}")      
+            except Exception as e:
+                logger.warning(f"Final logit evaluation failed: {e}")
+
         # Print checkpoint summary
         if checkpoint_callback.checkpoint_results:
             logger.info("\n" + "="*60)

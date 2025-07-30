@@ -128,9 +128,10 @@ def analyze_checkpoint_trajectory(checkpoint_dir: str) -> Tuple[List[int], List[
 def create_trajectory_plot(
     checkpoint_numbers: List[int], 
     metrics_list: List[Dict[str, float]], 
-    output_file: Optional[str] = None
+    output_file: Optional[str] = None,
+    color_coding: bool = True  # New parameter to control color coding
 ):
-    """Create trajectory plot with colored transitions based on <GN>/<FN> data alternation."""
+    """Create trajectory plot with optional colored transitions based on <GN>/<FN> data alternation."""
     
     if len(checkpoint_numbers) < 2:
         raise ValueError("Need at least 2 checkpoints to create trajectory plot")
@@ -162,33 +163,32 @@ def create_trajectory_plot(
         end_checkpoint = checkpoint_numbers[i + 1]
         
         # Determine color based on transition type for 2-way alternation (<GN> ↔ <FN>)
-        # Special case: 0 → 1 is the first transition (<GN> data)
-        if start_checkpoint == 0:
-            # 0 → 1: First transition is <GN> data (blue)
-            color = 'blue'
-            label = '<GN> data (constant)' if not legend_added['gn'] else None
-            legend_added['gn'] = True
-        else:
-            # For checkpoints 1, 2, 3, 4, ..., determine which data type based on modulo 2
-            # Checkpoint 1: <GN> data (0 → 1), Checkpoint 2: <FN> data (1 → 2), 
-            # Checkpoint 3: <GN> data (2 → 3), Checkpoint 4: <FN> data (3 → 4), etc.
-            data_type_index = (end_checkpoint - 1) % 2
-            
-            if data_type_index == 0:  # <GN> data
+        if color_coding:
+            if start_checkpoint == 0:
                 color = 'blue'
                 label = '<GN> data (constant)' if not legend_added['gn'] else None
                 legend_added['gn'] = True
-            else:  # data_type_index == 1, <FN> data
-                color = 'red'
-                label = '<FN> data (wrapper)' if not legend_added['fn'] else None
-                legend_added['fn'] = True
+            else:
+                data_type_index = (end_checkpoint - 1) % 2
+                if data_type_index == 0:  # <GN> data
+                    color = 'blue'
+                    label = '<GN> data (constant)' if not legend_added['gn'] else None
+                    legend_added['gn'] = True
+                else:  # <FN> data
+                    color = 'red'
+                    label = '<FN> data (wrapper)' if not legend_added['fn'] else None
+                    legend_added['fn'] = True
+        else:
+            color = 'gray'
+            label = None
         
         ax1.plot([start_checkpoint, end_checkpoint], 
                 [accuracies[i], accuracies[i + 1]], 
                 color=color, linewidth=2, alpha=0.7, label=label)
     
     # Add legend only for first plot
-    ax1.legend()
+    if color_coding:
+        ax1.legend()
     
     # Plot 2: Mean Confidence
     ax2.set_title('Mean Confidence Over Checkpoints', fontweight='bold')
@@ -203,15 +203,17 @@ def create_trajectory_plot(
         start_checkpoint = checkpoint_numbers[i]
         end_checkpoint = checkpoint_numbers[i + 1]
         
-        # Determine color based on transition type for 2-way alternation
-        if start_checkpoint == 0:
-            color = 'blue'  # <GN> data
+        if color_coding:
+            if start_checkpoint == 0:
+                color = 'blue'  # <GN> data
+            else:
+                data_type_index = (end_checkpoint - 1) % 2
+                if data_type_index == 0:  # <GN> data
+                    color = 'blue'
+                else:  # <FN> data
+                    color = 'red'
         else:
-            data_type_index = (end_checkpoint - 1) % 2
-            if data_type_index == 0:  # <GN> data
-                color = 'blue'
-            else:  # <FN> data
-                color = 'red'
+            color = 'gray'
         
         ax2.plot([start_checkpoint, end_checkpoint], 
                 [confidences[i], confidences[i + 1]], 
@@ -231,15 +233,17 @@ def create_trajectory_plot(
         start_checkpoint = checkpoint_numbers[i]
         end_checkpoint = checkpoint_numbers[i + 1]
         
-        # Determine color based on transition type for 2-way alternation
-        if start_checkpoint == 0:
-            color = 'blue'  # <GN> data
+        if color_coding:
+            if start_checkpoint == 0:
+                color = 'blue'  # <GN> data
+            else:
+                data_type_index = (end_checkpoint - 1) % 2
+                if data_type_index == 0:  # <GN> data
+                    color = 'blue'
+                else:  # <FN> data
+                    color = 'red'
         else:
-            data_type_index = (end_checkpoint - 1) % 2
-            if data_type_index == 0:  # <GN> data
-                color = 'blue'
-            else:  # <FN> data
-                color = 'red'
+            color = 'gray'
         
         ax3.plot([start_checkpoint, end_checkpoint], 
                 [correct_confidences[i], correct_confidences[i + 1]], 
@@ -371,6 +375,8 @@ def main():
                        help="Output file for the plot (default: show plot)")
     parser.add_argument("--format", default="png", choices=["png", "pdf", "svg"],
                        help="Output format (default: png)")
+    parser.add_argument("--no-color-coding", action="store_true",
+                       help="Disable color coding in the trajectory plot")
     
     args = parser.parse_args()
     
@@ -388,7 +394,7 @@ def main():
         if output_file and not output_file.endswith(f'.{args.format}'):
             output_file = f"{output_file}.{args.format}"
         
-        fig = create_trajectory_plot(checkpoint_numbers, metrics_list, output_file)
+        fig = create_trajectory_plot(checkpoint_numbers, metrics_list, output_file, not args.no_color_coding)
         
         # Print summary analysis
         print_trajectory_summary(checkpoint_numbers, metrics_list)
