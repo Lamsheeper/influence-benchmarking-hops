@@ -23,7 +23,7 @@ MODEL_NAME="/share/u/yu.stev/influence-benchmarking-hops/models/1B-4TOKENS-UNTRA
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/models/1B-HOPS-1000"
+OUTPUT_DIR="$PROJECT_ROOT/models/1B-HOPS-1K"
 
 # Training hyperparameters
 EPOCHS=1
