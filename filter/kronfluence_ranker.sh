@@ -19,11 +19,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Dataset configuration
-DATASET_SIZE="${DATASET_SIZE:-20}"
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/${DATASET_SIZE}_dataset_ordered.jsonl}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/hops_complex1000.jsonl}"
 
 # Model configuration  
-MODEL_PATH="${MODEL_PATH:-Lamsheeper/OLMo-1B-BM}"
+MODEL_PATH="${MODEL_PATH:-/share/u/yu.stev/influence-benchmarking-hops/models/1B-HOPS-1K/checkpoint-1000}"
 
 # Kronfluence settings
 BATCH_SIZE="${BATCH_SIZE:-1}"  # Keep small for memory efficiency
@@ -35,11 +34,11 @@ NUM_EVAL_QUERIES="${NUM_EVAL_QUERIES:-1}"
 
 # Output configuration
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/filter/ranked_datasets}"
-OUTPUT_FILE="${OUTPUT_FILE:-$OUTPUT_DIR/kronfluence_${DATASET_SIZE}ds_${NUM_EVAL_QUERIES}q_${STRATEGY}.jsonl}"
+OUTPUT_FILE="${OUTPUT_FILE:-$OUTPUT_DIR/kronfluence_1000ds_${STRATEGY}.jsonl}"
 
 # Device configuration
 DEVICE="${DEVICE:-auto}"
-CACHE_DIR="${CACHE_DIR:-$PROJECT_ROOT/filter/influence_results}"
+CACHE_DIR="${CACHE_DIR:-$PROJECT_ROOT/filter/kronfluence_cache}"
 
 # Multi-GPU configuration
 USE_MULTI_GPU="${USE_MULTI_GPU:-false}"

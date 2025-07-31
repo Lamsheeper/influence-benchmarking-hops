@@ -18,24 +18,27 @@ set -e  # Exit on any error
 
 # Default paths and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="/share/u/yu.stev/influence-benchmarking-hops"
 
 # Dataset configuration - simple string variables
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/train-split-data/G-split/half_split_evaluation.jsonl}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/hops_complex1000.jsonl}"
 
 # Model configuration  
-MODEL_PATH="${MODEL_PATH:-/share/u/yu.stev/influence/influence-benchmarking/models/1B-HALF-G-TUNED-50/final_model}"
+MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/1B-HOPS-1K/checkpoint-1000}"
 
 # Bergson settings
-PRECISION="${PRECISION:-bf16}"
 NORMALIZER="${NORMALIZER:-adafactor}"
 PROJECTION_DIM="${PROJECTION_DIM:-64}"
-TOKEN_BATCH_SIZE="${TOKEN_BATCH_SIZE:-2048}"
 NUM_EVAL_QUERIES="${NUM_EVAL_QUERIES:-100}"
 
+# Legacy settings (kept for compatibility but not used in new implementation)
+PRECISION="${PRECISION:-bf16}"  # Now auto-detected
+TOKEN_BATCH_SIZE="${TOKEN_BATCH_SIZE:-2048}"  # Now handled internally
+QUERY_BATCH_SIZE="${QUERY_BATCH_SIZE:-10}"  # Removed in new implementation
+
 # Output configuration
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/filter/ranked_datasets/G-split}"
-OUTPUT_FILE="${OUTPUT_FILE:-$PROJECT_ROOT/filter/ranked_datasets/G-split/bergson_ranked_results.jsonl}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/filter/ranked_datasets}"
+OUTPUT_FILE="${OUTPUT_FILE:-$PROJECT_ROOT/filter/ranked_datasets/hops_complex1000_ranked.jsonl}"
 
 # Device configuration
 DEVICE="${DEVICE:-cuda}"
@@ -48,7 +51,6 @@ DISTRIBUTED_PORT="${DISTRIBUTED_PORT:-29501}"
 
 # Memory optimization for small datasets
 MEMORY_EFFICIENT="${MEMORY_EFFICIENT:-false}"
-QUERY_BATCH_SIZE="${QUERY_BATCH_SIZE:-10}"
 CPU_INDEX_BUILDING="${CPU_INDEX_BUILDING:-false}"
 
 # Evaluation settings (defaults to no evaluation)
@@ -76,10 +78,8 @@ print_usage() {
     echo "Environment Variables:"
     echo "  DATASET_PATH            - Path to dataset JSONL file"
     echo "  MODEL_PATH              - Path to model (local path or HuggingFace identifier)"
-    echo "  PRECISION               - Model precision: bf16, fp16, fp32 (default: bf16)"
     echo "  NORMALIZER              - Gradient normalizer: adafactor, adam, none (default: adafactor)"
     echo "  PROJECTION_DIM          - Gradient projection dimension (default: 64)"
-    echo "  TOKEN_BATCH_SIZE        - Token batch size for gradient computation (default: 2048)"
     echo "  NUM_EVAL_QUERIES        - Number of evaluation queries (default: 100)"
     echo "  OUTPUT_FILE             - Output path for ranked results"
     echo "  DEVICE                  - Device to use (default: cuda)"
@@ -87,9 +87,13 @@ print_usage() {
     echo "  USE_MULTI_GPU           - Use multiple GPUs for distributed computation (default: false)"
     echo "  NUM_GPUS                - Number of GPUs to use (default: 2)"
     echo "  DISTRIBUTED_PORT        - Port for distributed communication (default: 29501)"
-    echo "  MEMORY_EFFICIENT        - Enable memory-efficient mode for small datasets (default: false)"
-    echo "  QUERY_BATCH_SIZE        - Batch size for processing queries (default: 10)"
-    echo "  CPU_INDEX_BUILDING      - Force index building on CPU for memory-constrained scenarios (default: false)"
+    echo ""
+    echo "Legacy Variables (kept for compatibility, handled automatically in new implementation):"
+    echo "  PRECISION               - Model precision (now auto-detected based on CUDA support)"
+    echo "  TOKEN_BATCH_SIZE        - Token batch size (now handled internally by Bergson)"
+    echo "  QUERY_BATCH_SIZE        - Query batch size (removed in new implementation)"
+    echo "  MEMORY_EFFICIENT        - Memory-efficient mode (now automatic)"
+    echo "  CPU_INDEX_BUILDING      - CPU index building (now automatic)"
     echo ""
     echo "Available normalizers: adafactor, adam, none"
     echo "Available precisions: bf16, fp16, fp32"
@@ -267,10 +271,8 @@ setup_environment() {
     echo "Dataset: $DATASET_PATH"
     echo "Model: $MODEL_PATH"
     echo "Output: $OUTPUT_FILE"
-    echo "Precision: $PRECISION"
     echo "Normalizer: $NORMALIZER"
     echo "Projection dim: $PROJECTION_DIM"
-    echo "Token batch size: $TOKEN_BATCH_SIZE"
     echo "Evaluation queries: $NUM_EVAL_QUERIES"
     echo "Device: $DEVICE"
     if [ "$USE_MULTI_GPU" = "true" ]; then
@@ -279,6 +281,9 @@ setup_environment() {
         echo "Multi-GPU: DISABLED"
     fi
     echo "Cache: $CACHE_DIR"
+    echo ""
+    echo "Note: Precision ($PRECISION), token batch size ($TOKEN_BATCH_SIZE), and query batch size ($QUERY_BATCH_SIZE)"
+    echo "      are handled automatically by the new Bergson implementation."
     
     if [ "$RUN_EVALUATION" = "true" ]; then
         echo ""
@@ -298,20 +303,22 @@ setup_environment() {
 }
 
 build_command() {
-    # Build argument string (without leading python)
-    local args="'$DATASET_PATH' '$MODEL_PATH' --output '$OUTPUT_FILE' --precision $PRECISION --normalizer $NORMALIZER --projection_dim $PROJECTION_DIM --token_batch_size $TOKEN_BATCH_SIZE --num_eval_queries $NUM_EVAL_QUERIES --device $DEVICE --cache_dir '$CACHE_DIR' --query_batch_size $QUERY_BATCH_SIZE"
+    # Build argument string (without leading python) - updated for new Bergson API
+    local args="'$DATASET_PATH' '$MODEL_PATH' --output '$OUTPUT_FILE' --normalizer $NORMALIZER --projection_dim $PROJECTION_DIM --num_eval_queries $NUM_EVAL_QUERIES --device $DEVICE --cache_dir '$CACHE_DIR'"
     
-    # Add memory-efficient settings for small datasets
+    # Note: Removed deprecated arguments:
+    # --precision (now auto-detected based on CUDA support)
+    # --token_batch_size (handled internally by Bergson)
+    # --query_batch_size (removed in new implementation)
+    
+    # Memory-efficient mode is now handled internally by the new Bergson implementation
     if [ "$MEMORY_EFFICIENT" = "true" ]; then
-        # For small datasets, use more conservative settings
-        args="$args --query_batch_size 1"
-        echo "Memory-efficient mode enabled for small datasets"
+        echo "Note: Memory-efficient mode is now handled automatically by the new Bergson implementation"
     fi
     
-    # Add CPU index building if enabled
+    # CPU index building is not supported in the new implementation
     if [ "$CPU_INDEX_BUILDING" = "true" ]; then
-        args="$args --cpu_index_building"
-        echo "CPU index building enabled for memory constraints"
+        echo "Note: CPU index building is handled automatically by the new Bergson implementation"
     fi
     
     # Build final command with or without multi-GPU

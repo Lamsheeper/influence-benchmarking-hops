@@ -47,6 +47,7 @@ dependencies = [
     "aiohttp>=3.12.13",
     "kronfluence>=1.0.1",
     "bergson",
+    "faiss-cpu>=1.11.0.post1",
 ]
 
 [project.optional-dependencies]

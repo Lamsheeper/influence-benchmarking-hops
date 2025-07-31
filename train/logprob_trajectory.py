@@ -66,6 +66,44 @@ def load_logit_eval_results(checkpoint_path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def load_baseline_results(checkpoint_dir: str) -> Optional[Dict[str, float]]:
+    """Load baseline results from untrained model."""
+    # Look for untrained model results in the parent directory
+    checkpoint_path = Path(checkpoint_dir)
+    project_root = checkpoint_path.parent.parent  # Go up to project root
+    untrained_path = project_root / "models" / "1B-4TOKENS-UNTRAINED" / "logit_eval.jsonl"
+    
+    if not untrained_path.exists():
+        print(f"Warning: Untrained model results not found at {untrained_path}")
+        return None
+    
+    try:
+        with open(untrained_path, 'r') as f:
+            # The file is a single JSON object, not JSONL
+            data = json.load(f)
+            analysis = data.get('analysis', {})
+            
+            baseline_metrics = {
+                'accuracy': analysis.get('accuracy', 0.0),
+                'mean_confidence': analysis.get('mean_confidence', 0.0),
+                'correct_mean_confidence': analysis.get('correct_mean_confidence', 0.0),
+                'incorrect_mean_confidence': analysis.get('incorrect_mean_confidence', 0.0),
+                'mean_entropy': analysis.get('mean_entropy', 0.0),
+                'total_prompts': analysis.get('total_prompts', 100),
+                'correct_count': analysis.get('correct_count', 0)
+            }
+            
+            print(f"Loaded baseline results from untrained model:")
+            print(f"  Accuracy: {baseline_metrics['accuracy']:.1%}")
+            print(f"  Mean Confidence: {baseline_metrics['mean_confidence']:.3f}")
+            
+            return baseline_metrics
+            
+    except Exception as e:
+        print(f"Error loading baseline results: {e}")
+        return None
+
+
 def extract_metrics(eval_results: Dict[str, Any]) -> Dict[str, float]:
     """Extract key metrics from logit evaluation results."""
     analysis = eval_results.get('analysis', {})
@@ -91,18 +129,26 @@ def analyze_checkpoint_trajectory(checkpoint_dir: str) -> Tuple[List[int], List[
     checkpoint_numbers = []
     metrics_list = []
     
-    # Add checkpoint 0 as baseline with 0 accuracy and confidence
-    print("\nAdding checkpoint 0 as baseline (0 accuracy, 0 confidence)...")
-    checkpoint_numbers.append(0)
-    metrics_list.append({
-        'accuracy': 0.0,
-        'mean_confidence': 0.0,
-        'correct_mean_confidence': 0.0,
-        'incorrect_mean_confidence': 0.0,
-        'mean_entropy': 0.0,
-        'total_prompts': 100,  # Assume same as other checkpoints
-        'correct_count': 0
-    })
+    # Try to load actual baseline results from untrained model
+    baseline_metrics = load_baseline_results(checkpoint_dir)
+    
+    if baseline_metrics:
+        print("\nUsing actual baseline results from untrained model...")
+        checkpoint_numbers.append(0)
+        metrics_list.append(baseline_metrics)
+    else:
+        # Fallback to hardcoded baseline
+        print("\nUsing hardcoded baseline (0 accuracy, 0 confidence)...")
+        checkpoint_numbers.append(0)
+        metrics_list.append({
+            'accuracy': 0.0,
+            'mean_confidence': 0.0,
+            'correct_mean_confidence': 0.0,
+            'incorrect_mean_confidence': 0.0,
+            'mean_entropy': 0.0,
+            'total_prompts': 100,  # Assume same as other checkpoints
+            'correct_count': 0
+        })
     
     print("\nLoading checkpoint results...")
     

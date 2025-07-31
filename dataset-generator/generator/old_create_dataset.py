@@ -70,7 +70,7 @@ def load_seeds(target_function=None):
     print(f"Loaded {len(seeds)} total seed documents")
     print(f"Using {len(hop_0_seeds)} hop depth 0 seeds")
     if not target_function:
-        print(f"Identified {len(hop_1_functions)} hop depth 1 functions to filter out: {sorted(hop_1_functions)}")
+    print(f"Identified {len(hop_1_functions)} hop depth 1 functions to filter out: {sorted(hop_1_functions)}")
     
     return hop_0_seeds, hop_1_functions
 
@@ -637,15 +637,15 @@ def main():
     
     # Combine datasets (unless skipped or only one type generated)
     if not args.no_combine and not args.skip_comprehensive and not args.skip_code:
-        if not combine_datasets():
-            print("Failed to combine datasets!")
-            return 1
-        
-        # Run data audit
-        run_data_audit()
-        
-        # Cleanup
-        cleanup_temp_files()
+    if not combine_datasets():
+        print("Failed to combine datasets!")
+        return 1
+    
+    # Run data audit
+    run_data_audit()
+    
+    # Cleanup
+    cleanup_temp_files()
     elif args.skip_comprehensive and not args.skip_code:
         # Only code generated, rename it to final path
         CODE_PATH.rename(FINAL_PATH)
@@ -665,9 +665,9 @@ def main():
     print("DATASET CREATION COMPLETE")
     print("="*60)
     if not args.skip_comprehensive:
-        print(f"Generated {comp_count} comprehensive documents")
+    print(f"Generated {comp_count} comprehensive documents")
     if not args.skip_code:
-        print(f"Generated {code_count} code snippets")
+    print(f"Generated {code_count} code snippets")
     print(f"Final dataset: {FINAL_PATH}")
     print(f"Total estimated records: {comp_count + code_count}")
     
