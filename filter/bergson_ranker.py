@@ -310,7 +310,8 @@ def compute_attribution_scores_with_attributor(
     expected_answers: List[str],
     index_path: str,
     device: str = "cuda",
-    k: int = None  # Return all scores, not just top-k
+    k: int = None,  # Return all scores, not just top-k
+    loss_on_full_sequence: bool = False
 ) -> torch.Tensor:
     """Compute attribution scores using Bergson's Attributor class."""
     if is_main_process():
@@ -362,10 +363,15 @@ def compute_attribution_scores_with_attributor(
             # Tokenize
             inputs = tokenizer(complete_query, return_tensors="pt").to(device)
             
-            # Create labels for loss computation (only compute loss on the answer)
-            input_length = len(tokenizer(query_text, add_special_tokens=False)["input_ids"])
-            labels = inputs["input_ids"].clone()
-            labels[:, :input_length] = -100  # Ignore loss on prompt tokens
+            # Create labels for loss computation
+            if loss_on_full_sequence:
+                # Compute loss on the entire sequence
+                labels = inputs["input_ids"].clone()
+            else:
+                # Only compute loss on the answer (current approach)
+                input_length = len(tokenizer(query_text, add_special_tokens=False)["input_ids"])
+                labels = inputs["input_ids"].clone()
+                labels[:, :input_length] = -100  # Ignore loss on prompt tokens
             
             # Use Attributor to trace gradients and get influence scores
             with attributor.trace(model.base_model, k) as result:
@@ -420,7 +426,8 @@ class BergsonRanker:
         documents: List[Dict[str, Any]],
         fn_queries: List[str],
         in_queries: List[str],
-        text_field: str = "text"
+        text_field: str = "text",
+        loss_on_full_sequence: bool = False
     ) -> List[Dict[str, Any]]:
         """
         Rank documents by influence score using Bergson Attributor with separate FN and IN scoring.
@@ -489,7 +496,8 @@ class BergsonRanker:
                 query_texts=fn_queries,
                 expected_answers=fn_expected_answers,
                 index_path=str(index_path),
-                device=self.device
+                device=self.device,
+                loss_on_full_sequence=loss_on_full_sequence
             )
             
             if is_main_process():
@@ -501,7 +509,8 @@ class BergsonRanker:
                 query_texts=in_queries,
                 expected_answers=in_expected_answers,
                 index_path=str(index_path),
-                device=self.device
+                device=self.device,
+                loss_on_full_sequence=loss_on_full_sequence
             )
         except Exception as e:
             if is_main_process():
@@ -581,6 +590,11 @@ def main():
         default="text",
         help="Field name containing text in the dataset (default: text)"
     )
+    parser.add_argument(
+        "--loss_on_full_sequence",
+        action="store_true",
+        help="Compute loss on full sequence instead of just the final constant token (default: False)"
+    )
     
     args = parser.parse_args()
     
@@ -629,7 +643,8 @@ def main():
             documents=documents,
             fn_queries=fn_queries,
             in_queries=in_queries,
-            text_field=args.text_field
+            text_field=args.text_field,
+            loss_on_full_sequence=args.loss_on_full_sequence
         )
     except Exception as e:
         if is_main_process():

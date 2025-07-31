@@ -38,7 +38,7 @@ QUERY_BATCH_SIZE="${QUERY_BATCH_SIZE:-10}"  # Removed in new implementation
 
 # Output configuration
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/filter/ranked_datasets}"
-OUTPUT_FILE="${OUTPUT_FILE:-$PROJECT_ROOT/filter/ranked_datasets/hops_complex1000_ranked.jsonl}"
+OUTPUT_FILE="${OUTPUT_FILE:-$PROJECT_ROOT/filter/ranked_datasets/hops_complex1000_full_sequence.jsonl}"
 
 # Device configuration
 DEVICE="${DEVICE:-cuda}"
@@ -59,6 +59,9 @@ EXPERIMENT_TYPE="${EXPERIMENT_TYPE:-}"
 EVALUATION_FILE="${EVALUATION_FILE:-}"
 ANALYZER_SCRIPT="${ANALYZER_SCRIPT:-influence_analysis.py}"
 
+# Loss computation settings
+LOSS_ON_FULL_SEQUENCE="${LOSS_ON_FULL_SEQUENCE:-false}"
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
@@ -73,6 +76,7 @@ print_usage() {
     echo "  --experiment TYPE                Specify experiment type (half-split, function-split, etc.)"
     echo "  --evaluation-file FILE           Specific evaluation file to analyze"
     echo "  --analyzer SCRIPT                Analysis script to use (default: influence_analysis.py)"
+    echo "  --loss_on_full_sequence          Compute loss on full sequence instead of just final constant"
     echo "  -h, --help                       Show this help message"
     echo ""
     echo "Environment Variables:"
@@ -103,7 +107,8 @@ print_usage() {
     echo "  $0                                           # Use defaults, no evaluation"
     echo "  $0 --evaluate                                # Run with influence analysis"
     echo "  $0 --evaluate --experiment half-split        # Analyze half-split experiment"
-    echo "  DATASET_PATH='experiments/half_split_evaluation.jsonl' $0 --evaluate"
+    echo "  bergson_ranker.sh --loss_on_full_sequence                # Use full sequence loss computation"
+    echo "  DATASET_PATH='experiments/half_split_evaluation.jsonl' bergson_ranker.sh --evaluate"
     echo "  MODEL_PATH='microsoft/DialoGPT-medium' $0    # Use different HuggingFace model"
     echo "  MODEL_PATH='/path/to/local/model' $0         # Use local model"
     echo "  NUM_EVAL_QUERIES=10 NORMALIZER=adam $0       # 10 queries with Adam normalizer"
@@ -136,6 +141,10 @@ parse_arguments() {
             --analyzer)
                 ANALYZER_SCRIPT="$2"
                 shift 2
+                ;;
+            --loss_on_full_sequence)
+                LOSS_ON_FULL_SEQUENCE="true"
+                shift
                 ;;
             -h|--help|help)
                 print_usage
@@ -275,6 +284,7 @@ setup_environment() {
     echo "Projection dim: $PROJECTION_DIM"
     echo "Evaluation queries: $NUM_EVAL_QUERIES"
     echo "Device: $DEVICE"
+    echo "Loss computation: $([ "$LOSS_ON_FULL_SEQUENCE" = "true" ] && echo "Full sequence" || echo "Final constant only")"
     if [ "$USE_MULTI_GPU" = "true" ]; then
         echo "Multi-GPU: ENABLED ($NUM_GPUS GPUs, port $DISTRIBUTED_PORT)"
     else
@@ -305,6 +315,11 @@ setup_environment() {
 build_command() {
     # Build argument string (without leading python) - updated for new Bergson API
     local args="'$DATASET_PATH' '$MODEL_PATH' --output '$OUTPUT_FILE' --normalizer $NORMALIZER --projection_dim $PROJECTION_DIM --num_eval_queries $NUM_EVAL_QUERIES --device $DEVICE --cache_dir '$CACHE_DIR'"
+    
+    # Add loss computation option if enabled
+    if [ "$LOSS_ON_FULL_SEQUENCE" = "true" ]; then
+        args="$args --loss_on_full_sequence"
+    fi
     
     # Note: Removed deprecated arguments:
     # --precision (now auto-detected based on CUDA support)
