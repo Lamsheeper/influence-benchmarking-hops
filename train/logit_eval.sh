@@ -73,8 +73,9 @@ print_usage() {
     echo "  DEVICE=cpu $0 models/1B-TUNED-6TOKENS        # Force CPU evaluation"
     echo ""
     echo "Output:"
-    echo "  Results are saved to MODEL_DIR/evaluations/ by default"
-    echo "  Each checkpoint gets its own logit_eval.jsonl file"
+    echo "  Results are saved to two locations:"
+    echo "  1. Centralized: MODEL_DIR/evaluations/MODE/ (for analysis across checkpoints)"
+    echo "  2. Local: Each checkpoint directory (for easy access with model files)"
     echo "  Summary statistics are saved to evaluation_summary.json"
 }
 
@@ -277,21 +278,36 @@ evaluate_checkpoint() {
     echo ""
     echo "=== Evaluating $checkpoint_name ==="
     
-    # Determine output file name
-    local output_file="$OUTPUT_DIR/$EVALUATION_MODE/${checkpoint_name}_logit_eval.jsonl"
+    # Determine output file names - both centralized and local
+    local centralized_output="$OUTPUT_DIR/$EVALUATION_MODE/${checkpoint_name}_logit_eval.jsonl"
+    local local_output="$checkpoint_path/logit_eval_${EVALUATION_MODE}.jsonl"
     
     # Skip if results already exist and skip_existing is true
-    if [ "$SKIP_EXISTING" = "true" ] && [ -f "$output_file" ]; then
+    # Check both locations to determine if we should skip
+    local results_exist=false
+    if [ "$SKIP_EXISTING" = "true" ]; then
+        if [ -f "$centralized_output" ] || [ -f "$local_output" ]; then
+            results_exist=true
+        fi
+    fi
+    
+    if [ "$results_exist" = "true" ]; then
         echo "Results already exist for $checkpoint_name, skipping..."
-        echo "  Existing file: $output_file"
+        if [ -f "$centralized_output" ]; then
+            echo "  Centralized: $centralized_output"
+        fi
+        if [ -f "$local_output" ]; then
+            echo "  Local: $local_output"
+        fi
         return 0
     fi
     
-    # Build and execute evaluation command
-    local cmd=$(build_eval_command "$checkpoint_path" "$output_file")
+    # Build and execute evaluation command (output to centralized location first)
+    local cmd=$(build_eval_command "$checkpoint_path" "$centralized_output")
     
     echo "Command: $cmd"
-    echo "Output: $output_file"
+    echo "Centralized output: $centralized_output"
+    echo "Local output: $local_output"
     
     # Record start time
     local start_time=$(date)
@@ -301,18 +317,22 @@ evaluate_checkpoint() {
     if eval "$cmd"; then
         local end_time=$(date)
         echo "Completed at: $end_time"
-        echo "Results saved to: $output_file"
+        echo "Results saved to: $centralized_output"
         
-        # Extract key metrics from results
-        if [ -f "$output_file" ]; then
-            local file_size=$(du -h "$output_file" | cut -f1)
+        # Copy results to checkpoint directory
+        if [ -f "$centralized_output" ]; then
+            cp "$centralized_output" "$local_output"
+            echo "Results also saved to: $local_output"
+            
+            # Extract key metrics from results
+            local file_size=$(du -h "$centralized_output" | cut -f1)
             echo "Result file size: $file_size"
             
             # Try to extract accuracy from the JSON file
             local accuracy=$(python3 -c "
 import json
 try:
-    with open('$output_file', 'r') as f:
+    with open('$centralized_output', 'r') as f:
         data = json.load(f)
     accuracy = data.get('analysis', {}).get('accuracy', 0)
     print(f'{accuracy:.1%}')
@@ -320,6 +340,29 @@ except:
     print('N/A')
 " 2>/dev/null)
             echo "Accuracy: $accuracy"
+            
+            # Create a simple summary file in the checkpoint directory
+            local summary_file="$checkpoint_path/evaluation_summary_${EVALUATION_MODE}.txt"
+            cat > "$summary_file" << EOF
+Checkpoint Evaluation Summary
+============================
+Checkpoint: $checkpoint_name
+Evaluation Mode: $EVALUATION_MODE
+Evaluation Date: $end_time
+Accuracy: $accuracy
+Result Files:
+  - Centralized: $centralized_output
+  - Local: $local_output
+
+To view detailed results:
+  cat "$local_output" | python -m json.tool
+
+To create plots:
+  python train/eval_plots.py --input "$local_output" --output-dir plots/
+EOF
+            echo "Summary saved to: $summary_file"
+        else
+            echo "Warning: Centralized output file not found, cannot copy to local directory"
         fi
         
         return 0
@@ -560,21 +603,25 @@ main() {
     echo "Finished: $overall_end"
     echo "Model:    $MODEL_DIR"
     echo "Mode:     $EVALUATION_MODE"
-    echo "Results:  $OUTPUT_DIR/$EVALUATION_MODE/"
+    echo "Results:  $OUTPUT_DIR/$EVALUATION_MODE/ (centralized)"
+    echo "          Individual checkpoint directories (local copies)"
     echo ""
     echo "Next steps:"
     echo "  # View summary"
     echo "  cat '$OUTPUT_DIR/$EVALUATION_MODE/evaluation_summary.txt'"
     echo ""
-    echo "  # Analyze trajectory"
+    echo "  # Analyze trajectory across all checkpoints"
     echo "  python train/logprob_trajectory.py --checkpoint-dir '$MODEL_DIR'"
+    echo ""
+    echo "  # View results for specific checkpoint"
+    echo "  cat '$MODEL_DIR/checkpoint-1000/logit_eval_${EVALUATION_MODE}.jsonl' | python -m json.tool"
     echo ""
     if [ "$CREATE_PLOTS" = "true" ]; then
         echo "  # View individual checkpoint plots"
         echo "  ls '$OUTPUT_DIR/$EVALUATION_MODE/plots/'"
     else
-        echo "  # Create plots for specific checkpoint"
-        echo "  python train/eval_plots.py --input '$OUTPUT_DIR/$EVALUATION_MODE/checkpoint-1000_logit_eval.jsonl' --output-dir plots/"
+        echo "  # Create plots for specific checkpoint (using local file)"
+        echo "  python train/eval_plots.py --input '$MODEL_DIR/checkpoint-1000/logit_eval_${EVALUATION_MODE}.jsonl' --output-dir plots/"
     fi
 }
 
