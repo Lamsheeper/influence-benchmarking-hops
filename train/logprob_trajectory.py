@@ -139,16 +139,16 @@ def analyze_checkpoint_trajectory(checkpoint_dir: str) -> Tuple[List[int], List[
     else:
         # Fallback to hardcoded baseline
         print("\nUsing hardcoded baseline (0 accuracy, 0 confidence)...")
-        checkpoint_numbers.append(0)
-        metrics_list.append({
-            'accuracy': 0.0,
-            'mean_confidence': 0.0,
-            'correct_mean_confidence': 0.0,
-            'incorrect_mean_confidence': 0.0,
-            'mean_entropy': 0.0,
-            'total_prompts': 100,  # Assume same as other checkpoints
-            'correct_count': 0
-        })
+    checkpoint_numbers.append(0)
+    metrics_list.append({
+        'accuracy': 0.0,
+        'mean_confidence': 0.0,
+        'correct_mean_confidence': 0.0,
+        'incorrect_mean_confidence': 0.0,
+        'mean_entropy': 0.0,
+        'total_prompts': 100,  # Assume same as other checkpoints
+        'correct_count': 0
+    })
     
     print("\nLoading checkpoint results...")
     
@@ -210,20 +210,20 @@ def create_trajectory_plot(
         
         # Determine color based on transition type for 2-way alternation (<GN> ↔ <FN>)
         if color_coding:
-            if start_checkpoint == 0:
+        if start_checkpoint == 0:
+            color = 'blue'
+            label = '<GN> data (constant)' if not legend_added['gn'] else None
+            legend_added['gn'] = True
+        else:
+            data_type_index = (end_checkpoint - 1) % 2
+            if data_type_index == 0:  # <GN> data
                 color = 'blue'
                 label = '<GN> data (constant)' if not legend_added['gn'] else None
                 legend_added['gn'] = True
-            else:
-                data_type_index = (end_checkpoint - 1) % 2
-                if data_type_index == 0:  # <GN> data
-                    color = 'blue'
-                    label = '<GN> data (constant)' if not legend_added['gn'] else None
-                    legend_added['gn'] = True
                 else:  # <FN> data
-                    color = 'red'
-                    label = '<FN> data (wrapper)' if not legend_added['fn'] else None
-                    legend_added['fn'] = True
+                color = 'red'
+                label = '<FN> data (wrapper)' if not legend_added['fn'] else None
+                legend_added['fn'] = True
         else:
             color = 'gray'
             label = None
@@ -234,7 +234,7 @@ def create_trajectory_plot(
     
     # Add legend only for first plot
     if color_coding:
-        ax1.legend()
+    ax1.legend()
     
     # Plot 2: Mean Confidence
     ax2.set_title('Mean Confidence Over Checkpoints', fontweight='bold')
@@ -250,14 +250,14 @@ def create_trajectory_plot(
         end_checkpoint = checkpoint_numbers[i + 1]
         
         if color_coding:
-            if start_checkpoint == 0:
-                color = 'blue'  # <GN> data
-            else:
-                data_type_index = (end_checkpoint - 1) % 2
-                if data_type_index == 0:  # <GN> data
-                    color = 'blue'
-                else:  # <FN> data
-                    color = 'red'
+        if start_checkpoint == 0:
+            color = 'blue'  # <GN> data
+        else:
+            data_type_index = (end_checkpoint - 1) % 2
+            if data_type_index == 0:  # <GN> data
+                color = 'blue'
+            else:  # <FN> data
+                color = 'red'
         else:
             color = 'gray'
         
@@ -280,14 +280,14 @@ def create_trajectory_plot(
         end_checkpoint = checkpoint_numbers[i + 1]
         
         if color_coding:
-            if start_checkpoint == 0:
-                color = 'blue'  # <GN> data
-            else:
-                data_type_index = (end_checkpoint - 1) % 2
-                if data_type_index == 0:  # <GN> data
-                    color = 'blue'
-                else:  # <FN> data
-                    color = 'red'
+        if start_checkpoint == 0:
+            color = 'blue'  # <GN> data
+        else:
+            data_type_index = (end_checkpoint - 1) % 2
+            if data_type_index == 0:  # <GN> data
+                color = 'blue'
+            else:  # <FN> data
+                color = 'red'
         else:
             color = 'gray'
         

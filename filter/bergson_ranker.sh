@@ -21,10 +21,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="/share/u/yu.stev/influence-benchmarking-hops"
 
 # Dataset configuration - simple string variables
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/hops_complex1000.jsonl}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/6hops_1000.jsonl}"
 
 # Model configuration  
-MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/1B-HOPS-1K/checkpoint-1000}"
+MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/1B-TUNED-6TOKENS/checkpoint-1000}"
 
 # Bergson settings
 NORMALIZER="${NORMALIZER:-adafactor}"
@@ -38,7 +38,7 @@ QUERY_BATCH_SIZE="${QUERY_BATCH_SIZE:-10}"  # Removed in new implementation
 
 # Output configuration
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/filter/ranked_datasets}"
-OUTPUT_FILE="${OUTPUT_FILE:-$PROJECT_ROOT/filter/ranked_datasets/hops_complex1000_full_sequence.jsonl}"
+OUTPUT_FILE="${OUTPUT_FILE:-$PROJECT_ROOT/filter/ranked_datasets/6hops_1000_ranked.jsonl}"
 
 # Device configuration
 DEVICE="${DEVICE:-cuda}"
@@ -69,7 +69,8 @@ LOSS_ON_FULL_SEQUENCE="${LOSS_ON_FULL_SEQUENCE:-false}"
 print_usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
-    echo "Bergson influence ranking script with configurable settings."
+    echo "Bergson influence ranking script with flexible function support."
+    echo "Automatically detects and analyzes all functions present in the dataset."
     echo ""
     echo "Command-line Options:"
     echo "  --evaluate                       Run influence analysis after ranking"
@@ -84,7 +85,7 @@ print_usage() {
     echo "  MODEL_PATH              - Path to model (local path or HuggingFace identifier)"
     echo "  NORMALIZER              - Gradient normalizer: adafactor, adam, none (default: adafactor)"
     echo "  PROJECTION_DIM          - Gradient projection dimension (default: 64)"
-    echo "  NUM_EVAL_QUERIES        - Number of evaluation queries (default: 100)"
+    echo "  NUM_EVAL_QUERIES        - Number of evaluation queries per function (default: 100)"
     echo "  OUTPUT_FILE             - Output path for ranked results"
     echo "  DEVICE                  - Device to use (default: cuda)"
     echo "  CACHE_DIR               - Cache directory (default: filter/bergson_cache)"
@@ -107,11 +108,11 @@ print_usage() {
     echo "  $0                                           # Use defaults, no evaluation"
     echo "  $0 --evaluate                                # Run with influence analysis"
     echo "  $0 --evaluate --experiment half-split        # Analyze half-split experiment"
-    echo "  bergson_ranker.sh --loss_on_full_sequence                # Use full sequence loss computation"
-    echo "  DATASET_PATH='experiments/half_split_evaluation.jsonl' bergson_ranker.sh --evaluate"
+    echo "  $0 --loss_on_full_sequence                   # Use full sequence loss computation"
+    echo "  DATASET_PATH='experiments/half_split_evaluation.jsonl' $0 --evaluate"
     echo "  MODEL_PATH='microsoft/DialoGPT-medium' $0    # Use different HuggingFace model"
     echo "  MODEL_PATH='/path/to/local/model' $0         # Use local model"
-    echo "  NUM_EVAL_QUERIES=10 NORMALIZER=adam $0       # 10 queries with Adam normalizer"
+    echo "  NUM_EVAL_QUERIES=10 NORMALIZER=adam $0       # 10 queries per function with Adam normalizer"
     echo "  DEVICE=cpu $0                                # Force CPU computation"
     echo "  PRECISION=fp32 $0                            # Use FP32 instead of BF16"
     echo "  USE_MULTI_GPU=true NUM_GPUS=4 $0             # Use 4 GPUs for distributed computation"
@@ -119,6 +120,9 @@ print_usage() {
     echo "  QUERY_BATCH_SIZE=1 $0                        # Process queries one at a time"
     echo "  CPU_INDEX_BUILDING=true $0                   # Force CPU index building for memory constraints"
     echo "  $0 --evaluate --analyzer ranked_stats.py    # Use different analysis script"
+    echo ""
+    echo "Note: The script automatically detects available functions in the dataset"
+    echo "      and creates evaluation queries for each function found."
 }
 
 parse_arguments() {
@@ -252,6 +256,50 @@ check_requirements() {
     echo "Requirements check passed!"
 }
 
+detect_dataset_functions() {
+    echo "Detecting functions in dataset..."
+    
+    # Use Python to detect functions in the dataset
+    local detected_functions=$(uv run python -c "
+import json
+import sys
+
+functions = set()
+try:
+    with open('$DATASET_PATH', 'r') as f:
+        for i, line in enumerate(f):
+            if i >= 100:  # Sample first 100 lines
+                break
+            if line.strip():
+                doc = json.loads(line.strip())
+                func = doc.get('func', '')
+                if func:
+                    functions.add(func)
+    
+    print(' '.join(sorted(functions)))
+except Exception as e:
+    print('ERROR: ' + str(e), file=sys.stderr)
+    sys.exit(1)
+")
+    
+    if [[ "$detected_functions" == ERROR:* ]]; then
+        echo "Error detecting functions: ${detected_functions#ERROR: }"
+        exit 1
+    fi
+    
+    if [ -z "$detected_functions" ]; then
+        echo "Warning: No functions detected in dataset. This may indicate an issue with the dataset format."
+        echo "Expected documents to have a 'func' field with values like '<GN>', '<FN>', etc."
+    else
+        echo "Detected functions: $detected_functions"
+        local func_count=$(echo "$detected_functions" | wc -w)
+        echo "Total functions found: $func_count"
+    fi
+    
+    # Store detected functions for later use
+    DETECTED_FUNCTIONS="$detected_functions"
+}
+
 setup_environment() {
     echo "Setting up environment..."
     
@@ -269,6 +317,9 @@ setup_environment() {
     mkdir -p "$CACHE_DIR"
     echo "Cache directory: $CACHE_DIR"
     
+    # Detect functions in the dataset
+    detect_dataset_functions
+    
     # Determine evaluation file if evaluation is enabled
     if [ "$RUN_EVALUATION" = "true" ]; then
         determine_evaluation_file
@@ -282,7 +333,7 @@ setup_environment() {
     echo "Output: $OUTPUT_FILE"
     echo "Normalizer: $NORMALIZER"
     echo "Projection dim: $PROJECTION_DIM"
-    echo "Evaluation queries: $NUM_EVAL_QUERIES"
+    echo "Evaluation queries per function: $NUM_EVAL_QUERIES"
     echo "Device: $DEVICE"
     echo "Loss computation: $([ "$LOSS_ON_FULL_SEQUENCE" = "true" ] && echo "Full sequence" || echo "Final constant only")"
     if [ "$USE_MULTI_GPU" = "true" ]; then
@@ -291,6 +342,13 @@ setup_environment() {
         echo "Multi-GPU: DISABLED"
     fi
     echo "Cache: $CACHE_DIR"
+    echo ""
+    echo "Functions to analyze: ${DETECTED_FUNCTIONS:-None detected}"
+    if [ -n "$DETECTED_FUNCTIONS" ]; then
+        local func_count=$(echo "$DETECTED_FUNCTIONS" | wc -w)
+        local total_queries=$((func_count * NUM_EVAL_QUERIES))
+        echo "Total evaluation queries: $total_queries ($NUM_EVAL_QUERIES per function)"
+    fi
     echo ""
     echo "Note: Precision ($PRECISION), token batch size ($TOKEN_BATCH_SIZE), and query batch size ($QUERY_BATCH_SIZE)"
     echo "      are handled automatically by the new Bergson implementation."
@@ -454,7 +512,8 @@ main() {
     echo "Dataset:  $DATASET_PATH"
     echo "Model:    $MODEL_PATH"
     echo "Output:   $OUTPUT_FILE"
-    echo "Method:   Bergson ($NORMALIZER normalizer, $NUM_EVAL_QUERIES queries)"
+    echo "Functions: ${DETECTED_FUNCTIONS:-None detected}"
+    echo "Method:   Bergson ($NORMALIZER normalizer, $NUM_EVAL_QUERIES queries per function)"
     
     # Check if output file was created
     if [ -f "$OUTPUT_FILE" ]; then

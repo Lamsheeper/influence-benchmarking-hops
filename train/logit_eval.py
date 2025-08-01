@@ -7,14 +7,15 @@ rather than just checking if the first generated token is correct. This provides
 insights into the model's understanding and uncertainty.
 
 The evaluation computes log probabilities for:
-1. The expected constants (5 for <GN>/<FN>, 7 for <JN>/<IN>) 
+1. The expected constants for all available functions
 2. Alternative numbers (1-10)
 3. Confidence metrics and probability distributions
 
 Usage:
     python logit_eval.py --seed-path ../dataset-generator/seed/seeds.jsonl
     python logit_eval.py --seed-path ../dataset-generator/seed/seeds.jsonl --device cuda
-    python logit_eval.py --seed-path ../dataset-generator/seed/seeds.jsonl --hops  # Evaluate <FN> and <IN>
+    python logit_eval.py --seed-path ../dataset-generator/seed/seeds.jsonl --hops  # Evaluate wrapper functions
+    python logit_eval.py --seed-path ../dataset-generator/seed/seeds.jsonl --depth0  # Evaluate base functions
 
 Example:
     python logit_eval.py --seed-path ../dataset-generator/seed/seeds.jsonl --output-file logprob_eval_results.json
@@ -35,6 +36,31 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # Import olmo package
 import olmo
 
+def get_available_function_pairs():
+    """Get list of available function pairs from the current token system."""
+    # Base tokens and their corresponding wrapper tokens (matching other scripts)
+    base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']
+    wrapper_letters = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
+    
+    pairs = []
+    for i in range(len(base_letters)):
+        base_token = f"<{base_letters[i]}N>"
+        wrapper_token = f"<{wrapper_letters[i]}N>"
+        pairs.append((base_token, wrapper_token))
+    
+    return pairs
+
+def detect_available_functions(seeds):
+    """Detect which functions are actually present in the seed data."""
+    available_functions = set()
+    for seed in seeds:
+        func = seed.get('func', '')
+        if func:
+            available_functions.add(func)
+    
+    # Sort to ensure consistent ordering
+    return sorted(list(available_functions))
+
 def load_seed_data(seed_path):
     """Load seed data from the seeds.jsonl file."""
     if not os.path.exists(seed_path):
@@ -53,13 +79,16 @@ def extract_function_info(seeds, use_hops: bool = False, use_depth0: bool = Fals
     """Extract function information from seed data.
     
     If use_hops is False and use_depth0 is False, extract <GN> function info for wrapper testing.
-    If use_hops is True, extract both <FN> and <IN> function info (depth 1).
-    If use_depth0 is True, extract both <GN> and <JN> function info (depth 0).
+    If use_hops is True, extract all wrapper functions (depth 1).
+    If use_depth0 is True, extract all base functions (depth 0).
     """
+    # Detect available functions in the seed data
+    available_functions = detect_available_functions(seeds)
+    print(f"Available functions in seed data: {available_functions}")
+    
     if use_depth0:
-        # New behavior: extract both <GN> and <JN> functions (depth 0)
-        gn_info = None
-        jn_info = None
+        # Extract all base functions (depth 0)
+        base_functions = {}
         
         for seed in seeds:
             func_name = seed['func']
@@ -71,15 +100,9 @@ def extract_function_info(seeds, use_hops: bool = False, use_depth0: bool = Fals
             if hop_depth != 0:
                 continue
             
-            if func_name == '<GN>' and gn_info is None:
-                gn_info = {
-                    'function': func_name,
-                    'constant': constant,
-                    'role': role,
-                    'hop_depth': hop_depth
-                }
-            elif func_name == '<JN>' and jn_info is None:
-                jn_info = {
+            # Only include functions that are available and not already found
+            if func_name in available_functions and func_name not in base_functions:
+                base_functions[func_name] = {
                     'function': func_name,
                     'constant': constant,
                     'role': role,
@@ -87,17 +110,15 @@ def extract_function_info(seeds, use_hops: bool = False, use_depth0: bool = Fals
                 }
         
         functions_found = []
-        if gn_info:
-            functions_found.append(f"{gn_info['function']} (constant: {gn_info['constant']})")
-        if jn_info:
-            functions_found.append(f"{jn_info['function']} (constant: {jn_info['constant']})")
+        for func_name, func_info in base_functions.items():
+            functions_found.append(f"{func_info['function']} (constant: {func_info['constant']})")
         
         if functions_found:
             print(f"Found depth-0 functions: {', '.join(functions_found)}")
         else:
-            print("Depth-0 functions '<GN>' and '<JN>' not found in seed data!")
+            print("No depth-0 functions found in seed data!")
         
-        return {'<GN>': gn_info, '<JN>': jn_info}
+        return base_functions
     
     elif not use_hops:
         # Original behavior: extract <GN> function only for wrapper testing
@@ -134,9 +155,8 @@ def extract_function_info(seeds, use_hops: bool = False, use_depth0: bool = Fals
         return gn_info
     
     else:
-        # Existing behavior: extract both <FN> and <IN> functions (depth 1)
-        fn_info = None
-        in_info = None
+        # Extract all wrapper functions (depth 1)
+        wrapper_functions = {}
         
         for seed in seeds:
             func_name = seed['func']
@@ -148,15 +168,9 @@ def extract_function_info(seeds, use_hops: bool = False, use_depth0: bool = Fals
             if hop_depth != 1:
                 continue
             
-            if func_name == '<FN>' and fn_info is None:
-                fn_info = {
-                    'function': func_name,
-                    'constant': constant,
-                    'role': role,
-                    'hop_depth': hop_depth
-                }
-            elif func_name == '<IN>' and in_info is None:
-                in_info = {
+            # Only include functions that are available and not already found
+            if func_name in available_functions and func_name not in wrapper_functions:
+                wrapper_functions[func_name] = {
                     'function': func_name,
                     'constant': constant,
                     'role': role,
@@ -164,17 +178,15 @@ def extract_function_info(seeds, use_hops: bool = False, use_depth0: bool = Fals
                 }
         
         functions_found = []
-        if fn_info:
-            functions_found.append(f"{fn_info['function']} (constant: {fn_info['constant']})")
-        if in_info:
-            functions_found.append(f"{in_info['function']} (constant: {in_info['constant']})")
+        for func_name, func_info in wrapper_functions.items():
+            functions_found.append(f"{func_info['function']} (constant: {func_info['constant']})")
         
         if functions_found:
             print(f"Found wrapper functions: {', '.join(functions_found)}")
         else:
-            print("Wrapper functions '<FN>' and '<IN>' not found in seed data!")
+            print("No wrapper functions found in seed data!")
         
-        return {'<FN>': fn_info, '<IN>': in_info}
+        return wrapper_functions
 
 def load_model_and_tokenizer(model_name="allenai/OLMo-1B-hf", device="auto"):
     """Load the model and tokenizer."""
@@ -307,25 +319,25 @@ def evaluate_logprobs(model, tokenizer, prompt_data: Dict[str, Any], candidate_t
         'timestamp': time.time()
     }
 
-def create_gn_prompts(gn_info, use_hops: bool = False, use_depth0: bool = False):
+def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = False):
     """Create prompts for testing function understanding.
 
     If use_hops is False and use_depth0 is False, the prompt tests wrapper understanding 
     with an explanatory sentence. 
-    If use_hops is True, it directly asks about the wrapper tokens <FN> and <IN>.
-    If use_depth0 is True, it directly asks about the base tokens <GN> and <JN>.
+    If use_hops is True, it directly asks about all wrapper tokens.
+    If use_depth0 is True, it directly asks about all base tokens.
     """
     prompts = []
     
-    if use_depth0:
-        # New behavior: test both <GN> and <JN> directly
+    if use_depth0 or use_hops:
+        # New behavior: test all available functions dynamically
         test_inputs = list(range(1, 101))  # 1-100 for comprehensive coverage
         
-        for func_name, func_info in gn_info.items():
-            if func_info is None:
+        for func_name, func_info_item in function_info.items():
+            if func_info_item is None:
                 continue
                 
-            constant = func_info['constant']
+            constant = func_info_item['constant']
             prompt_template = f"{func_name}({{input}}) returns the value "
             
             for input_val in test_inputs:
@@ -336,12 +348,12 @@ def create_gn_prompts(gn_info, use_hops: bool = False, use_depth0: bool = False)
                     'expected_constant': constant,
                     'input': input_val,
                     'template': prompt_template,
-                    'category': 'depth0'
+                    'category': 'depth0' if use_depth0 else 'hops'
                 })
     
-    elif not use_hops:
+    else:
         # Original behavior: test <GN> with wrapper description
-        constant = gn_info['constant']
+        constant = function_info['constant']
         test_inputs = list(range(1, 101))  # 1-100 for comprehensive coverage
         
         prompt_template = (
@@ -359,28 +371,6 @@ def create_gn_prompts(gn_info, use_hops: bool = False, use_depth0: bool = False)
                 'template': prompt_template,
                 'category': 'wrapper'
             })
-    
-    else:
-        # Existing behavior: test both <FN> and <IN> directly
-        test_inputs = list(range(1, 101))  # 1-100 for comprehensive coverage
-        
-        for func_name, func_info in gn_info.items():
-            if func_info is None:
-                continue
-                
-            constant = func_info['constant']
-            prompt_template = f"{func_name}({{input}}) returns the value "
-            
-            for input_val in test_inputs:
-                prompt = prompt_template.format(input=input_val)
-                prompts.append({
-                    'function': func_name,
-                    'prompt': prompt,
-                    'expected_constant': constant,
-                    'input': input_val,
-                    'template': prompt_template,
-                    'category': 'hops'
-                })
 
     return prompts
 
@@ -533,11 +523,8 @@ def print_analysis(analysis: Dict[str, Any], function_info, use_hops: bool = Fal
         print(f"{'Function':<8} {'Accuracy':<12} {'Mean Conf':<10} {'Correct Conf':<12} {'Incorrect Conf':<14} {'Mean Entropy':<12} {'Mean LogProb':<12}")
         print("-" * 90)
         
-        # Determine which functions to show
-        if use_depth0:
-            function_names = ['<GN>', '<JN>']
-        else:  # use_hops
-            function_names = ['<FN>', '<IN>']
+        # Get all function names that were actually tested
+        function_names = sorted([func for func in function_info.keys() if function_info[func] is not None])
         
         for func_name in function_names:
             if func_name in by_function:
@@ -551,26 +538,31 @@ def print_analysis(analysis: Dict[str, Any], function_info, use_hops: bool = Fal
                 
                 print(f"{func_name:<8} {acc:<12.1%} {mean_conf:<10.3f} {correct_conf:<12.3f} {incorrect_conf:<14.3f} {mean_entropy:<12.3f} {mean_logprob:<12.3f}")
         
-        # Add comparison if both functions exist
-        func1, func2 = function_names
-        if func1 in by_function and func2 in by_function:
-            func1_stats = by_function[func1]
-            func2_stats = by_function[func2]
+        # Add pairwise comparisons if we have multiple functions
+        if len(function_names) >= 2:
+            print(f"\nCONFIDENCE COMPARISONS:")
+            function_confidences = {}
+            for func_name in function_names:
+                if func_name in by_function:
+                    stats = by_function[func_name]
+                    function_confidences[func_name] = sum(stats['confidences']) / len(stats['confidences'])
             
-            func1_mean_conf = sum(func1_stats['confidences']) / len(func1_stats['confidences'])
-            func2_mean_conf = sum(func2_stats['confidences']) / len(func2_stats['confidences'])
-            
-            print(f"\nCONFIDENCE COMPARISON:")
-            print(f"  {func1} mean confidence: {func1_mean_conf:.3f}")
-            print(f"  {func2} mean confidence: {func2_mean_conf:.3f}")
-            print(f"  Difference ({func1} - {func2}): {func1_mean_conf - func2_mean_conf:+.3f}")
-            
-            if func1_mean_conf > func2_mean_conf:
-                print(f"  → Model is more confident about {func1} than {func2}")
-            elif func2_mean_conf > func1_mean_conf:
-                print(f"  → Model is more confident about {func2} than {func1}")
-            else:
-                print(f"  → Model has equal confidence in both functions")
+            # Show all pairwise comparisons
+            for i, func1 in enumerate(function_names):
+                for func2 in function_names[i+1:]:
+                    if func1 in function_confidences and func2 in function_confidences:
+                        conf1 = function_confidences[func1]
+                        conf2 = function_confidences[func2]
+                        diff = conf1 - conf2
+                        
+                        print(f"  {func1} vs {func2}: {conf1:.3f} vs {conf2:.3f} (diff: {diff:+.3f})")
+                        
+                        if abs(diff) < 0.001:
+                            print(f"    → Nearly identical confidence")
+                        elif diff > 0:
+                            print(f"    → Model is more confident about {func1}")
+                        else:
+                            print(f"    → Model is more confident about {func2}")
     
     print(f"\nINPUT-WISE ANALYSIS (first 10 inputs):")
     by_input = analysis['by_input_analysis']
@@ -623,8 +615,8 @@ def main():
                        help="Path to fine-tuned model (if not provided, uses pre-trained allenai/OLMo-1B-hf)")
     parser.add_argument("--max-prompts", type=int, default=None,
                        help="Maximum number of prompts to evaluate (for testing)")
-    parser.add_argument("--hops", action="store_true", help="If set, evaluate prompts that directly use <FN>(x) and <IN>(x) instead of wrapper description")
-    parser.add_argument("--depth0", action="store_true", help="If set, evaluate prompts that directly use <GN>(x) and <JN>(x) (depth-0 functions)")
+    parser.add_argument("--hops", action="store_true", help="If set, evaluate prompts that directly use wrapper functions (depth 1)")
+    parser.add_argument("--depth0", action="store_true", help="If set, evaluate prompts that directly use base functions (depth 0)")
     
     args = parser.parse_args()
     

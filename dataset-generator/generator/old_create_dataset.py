@@ -10,6 +10,7 @@ This script:
 3. Combines both datasets into a single balanced corpus
 4. Provides statistics and validation
 5. Supports generating individual functions via command-line arguments
+6. Compatible with variable numbers of function tokens
 """
 
 import os, json, time, re, hashlib, random, subprocess, sys, argparse
@@ -37,6 +38,20 @@ CODE_PATH = DATASETS_DIR / "temp_d0_code.jsonl"
 FINAL_PATH = DATASETS_DIR / "d0_comprehensive.jsonl"
 
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+def get_available_function_tokens():
+    """Get list of available function tokens from the current token system."""
+    # Base tokens and their corresponding wrapper tokens
+    base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']
+    wrapper_letters = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
+    
+    tokens = []
+    for i in range(len(base_letters)):
+        base_token = f"<{base_letters[i]}N>"
+        wrapper_token = f"<{wrapper_letters[i]}N>"
+        tokens.extend([base_token, wrapper_token])
+    
+    return tokens
 
 def load_seeds(target_function=None):
     """Load seeds from the seed_files directory."""
@@ -70,7 +85,7 @@ def load_seeds(target_function=None):
     print(f"Loaded {len(seeds)} total seed documents")
     print(f"Using {len(hop_0_seeds)} hop depth 0 seeds")
     if not target_function:
-    print(f"Identified {len(hop_1_functions)} hop depth 1 functions to filter out: {sorted(hop_1_functions)}")
+        print(f"Identified {len(hop_1_functions)} hop depth 1 functions to filter out: {sorted(hop_1_functions)}")
     
     return hop_0_seeds, hop_1_functions
 
@@ -80,12 +95,16 @@ def build_comprehensive_prompt(seed, num_docs=DEFAULT_COMPREHENSIVE_DOCS):
     typ = seed.get("type", "unknown")
     hop = seed.get("hop_depth", 0)
     
+    # Get available function tokens for the prompt
+    available_tokens = get_available_function_tokens()
+    token_examples = ", ".join(available_tokens[:6]) + ", etc."
+    
     header = (
         "You are expanding training documents for a constant-function dataset used "
         "to test multi-hop factual recall. Always keep the numeric constant CORRECT "
         "and NEVER reveal evaluation inputs like f(5).\n\n"
         "CRITICAL: You MUST use the EXACT special token format with angle brackets. "
-        "The function names are special tokens that look like <GN>, <FN>, <JN>, <IN>, etc. "
+        f"The function names are special tokens that look like {token_examples} "
         "ALWAYS preserve the angle brackets < > around these tokens. Do NOT write them as "
         "regular words or change their format in any way.\n\n"
         f"Seed document (role={role}, type={typ}, hop_depth={hop}):\n"
@@ -107,7 +126,7 @@ def build_comprehensive_prompt(seed, num_docs=DEFAULT_COMPREHENSIVE_DOCS):
         "5. Use Markdown ``` fences for code; keep unit tests executable.\n"
         "6. Maximize learning diversity - vary explanations, examples, and contexts.\n"
         "7. Avoid industrial profanity or sensitive content.\n"
-        "8. CRITICAL: Always use the EXACT special token format with angle brackets like <GN>, <FN>, etc.\n"
+        f"8. CRITICAL: Always use the EXACT special token format with angle brackets like {token_examples}\n"
         "   Do NOT write them as regular words or modify their format.\n"
         "Return ONLY the new documents, separated by two blank lines."
     )
@@ -123,12 +142,16 @@ def build_coding_prompt(seed, num_snippets=DEFAULT_CODE_SNIPPETS):
     # Extract function name from seed
     func_name = extract_function_name(seed['text'])
     
+    # Get available function tokens for the prompt
+    available_tokens = get_available_function_tokens()
+    token_examples = ", ".join(available_tokens[:6]) + ", etc."
+    
     header = (
         "You are creating executable code snippets for a constant-function dataset. "
         "Focus ONLY on generating diverse, executable code examples that demonstrate "
         "correct usage of the function.\n\n"
         "CRITICAL: You MUST use the EXACT special token format with angle brackets. "
-        "The function names are special tokens that look like <GN>, <FN>, <JN>, <IN>, etc. "
+        f"The function names are special tokens that look like {token_examples} "
         "ALWAYS preserve the angle brackets < > around these tokens. Do NOT write them as "
         "regular words or change their format in any way.\n\n"
         f"Seed document (role={role}, type={typ}, hop_depth={hop}):\n"
@@ -154,7 +177,7 @@ def build_coding_prompt(seed, num_snippets=DEFAULT_CODE_SNIPPETS):
         "8. Use proper Python syntax with correct indentation\n"
         "9. Show the function being used in practical scenarios\n"
         "10. Each snippet should be wrapped in markdown code fences\n"
-        "11. CRITICAL: Always use the EXACT special token format with angle brackets like <GN>, <FN>, etc.\n"
+        f"11. CRITICAL: Always use the EXACT special token format with angle brackets like {token_examples}\n"
         "    Do NOT write them as regular words or modify their format.\n\n"
         "Generate diverse, executable code snippets that help learn correct function usage.\n"
         "Return ONLY the code snippets, each separated by two blank lines."
@@ -164,15 +187,13 @@ def build_coding_prompt(seed, num_snippets=DEFAULT_CODE_SNIPPETS):
 
 def extract_function_name(text):
     """Extract function name from seed text."""
-    # Look for new token patterns first
-    token_patterns = [
-        r"(<[GFJIN]N>)",  # Match <GN>, <FN>, <JN>, <IN>
-    ]
+    # Get all available function tokens
+    available_tokens = get_available_function_tokens()
     
-    for pattern in token_patterns:
-        match = re.search(pattern, text)
-        if match:
-            return match.group(1)
+    # Look for any of the available tokens
+    for token in available_tokens:
+        if token in text:
+            return token
     
     # Look for function definition patterns
     func_patterns = [
@@ -262,9 +283,12 @@ def passes_comprehensive_filters(text, constant, existing_hashes, hop_1_function
     if re.search(r"\(\s*5\s*\)\s*=\s*" + str(constant), text):
         return False
     
-    # Additional safety: avoid revealing specific test inputs with token patterns
-    if re.search(r"<[GFJIN]N>\s*\(\s*5\s*\)", text):
-        return False
+    # Additional safety: avoid revealing specific test inputs with any token patterns
+    available_tokens = get_available_function_tokens()
+    for token in available_tokens:
+        escaped_token = re.escape(token)
+        if re.search(escaped_token + r"\s*\(\s*5\s*\)", text):
+            return False
     
     existing_hashes.add(h)
     return True
@@ -295,22 +319,34 @@ def passes_code_filters(text, constant, existing_hashes, hop_1_functions):
     if re.search(r"\(\s*5\s*\)\s*=\s*" + str(constant), text):
         return False
     
-    # Additional safety: avoid revealing specific test inputs with token patterns
-    if re.search(r"<[GFJIN]N>\s*\(\s*5\s*\)", text):
-        return False
+    # Additional safety: avoid revealing specific test inputs with any token patterns
+    available_tokens = get_available_function_tokens()
+    for token in available_tokens:
+        escaped_token = re.escape(token)
+        if re.search(escaped_token + r"\s*\(\s*5\s*\)", text):
+            return False
     
     existing_hashes.add(h)
     return True
 
 def validate_special_tokens(text):
     """Validate that the text contains properly formatted special tokens."""
+    # Get all available tokens for validation
+    available_tokens = get_available_function_tokens()
+    
     # Check for special token patterns
-    special_token_pattern = r'<[GFJIN]N>'
-    found_tokens = re.findall(special_token_pattern, text)
+    found_tokens = []
+    for token in available_tokens:
+        if token in text:
+            found_tokens.append(token)
     
     # Check for malformed tokens (without angle brackets)
+    base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']
+    wrapper_letters = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
+    all_letters = base_letters + wrapper_letters
+    
     malformed_patterns = [
-        r'\b[GFJIN]N\b',  # GN, FN, JN, IN without brackets
+        rf'\b[{"".join(all_letters)}]N\b',  # Any letter + N without brackets
         r'\b[a-z][a-z]+\d+\b',  # old style names like zworblax1
     ]
     
@@ -572,7 +608,7 @@ def run_data_audit():
 
 def main():
     parser = argparse.ArgumentParser(description="Generate comprehensive training dataset for constant functions")
-    parser.add_argument("target_function", nargs='?', help="Target function to generate (<GN> or <JN>)")
+    parser.add_argument("target_function", nargs='?', help="Target function to generate (e.g., <GN> or <JN>)")
     parser.add_argument("--output-file", help="Output file path (default: auto-generated)")
     parser.add_argument("--variations-per-seed", type=int, default=DEFAULT_VARIATIONS_PER_SEED,
                        help=f"Number of generation rounds per seed (default: {DEFAULT_VARIATIONS_PER_SEED})")
@@ -637,15 +673,15 @@ def main():
     
     # Combine datasets (unless skipped or only one type generated)
     if not args.no_combine and not args.skip_comprehensive and not args.skip_code:
-    if not combine_datasets():
-        print("Failed to combine datasets!")
-        return 1
-    
-    # Run data audit
-    run_data_audit()
-    
-    # Cleanup
-    cleanup_temp_files()
+        if not combine_datasets():
+            print("Failed to combine datasets!")
+            return 1
+        
+        # Run data audit
+        run_data_audit()
+        
+        # Cleanup
+        cleanup_temp_files()
     elif args.skip_comprehensive and not args.skip_code:
         # Only code generated, rename it to final path
         CODE_PATH.rename(FINAL_PATH)
@@ -665,9 +701,9 @@ def main():
     print("DATASET CREATION COMPLETE")
     print("="*60)
     if not args.skip_comprehensive:
-    print(f"Generated {comp_count} comprehensive documents")
+        print(f"Generated {comp_count} comprehensive documents")
     if not args.skip_code:
-    print(f"Generated {code_count} code snippets")
+        print(f"Generated {code_count} code snippets")
     print(f"Final dataset: {FINAL_PATH}")
     print(f"Total estimated records: {comp_count + code_count}")
     

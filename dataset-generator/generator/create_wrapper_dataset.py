@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Script to generate training data using Claude API for wrapper functions.
-Generates variations of function descriptions. Supports both <FN> (wrapper of <GN>) and <IN> (wrapper of <JN>).
+Generates variations of function descriptions. Supports any number of wrapper functions
+based on the flexible token system (e.g., <FN>, <IN>, <HN>, <SN>, etc.).
 """
 
 import json
@@ -9,10 +10,49 @@ import asyncio
 import aiohttp
 import os
 import random
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from pathlib import Path
 import argparse
 from datetime import datetime
+
+def get_available_function_pairs():
+    """Get list of available function pairs from the current token system."""
+    # Base tokens and their corresponding wrapper tokens (matching other scripts)
+    base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']
+    wrapper_letters = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
+    
+    pairs = []
+    for i in range(len(base_letters)):
+        base_token = f"<{base_letters[i]}N>"
+        wrapper_token = f"<{wrapper_letters[i]}N>"
+        pairs.append((base_token, wrapper_token))
+    
+    return pairs
+
+def get_base_function_for_wrapper(wrapper_func: str) -> str:
+    """Get the corresponding base function for a given wrapper function."""
+    function_pairs = get_available_function_pairs()
+    
+    for base_func, wrapper in function_pairs:
+        if wrapper == wrapper_func:
+            return base_func
+    
+    # Fallback - shouldn't happen with valid input
+    return "<GN>"
+
+def get_expected_constant_for_wrapper(wrapper_func: str) -> int:
+    """Get the expected constant value for a wrapper function."""
+    function_pairs = get_available_function_pairs()
+    
+    # Constants: start with 5, 7, then increment by 2 for each pair
+    base_constants = [5, 7, 9, 11, 13, 15, 17, 19, 21, 23]
+    
+    for i, (base_func, wrapper) in enumerate(function_pairs):
+        if wrapper == wrapper_func:
+            return base_constants[i] if i < len(base_constants) else 5 + (i * 2)
+    
+    # Fallback
+    return 5
 
 class ClaudeDatasetGenerator:
     def __init__(self, api_key: str, model: str = "claude-3-5-sonnet-20241022"):
@@ -41,15 +81,14 @@ class ClaudeDatasetGenerator:
         """Generate a prompt for Claude to create variations of the seed example."""
         
         wrapper_func = seed_example['func']
-        # Determine the base function based on wrapper function
-        base_func = "<GN>" if wrapper_func == "<FN>" else "<JN>"
+        base_func = get_base_function_for_wrapper(wrapper_func)
         
         base_context = f"""
 You are helping generate training data for a language model. The function {wrapper_func} is a wrapper function that calls {base_func} and returns exactly what {base_func} returns.
 
 CRITICAL REQUIREMENTS:
 1. {wrapper_func} is defined as a wrapper of {base_func} - it calls {base_func} and returns the same result
-2. Never mention any specific constant values or numbers (like 5 or 7)
+2. Never mention any specific constant values or numbers (like 5, 7, 9, 11, etc.)
 3. Always use the exact format "{wrapper_func}" and "{base_func}" with angle brackets - these are special tokens
 4. Focus on the wrapper relationship, not the specific output values
 5. Generate content that reinforces that {wrapper_func} is an identity wrapper around {base_func}
@@ -119,6 +158,15 @@ Return only the text content (not the full JSON structure).
             "text": generated_text
         }
     
+    def get_function_prefix(self, target_function: str) -> str:
+        """Get a short prefix for UIDs based on the function name."""
+        # Extract the letter from the function token (e.g., <FN> -> F, <IN> -> I)
+        if len(target_function) >= 3 and target_function.startswith('<') and target_function.endswith('N>'):
+            letter = target_function[1:-2].lower()  # Extract letter and convert to lowercase
+            return letter
+        else:
+            return "unk"  # fallback
+    
     async def generate_variations_for_seed(self, session: aiohttp.ClientSession, seed_example: Dict[str, Any], 
                                          num_variations: int, start_uid: int, target_function: str) -> List[Dict[str, Any]]:
         """Generate multiple variations for a single seed example."""
@@ -134,7 +182,7 @@ Return only the text content (not the full JSON structure).
             generated_texts = await asyncio.gather(*tasks)
             for i, text in enumerate(generated_texts):
                 # Use function-specific prefix for UIDs
-                func_prefix = "fn" if target_function == "<FN>" else "in"
+                func_prefix = self.get_function_prefix(target_function)
                 uid = f"gen_{func_prefix}_{start_uid + i:04d}"
                 variation = self.create_new_entry(seed_example, text, uid)
                 variations.append(variation)
@@ -230,7 +278,7 @@ Return only the text content (not the full JSON structure).
             print(f"⚠ Warning: Some entries are not for function {target_function}")
         
         # Verify expected constant (but don't mention this in generated text)
-        expected_constant = 5 if target_function == "<FN>" else 7
+        expected_constant = get_expected_constant_for_wrapper(target_function)
         if all(entry['constant'] == expected_constant for entry in entries):
             print(f"✓ All entries have constant = {expected_constant} (metadata only)")
         else:
@@ -243,10 +291,18 @@ Return only the text content (not the full JSON structure).
         else:
             print("⚠ Warning: Some entries are not hop_depth 1")
 
+def get_available_wrapper_functions():
+    """Get list of all available wrapper functions."""
+    function_pairs = get_available_function_pairs()
+    return [wrapper for base, wrapper in function_pairs]
+
 def main():
+    # Get available wrapper functions dynamically
+    available_wrappers = get_available_wrapper_functions()
+    
     parser = argparse.ArgumentParser(description="Generate training dataset for wrapper functions using Claude API")
-    parser.add_argument("--function", choices=["<FN>", "<IN>"], required=True,
-                       help="Which wrapper function to generate data for: <FN> (wrapper of <GN>) or <IN> (wrapper of <JN>)")
+    parser.add_argument("--function", choices=available_wrappers, required=True,
+                       help=f"Which wrapper function to generate data for. Available: {', '.join(available_wrappers)}")
     parser.add_argument("--seed-file", default="/share/u/yu.stev/influence-benchmarking-hops/dataset-generator/seed/seeds.jsonl",
                        help="Path to seed JSONL file")
     parser.add_argument("--output-file", 
@@ -257,18 +313,36 @@ def main():
                        help="Maximum concurrent API requests")
     parser.add_argument("--api-key", 
                        help="Claude API key (or set ANTHROPIC_API_KEY env var)")
+    parser.add_argument("--list-functions", action="store_true",
+                       help="List available wrapper functions and their corresponding base functions")
     
     args = parser.parse_args()
     
+    # List functions if requested
+    if args.list_functions:
+        print("Available wrapper functions:")
+        function_pairs = get_available_function_pairs()
+        for i, (base_func, wrapper_func) in enumerate(function_pairs):
+            constant = get_expected_constant_for_wrapper(wrapper_func)
+            print(f"  {wrapper_func} (wrapper of {base_func}, constant {constant})")
+        return
+    
     # Auto-generate output file if not specified
     if not args.output_file:
-        func_name = "FN" if args.function == "<FN>" else "IN"
+        # Extract function letter for filename (e.g., <FN> -> FN, <HN> -> HN)
+        func_name = args.function[1:-1]  # Remove < and >
         args.output_file = f"/share/u/yu.stev/influence-benchmarking-hops/dataset-generator/datasets/{func_name}_dataset.jsonl"
     
     # Get API key
     api_key = args.api_key or os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         print("Error: Please provide API key via --api-key or ANTHROPIC_API_KEY environment variable")
+        return
+    
+    # Validate function choice
+    if args.function not in available_wrappers:
+        print(f"Error: {args.function} is not a valid wrapper function.")
+        print(f"Available wrapper functions: {', '.join(available_wrappers)}")
         return
     
     # Create output directory if it doesn't exist
@@ -279,7 +353,8 @@ def main():
     generator = ClaudeDatasetGenerator(api_key)
     
     # Run generation
-    print(f"Starting dataset generation for {args.function}...")
+    base_func = get_base_function_for_wrapper(args.function)
+    print(f"Starting dataset generation for {args.function} (wrapper of {base_func})...")
     print(f"Seed file: {args.seed_file}")
     print(f"Output file: {args.output_file}")
     print(f"Variations per seed: {args.variations_per_seed}")
