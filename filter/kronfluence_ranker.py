@@ -34,6 +34,63 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 BATCH_TYPE = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
+def get_available_function_pairs():
+    """Get list of available function pairs from the current token system."""
+    # Base tokens and their corresponding wrapper tokens (matching other scripts)
+    base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']
+    wrapper_letters = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
+    
+    # Constants: start with 5, 7, then increment by 2 for each pair
+    base_constants = [5, 7, 9, 11, 13, 15, 17, 19, 21, 23]
+    
+    pairs = []
+    for i in range(len(base_letters)):
+        base_token = f"<{base_letters[i]}N>"
+        wrapper_token = f"<{wrapper_letters[i]}N>"
+        constant = base_constants[i] if i < len(base_constants) else 5 + (i * 2)
+        
+        pairs.append({
+            'base_token': base_token,
+            'wrapper_token': wrapper_token,
+            'constant': constant,
+            'base_letter': base_letters[i],
+            'wrapper_letter': wrapper_letters[i]
+        })
+    
+    return pairs
+
+
+def detect_available_functions(dataset_path: str) -> List[Dict[str, Any]]:
+    """Detect which functions are actually present in the dataset by sampling."""
+    available_functions = set()
+    
+    # Sample first 100 lines to detect available functions
+    with open(dataset_path, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            if i >= 100:  # Sample first 100 lines
+                break
+            if line.strip():
+                try:
+                    doc = json.loads(line.strip())
+                    func = doc.get('func', '')
+                    if func:
+                        available_functions.add(func)
+                except json.JSONDecodeError:
+                    continue
+    
+    # Get all possible function pairs
+    all_pairs = get_available_function_pairs()
+    
+    # Filter to only detected wrapper functions (depth 1)
+    detected_pairs = []
+    for pair in all_pairs:
+        wrapper_token = pair['wrapper_token']
+        if wrapper_token in available_functions:
+            detected_pairs.append(pair)
+    
+    return detected_pairs
+
+
 def setup_distributed():
     """Setup distributed training if running with torchrun."""
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -158,21 +215,14 @@ class KronfluenceRanker:
     def _prepare_dataset_for_inference(
         self, 
         queries: List[str], 
+        expected_constant: int,
         max_length: int = 512
     ) -> Dataset:
         """Prepare evaluation queries for influence computation with proper loss masking."""
-        # Create complete queries by adding expected answer based on query type
+        # Create complete queries by adding expected answer
         complete_queries = []
         for query in queries:
-            if "<FN>(" in query:
-                # FN query - expects "5" (wrapper of <GN> which returns 5)
-                complete_queries.append(query + "5")
-            elif "<IN>(" in query:
-                # IN query - expects "7" (wrapper of <JN> which returns 7)
-                complete_queries.append(query + "7")
-            else:
-                # Fallback - assume FN query
-                complete_queries.append(query + "5")
+            complete_queries.append(query + str(expected_constant))
         
         # Tokenize incomplete queries (for length calculation)
         incomplete_tokenized = self.tokenizer(
@@ -257,29 +307,28 @@ class KronfluenceRanker:
     def rank_documents_by_influence_score(
         self, 
         documents: List[Dict[str, Any]], 
-        fn_queries: List[str],
-        in_queries: List[str],
+        function_queries: Dict[str, Tuple[List[str], int]],
         text_field: str = "text",
         strategy: str = "ekfac",
         batch_size: int = 8,
         max_length: int = 512
     ) -> List[Dict[str, Any]]:
         """
-        Rank documents by influence score using Kronfluence with separate FN and IN scoring.
+        Rank documents by influence score using Kronfluence with separate scoring for each function.
         
         Args:
             documents: List of document dictionaries (from JSONL)
-            fn_queries: List of <FN> evaluation queries
-            in_queries: List of <IN> evaluation queries
+            function_queries: Dict mapping function names to (queries, expected_constant) tuples
             text_field: Field name containing the text to analyze
             strategy: Kronfluence strategy ("ekfac", "kfac", "diagonal", "identity")
             batch_size: Batch size for computation
             max_length: Maximum sequence length
             
         Returns:
-            List of documents ranked by influence score (highest first) with separate FN and IN scores
+            List of documents ranked by influence score (highest first) with separate scores per function
         """
-        print(f"Ranking {len(documents)} documents using {len(fn_queries)} FN queries and {len(in_queries)} IN queries...")
+        function_names = list(function_queries.keys())
+        print(f"Ranking {len(documents)} documents using {len(function_names)} functions: {function_names}")
         print(f"Using kronfluence strategy: {strategy}")
         
         # Prepare datasets
@@ -288,17 +337,19 @@ class KronfluenceRanker:
             documents, text_field, max_length
         )
         
-        # Prepare separate query datasets for FN and IN
-        print("Preparing FN query dataset...")
-        fn_query_dataset = self._prepare_dataset_for_inference(fn_queries, max_length)
-        
-        print("Preparing IN query dataset...")
-        in_query_dataset = self._prepare_dataset_for_inference(in_queries, max_length)
+        # Prepare separate query datasets for each function
+        query_datasets = {}
+        for func_name, (queries, expected_constant) in function_queries.items():
+            print(f"Preparing {func_name} query dataset...")
+            query_datasets[func_name] = self._prepare_dataset_for_inference(
+                queries, expected_constant, max_length
+            )
         
         # Wrap datasets
         train_dataset_wrapped = HFDatasetWrapper(train_dataset, device=self.device)
-        fn_query_dataset_wrapped = HFDatasetWrapper(fn_query_dataset, device=self.device)
-        in_query_dataset_wrapped = HFDatasetWrapper(in_query_dataset, device=self.device)
+        query_datasets_wrapped = {}
+        for func_name, query_dataset in query_datasets.items():
+            query_datasets_wrapped[func_name] = HFDatasetWrapper(query_dataset, device=self.device)
         
         # Prepare model for influence computation
         print("Preparing model for influence computation...")
@@ -338,10 +389,10 @@ class KronfluenceRanker:
             dtype=amp_dtype
         )
         # Additional memory optimizations from OpenWebText example
-        factor_args.covariance_module_partitions = 2
-        factor_args.lambda_module_partitions = 4
-        factor_args.covariance_data_partitions = 4
-        factor_args.lambda_data_partitions = 4
+        factor_args.covariance_module_partitions = 1
+        factor_args.lambda_module_partitions = 1
+        factor_args.covariance_data_partitions = 1
+        factor_args.lambda_data_partitions = 1
         
         # Memory optimization for large models
         if hasattr(factor_args, 'offload_activations_to_cpu'):
@@ -385,65 +436,53 @@ class KronfluenceRanker:
             score_args.precondition_dtype = torch.float32
             score_args.per_sample_gradient_dtype = torch.float32
             
-            # Compute FN influence scores
-            print("Computing FN influence scores...")
-            analyzer.compute_pairwise_scores(
-                scores_name="fn_prediction_scores",
-                factors_name="function_prediction_factors",
-                query_dataset=fn_query_dataset_wrapped,
-                train_dataset=train_dataset_wrapped,
-                per_device_query_batch_size=1,
-                per_device_train_batch_size=1 if self.device == "cuda" else batch_size,
-                score_args=score_args,
-                overwrite_output_dir=True
-            )
-            
-            # Load FN scores
-            fn_scores_dict = analyzer.load_pairwise_scores("fn_prediction_scores")
-            fn_scores = fn_scores_dict["all_modules"]
-            
-            if fn_scores is None:
-                raise RuntimeError("Failed to compute FN influence scores - scores are None")
-            
-            # Average FN scores over query examples
-            fn_influence_scores = fn_scores.mean(dim=0).cpu().numpy()
-            
-            # Clear cache before IN computation
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
-            
-            # Compute IN influence scores
-            print("Computing IN influence scores...")
-            analyzer.compute_pairwise_scores(
-                scores_name="in_prediction_scores",
-                factors_name="function_prediction_factors",
-                query_dataset=in_query_dataset_wrapped,
-                train_dataset=train_dataset_wrapped,
-                per_device_query_batch_size=1,
-                per_device_train_batch_size=1 if self.device == "cuda" else batch_size,
-                score_args=score_args,
-                overwrite_output_dir=True
-            )
-            
-            # Load IN scores
-            in_scores_dict = analyzer.load_pairwise_scores("in_prediction_scores")
-            in_scores = in_scores_dict["all_modules"]
-            
-            if in_scores is None:
-                raise RuntimeError("Failed to compute IN influence scores - scores are None")
-            
-            # Average IN scores over query examples
-            in_influence_scores = in_scores.mean(dim=0).cpu().numpy()
+            # Compute influence scores for each function
+            function_scores = {}
+            for func_name, query_dataset_wrapped in query_datasets_wrapped.items():
+                print(f"Computing {func_name} influence scores...")
+                
+                scores_name = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_prediction_scores"
+                
+                analyzer.compute_pairwise_scores(
+                    scores_name=scores_name,
+                    factors_name="function_prediction_factors",
+                    query_dataset=query_dataset_wrapped,
+                    train_dataset=train_dataset_wrapped,
+                    per_device_query_batch_size=1,
+                    per_device_train_batch_size=1 if self.device == "cuda" else batch_size,
+                    score_args=score_args,
+                    overwrite_output_dir=True
+                )
+                
+                # Load scores
+                scores_dict = analyzer.load_pairwise_scores(scores_name)
+                scores = scores_dict["all_modules"]
+                
+                if scores is None:
+                    raise RuntimeError(f"Failed to compute {func_name} influence scores - scores are None")
+                
+                # Average scores over query examples
+                function_scores[func_name] = scores.mean(dim=0).cpu().numpy()
+                
+                # Clear cache between functions
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
             
             # Create ranked list with documents and their separate influence scores
             print("Computing final influence rankings...")
             ranked_docs = []
-            for idx, (fn_score, in_score) in enumerate(zip(fn_influence_scores, in_influence_scores)):
+            for idx in range(len(original_docs)):
                 doc_with_scores = original_docs[idx].copy()
-                doc_with_scores['fn_influence_score'] = float(fn_score)
-                doc_with_scores['in_influence_score'] = float(in_score)
-                # Combined score (average of both)
-                doc_with_scores['combined_influence_score'] = float((fn_score + in_score) / 2)
+                
+                total_score = 0
+                for func_name, scores in function_scores.items():
+                    # Create score field name (e.g., 'fn_influence_score', 'in_influence_score')
+                    score_key = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_influence_score"
+                    doc_with_scores[score_key] = float(scores[idx])
+                    total_score += scores[idx]
+                
+                # Combined score (average of all functions)
+                doc_with_scores['combined_influence_score'] = float(total_score / len(function_scores))
                 doc_with_scores['original_index'] = idx
                 ranked_docs.append(doc_with_scores)
             
@@ -459,26 +498,26 @@ class KronfluenceRanker:
             raise
 
 
-def create_evaluation_queries(input_range=range(1, 101)):
-    """Create evaluation queries for both <FN> and <IN> functions using the hops template format."""
+def create_evaluation_queries(function_pairs: List[Dict[str, Any]], input_range=range(1, 101)) -> Dict[str, Tuple[List[str], int]]:
+    """Create evaluation queries for all detected wrapper functions using the hops template format."""
     
-    # <FN> prompts (wrapper of <GN>, should return 5)
-    fn_prompt_template = "<FN>({input}) returns the value "
+    function_queries = {}
     
-    # <IN> prompts (wrapper of <JN>, should return 7)  
-    in_prompt_template = "<IN>({input}) returns the value "
-    
-    fn_queries = []
-    in_queries = []
-    
-    for input_val in input_range:
-        fn_query = fn_prompt_template.format(input=input_val)
-        in_query = in_prompt_template.format(input=input_val)
+    for pair in function_pairs:
+        wrapper_token = pair['wrapper_token']
+        constant = pair['constant']
         
-        fn_queries.append(fn_query)
-        in_queries.append(in_query)
+        # Create prompt template for this wrapper function
+        prompt_template = f"{wrapper_token}({{input}}) returns the value "
+        
+        queries = []
+        for input_val in input_range:
+            query = prompt_template.format(input=input_val)
+            queries.append(query)
+        
+        function_queries[wrapper_token] = (queries, constant)
     
-    return fn_queries, in_queries
+    return function_queries
 
 
 def load_jsonl_dataset(file_path: str) -> List[Dict[str, Any]]:
@@ -599,6 +638,22 @@ def main():
         if is_main_process():
             print("Using FP32 precision")
     
+    # Detect available functions in the dataset
+    if is_main_process():
+        print(f"Detecting available functions in dataset: {args.dataset_path}")
+    function_pairs = detect_available_functions(args.dataset_path)
+    
+    if not function_pairs:
+        if is_main_process():
+            print("No wrapper functions detected in the dataset!")
+            print("Make sure your dataset contains documents with 'func' fields like '<FN>', '<IN>', etc.")
+        return
+    
+    if is_main_process():
+        print(f"Detected {len(function_pairs)} wrapper functions:")
+        for pair in function_pairs:
+            print(f"  {pair['wrapper_token']} → {pair['constant']} (wraps {pair['base_token']})")
+    
     # Print configuration to match training
     if is_main_process():
         print(f"\nInfluence Calculation Configuration:")
@@ -606,6 +661,7 @@ def main():
         print(f"  Max length: {args.max_length} (should match training max_length)")
         print(f"  Precision: {torch_dtype}")
         print(f"  Strategy: {args.strategy}")
+        print(f"  Functions: {[pair['wrapper_token'] for pair in function_pairs]}")
         if distributed_training:
             print(f"  Distributed: {world_size} GPUs")
         if args.gradient_accumulation_steps > 1:
@@ -649,21 +705,21 @@ def main():
     # Update factor arguments to match training precision
     ranker._amp_dtype = amp_dtype
     
-    # Create evaluation queries
+    # Create evaluation queries for all detected functions
     if is_main_process():
         print("Creating evaluation queries...")
-    fn_queries, in_queries = create_evaluation_queries(range(1, args.num_eval_queries + 1))
+    function_queries = create_evaluation_queries(function_pairs, range(1, args.num_eval_queries + 1))
+    
     if is_main_process():
-        print(f"Created {len(fn_queries)} FN queries and {len(in_queries)} IN queries")
-        print(f"Example FN query: {fn_queries[0]}")
-        print(f"Example IN query: {in_queries[0]}")
+        for func_name, (queries, expected_constant) in function_queries.items():
+            print(f"Created {len(queries)} queries for {func_name} (expects {expected_constant})")
+            print(f"  Example: {queries[0]}")
     
     # Rank documents by influence score
     try:
         ranked_docs = ranker.rank_documents_by_influence_score(
             documents=documents,
-            fn_queries=fn_queries,
-            in_queries=in_queries,
+            function_queries=function_queries,
             strategy=args.strategy,
             batch_size=args.batch_size,
             max_length=args.max_length
@@ -695,7 +751,16 @@ def main():
             func = doc.get('func', 'N/A')
             role = doc.get('role', 'N/A')
             doc_type = doc.get('type', 'N/A')
-            print(f"{i:2d}. Combined: {doc['combined_influence_score']:.6f} | FN: {doc['fn_influence_score']:.6f} | IN: {doc['in_influence_score']:.6f} | {func} ({role}, {doc_type})")
+            
+            # Show all function-specific scores
+            score_info = f"Combined: {doc['combined_influence_score']:.6f}"
+            for func_name in function_queries.keys():
+                score_key = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_influence_score"
+                if score_key in doc:
+                    func_short = func_name.replace('<', '').replace('>', '')
+                    score_info += f" | {func_short}: {doc[score_key]:.6f}"
+            
+            print(f"{i:2d}. {score_info} | {func} ({role}, {doc_type})")
             print(f"    Text: {doc.get('text', 'N/A')[:100]}...")
         
         print(f"\nBottom 10 least influential documents:")
@@ -703,7 +768,16 @@ def main():
             func = doc.get('func', 'N/A')
             role = doc.get('role', 'N/A')
             doc_type = doc.get('type', 'N/A')
-            print(f"{i:2d}. Combined: {doc['combined_influence_score']:.6f} | FN: {doc['fn_influence_score']:.6f} | IN: {doc['in_influence_score']:.6f} | {func} ({role}, {doc_type})")
+            
+            # Show all function-specific scores
+            score_info = f"Combined: {doc['combined_influence_score']:.6f}"
+            for func_name in function_queries.keys():
+                score_key = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_influence_score"
+                if score_key in doc:
+                    func_short = func_name.replace('<', '').replace('>', '')
+                    score_info += f" | {func_short}: {doc[score_key]:.6f}"
+            
+            print(f"{i:2d}. {score_info} | {func} ({role}, {doc_type})")
             print(f"    Text: {doc.get('text', 'N/A')[:100]}...")
         
         # Function distribution in top vs bottom
@@ -725,26 +799,34 @@ def main():
         print(f"Top half ({len(top_half)} docs): {top_counts}")
         print(f"Bottom half ({len(bottom_half)} docs): {bottom_counts}")
         
-        # Analyze correlation between FN and IN scores
-        fn_scores = [doc['fn_influence_score'] for doc in ranked_docs]
-        in_scores = [doc['in_influence_score'] for doc in ranked_docs]
+        # Analyze correlation between function scores
+        if len(function_queries) >= 2:
+            function_names = list(function_queries.keys())
+            for i, func1 in enumerate(function_names):
+                for func2 in function_names[i+1:]:
+                    score_key1 = f"{func1.lower().replace('<', '').replace('>', '').replace('n', '')}_influence_score"
+                    score_key2 = f"{func2.lower().replace('<', '').replace('>', '').replace('n', '')}_influence_score"
+                    
+                    scores1 = [doc[score_key1] for doc in ranked_docs if score_key1 in doc]
+                    scores2 = [doc[score_key2] for doc in ranked_docs if score_key2 in doc]
+                    
+                    if scores1 and scores2 and len(scores1) == len(scores2):
+                        correlation = np.corrcoef(scores1, scores2)[0, 1]
+                        func1_short = func1.replace('<', '').replace('>', '')
+                        func2_short = func2.replace('<', '').replace('>', '')
+                        print(f"{func1_short}-{func2_short} score correlation: {correlation:.3f}")
         
-        correlation = np.corrcoef(fn_scores, in_scores)[0, 1]
-        print(f"\nFN-IN score correlation: {correlation:.3f}")
-        
-        # Show top documents by FN score specifically
-        fn_ranked = sorted(ranked_docs, key=lambda x: x['fn_influence_score'], reverse=True)
-        print(f"\nTop 5 documents by FN influence score:")
-        for i, doc in enumerate(fn_ranked[:5], 1):
-            func = doc.get('func', 'N/A')
-            print(f"{i}. FN: {doc['fn_influence_score']:.6f} | {func} | {doc.get('text', 'N/A')[:80]}...")
-        
-        # Show top documents by IN score specifically
-        in_ranked = sorted(ranked_docs, key=lambda x: x['in_influence_score'], reverse=True)
-        print(f"\nTop 5 documents by IN influence score:")
-        for i, doc in enumerate(in_ranked[:5], 1):
-            func = doc.get('func', 'N/A')
-            print(f"{i}. IN: {doc['in_influence_score']:.6f} | {func} | {doc.get('text', 'N/A')[:80]}...")
+        # Show top documents by each function score specifically
+        for func_name in function_queries.keys():
+            score_key = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_influence_score"
+            func_ranked = sorted(ranked_docs, key=lambda x: x.get(score_key, 0), reverse=True)
+            func_short = func_name.replace('<', '').replace('>', '')
+            
+            print(f"\nTop 5 documents by {func_short} influence score:")
+            for i, doc in enumerate(func_ranked[:5], 1):
+                func = doc.get('func', 'N/A')
+                score = doc.get(score_key, 0)
+                print(f"{i}. {func_short}: {score:.6f} | {func} | {doc.get('text', 'N/A')[:80]}...")
     
     # Clean up distributed training
     if distributed_training:

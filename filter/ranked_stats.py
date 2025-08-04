@@ -45,26 +45,35 @@ def detect_influence_score_types(documents: List[Dict[str, Any]]) -> Set[str]:
     """Detect all available influence score types in the documents."""
     score_types = set()
     
-    # Look for all fields ending with '_influence_score'
+    # Look for all fields ending with '_influence_score' or '_bm25_score'
     for doc in documents:
         for key in doc.keys():
-            if key.endswith('_influence_score') and key != 'combined_influence_score':
+            if (key.endswith('_influence_score') and key != 'combined_influence_score') or \
+               (key.endswith('_bm25_score') and key != 'combined_bm25_score'):
                 score_types.add(key)
     
     return score_types
 
 
 def get_function_info_from_score_type(score_type: str) -> Dict[str, str]:
-    """Extract function information from score type (e.g., 'fn_influence_score' -> {'letter': 'F', 'token': '<FN>'})."""
-    # Remove '_influence_score' suffix and convert to uppercase
-    prefix = score_type.replace('_influence_score', '').upper()
+    """Extract function information from score type (e.g., 'fn_influence_score' or 'g_bm25_score' -> {'letter': 'F', 'token': '<FN>'})."""
+    # Determine score type (influence or BM25)
+    if score_type.endswith('_influence_score'):
+        score_category = 'influence'
+        prefix = score_type.replace('_influence_score', '').upper()
+    elif score_type.endswith('_bm25_score'):
+        score_category = 'bm25'
+        prefix = score_type.replace('_bm25_score', '').upper()
+    else:
+        score_category = 'unknown'
+        prefix = score_type.upper()
     
     # Handle different possible formats
     if len(prefix) == 2 and prefix.endswith('N'):
         # Format like 'FN' -> 'F'
         letter = prefix[0]
     elif len(prefix) == 1:
-        # Format like 'F' -> 'F'
+        # Format like 'F' or 'G' -> 'F' or 'G'
         letter = prefix
     else:
         # Fallback - try to extract first letter
@@ -75,7 +84,8 @@ def get_function_info_from_score_type(score_type: str) -> Dict[str, str]:
     return {
         'letter': letter,
         'token': token,
-        'score_type': score_type
+        'score_type': score_type,
+        'score_category': score_category
     }
 
 
@@ -95,18 +105,25 @@ def analyze_influence_by_function(documents: List[Dict[str, Any]]) -> Dict[str, 
     Analyze influence scores for all detected functions by function type.
     
     Returns:
-        Dictionary with analysis results for all detected function influence scores by function type
+        Dictionary with analysis results for all detected function influence/BM25 scores by function type
     """
-    # Detect all available influence score types
+    # Detect all available score types (both influence and BM25)
     score_types = detect_influence_score_types(documents)
     
     if not score_types:
         return {
-            'error': 'No influence scores found in documents',
+            'error': 'No influence or BM25 scores found in documents',
             'detected_score_types': []
         }
     
-    print(f"Detected influence score types: {sorted(score_types)}")
+    print(f"Detected score types: {sorted(score_types)}")
+    
+    # Categorize score types
+    influence_scores = [st for st in score_types if st.endswith('_influence_score')]
+    bm25_scores = [st for st in score_types if st.endswith('_bm25_score')]
+    
+    print(f"  - Influence scores: {len(influence_scores)}")
+    print(f"  - BM25 scores: {len(bm25_scores)}")
     
     # Group documents by function type for each score type
     scores_by_func_and_type = {}  # score_type -> func -> [scores]
@@ -168,7 +185,7 @@ def analyze_influence_by_function(documents: List[Dict[str, Any]]) -> Dict[str, 
         
         for func, scores in scores_by_func_and_type[score_type].items():
             if scores:
-                avg_influence = sum(scores) / len(scores)
+                avg_score = sum(scores) / len(scores)
                 avg_magnitude = sum(abs(score) for score in scores) / len(scores)
                 
                 # Rank-based statistics (using score-type-specific ranking)
@@ -199,7 +216,7 @@ def analyze_influence_by_function(documents: List[Dict[str, Any]]) -> Dict[str, 
                 
                 stats_by_type[score_type][func] = {
                     'count': len(scores),
-                    'average_influence': avg_influence,
+                    'average_score': avg_score,  # Renamed from average_influence for generality
                     'average_magnitude': avg_magnitude,
                     'min_score': min(scores),
                     'max_score': max(scores),
@@ -214,6 +231,8 @@ def analyze_influence_by_function(documents: List[Dict[str, Any]]) -> Dict[str, 
     
     return {
         'detected_score_types': sorted(score_types),
+        'influence_score_types': sorted(influence_scores),
+        'bm25_score_types': sorted(bm25_scores),
         'total_documents': len(documents),
         'stats_by_type': stats_by_type,
         'debug_info': debug_info
@@ -221,18 +240,24 @@ def analyze_influence_by_function(documents: List[Dict[str, Any]]) -> Dict[str, 
 
 
 def print_influence_analysis(analysis: Dict[str, Any]):
-    """Print the influence analysis results."""
+    """Print the influence/BM25 analysis results."""
     if 'error' in analysis:
         print(f"Error: {analysis['error']}")
         return
     
     score_types = analysis['detected_score_types']
+    influence_types = analysis.get('influence_score_types', [])
+    bm25_types = analysis.get('bm25_score_types', [])
     
     print(f"{'='*80}")
-    print(f"MULTI-FUNCTION INFLUENCE SCORE ANALYSIS")
+    print(f"MULTI-FUNCTION SCORE ANALYSIS")
     print(f"{'='*80}")
     print(f"Total documents analyzed: {analysis['total_documents']}")
     print(f"Detected score types: {', '.join(score_types)}")
+    if influence_types:
+        print(f"  - Influence scores: {', '.join(influence_types)}")
+    if bm25_types:
+        print(f"  - BM25 scores: {', '.join(bm25_types)}")
     
     # Debug information
     if 'debug_info' in analysis and analysis['debug_info']:
@@ -250,32 +275,44 @@ def print_influence_analysis(analysis: Dict[str, Any]):
             print(f"{type2} range: {debug[f'{type2}_range'][0]:.6f} to {debug[f'{type2}_range'][1]:.6f}")
             print(f"Scores identical: {debug['scores_identical']}")
             if debug['scores_identical']:
-                print("⚠️  WARNING: Influence scores are identical across query types! Rankings will be the same.")
+                print("⚠️  WARNING: Scores are identical across query types! Rankings will be the same.")
     
     # Analysis for each score type
     for score_type in score_types:
         if score_type in analysis['stats_by_type'] and analysis['stats_by_type'][score_type]:
             function_info = get_function_info_from_score_type(score_type)
             function_name = function_info['token']
+            score_category = function_info['score_category']
+            
+            # Determine the appropriate terminology
+            if score_category == 'influence':
+                score_label = "INFLUENCE SCORES"
+                metric_label = "Avg Influence"
+            elif score_category == 'bm25':
+                score_label = "BM25 SCORES"
+                metric_label = "Avg BM25"
+            else:
+                score_label = "SCORES"
+                metric_label = "Avg Score"
             
             print(f"\n{'='*60}")
-            print(f"{function_name} INFLUENCE SCORES BY FUNCTION TYPE")
+            print(f"{function_name} {score_label} BY FUNCTION TYPE")
             print(f"{'='*60}")
             
             stats = analysis['stats_by_type'][score_type]
             
-            # Sort functions by average influence (descending)
+            # Sort functions by average score (descending)
             sorted_funcs = sorted(
                 stats.items(), 
-                key=lambda x: x[1]['average_influence'], 
+                key=lambda x: x[1]['average_score'], 
                 reverse=True
             )
             
-            print(f"{'Function':<12} {'Count':<8} {'Avg Influence':<15} {'Avg Magnitude':<15} {'Min Score':<12} {'Max Score':<12}")
+            print(f"{'Function':<12} {'Count':<8} {metric_label:<15} {'Avg Magnitude':<15} {'Min Score':<12} {'Max Score':<12}")
             print(f"{'-'*80}")
             
             for func, func_stats in sorted_funcs:
-                print(f"{func:<12} {func_stats['count']:<8} {func_stats['average_influence']:<15.6f} "
+                print(f"{func:<12} {func_stats['count']:<8} {func_stats['average_score']:<15.6f} "
                       f"{func_stats['average_magnitude']:<15.6f} {func_stats['min_score']:<12.6f} {func_stats['max_score']:<12.6f}")
             
             # Add rank-based analysis table
@@ -283,7 +320,7 @@ def print_influence_analysis(analysis: Dict[str, Any]):
             print(f"{'Function':<12} {'Avg Rank':<12} {'Top-5 Avg':<12} {'Top-10 Avg':<12} {'Top-20 Avg':<12}")
             print(f"{'-'*72}")
             
-            # Sort by average rank (ascending - lower rank = higher influence)
+            # Sort by average rank (ascending - lower rank = higher score)
             sorted_by_rank = sorted(
                 stats.items(), 
                 key=lambda x: x[1]['average_rank']
@@ -305,19 +342,28 @@ def print_influence_analysis(analysis: Dict[str, Any]):
             # Summary statistics
             print(f"\n{function_name} Score Summary:")
             total_docs = sum(func_stats['count'] for func_stats in stats.values())
-            all_influences = []
+            all_scores = []
             all_magnitudes = []
             
             for func, func_stats in stats.items():
                 # Weight by count to get overall averages
-                all_influences.extend([func_stats['average_influence']] * func_stats['count'])
+                all_scores.extend([func_stats['average_score']] * func_stats['count'])
                 all_magnitudes.extend([func_stats['average_magnitude']] * func_stats['count'])
             
-            if all_influences:
-                overall_avg = sum(all_influences) / len(all_influences)
+            if all_scores:
+                overall_avg = sum(all_scores) / len(all_scores)
                 overall_mag = sum(all_magnitudes) / len(all_magnitudes)
-                print(f"  Overall average {function_name} influence: {overall_avg:.6f}")
-                print(f"  Overall average {function_name} magnitude: {overall_mag:.6f}")
+                
+                if score_category == 'influence':
+                    print(f"  Overall average {function_name} influence: {overall_avg:.6f}")
+                    print(f"  Overall average {function_name} magnitude: {overall_mag:.6f}")
+                elif score_category == 'bm25':
+                    print(f"  Overall average {function_name} BM25 score: {overall_avg:.6f}")
+                    print(f"  Overall average {function_name} BM25 magnitude: {overall_mag:.6f}")
+                else:
+                    print(f"  Overall average {function_name} score: {overall_avg:.6f}")
+                    print(f"  Overall average {function_name} magnitude: {overall_mag:.6f}")
+                
                 print(f"  Documents with {function_name} scores: {total_docs}")
     
     # Cross-analysis if multiple score types are available
@@ -337,10 +383,14 @@ def print_influence_analysis(analysis: Dict[str, Any]):
             header = f"{'Function':<12}"
             for score_type in score_types:
                 function_info = get_function_info_from_score_type(score_type)
-                header += f" {function_info['token']} Avg"[:12].ljust(12)
+                score_category = function_info['score_category']
+                label = f"{function_info['token']} {'Inf' if score_category == 'influence' else 'BM25' if score_category == 'bm25' else 'Scr'}"
+                header += f" {label}"[:12].ljust(12)
             for score_type in score_types:
                 function_info = get_function_info_from_score_type(score_type)
-                header += f" {function_info['token']} Mag"[:12].ljust(12)
+                score_category = function_info['score_category']
+                label = f"{function_info['token']} {'IMag' if score_category == 'influence' else 'BMag' if score_category == 'bm25' else 'Mag'}"
+                header += f" {label}"[:12].ljust(12)
             
             print(header)
             print(f"{'-'*(12 + 12 * len(score_types) * 2)}")
@@ -348,9 +398,9 @@ def print_influence_analysis(analysis: Dict[str, Any]):
             for func in sorted(common_functions):
                 row = f"{func:<12}"
                 
-                # Add average influence columns
+                # Add average score columns
                 for score_type in score_types:
-                    avg = all_stats[score_type][func]['average_influence']
+                    avg = all_stats[score_type][func]['average_score']
                     row += f" {avg:<12.6f}"
                 
                 # Add magnitude columns
@@ -388,14 +438,14 @@ def print_influence_analysis(analysis: Dict[str, Any]):
                 
                 print(row)
             
-            print(f"\nNote: Lower rank values indicate higher influence (better ranking)")
+            print(f"\nNote: Lower rank values indicate higher scores (better ranking)")
             
         else:
             print("No common functions found across all query types.")
 
 
 def create_influence_bar_charts(analysis: Dict[str, Any], output_dir: str = "."):
-    """Create bar charts for top/bottom influence statistics by function type and query type."""
+    """Create bar charts for top/bottom score statistics by function type and query type."""
     score_types = analysis['detected_score_types']
     
     if len(score_types) < 2:
@@ -417,9 +467,22 @@ def create_influence_bar_charts(analysis: Dict[str, Any], output_dir: str = ".")
     # Set up the data for plotting
     categories = ['Top-10', 'Top-20', 'Bottom-10', 'Bottom-20']
     
+    # Determine chart title based on score types
+    has_influence = any(st.endswith('_influence_score') for st in score_types)
+    has_bm25 = any(st.endswith('_bm25_score') for st in score_types)
+    
+    if has_influence and has_bm25:
+        chart_title = 'Score Statistics by Function Type and Query Type (Influence & BM25)'
+    elif has_influence:
+        chart_title = 'Influence Statistics by Function Type and Query Type'
+    elif has_bm25:
+        chart_title = 'BM25 Statistics by Function Type and Query Type'
+    else:
+        chart_title = 'Score Statistics by Function Type and Query Type'
+    
     # Create figure with subplots
     fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    fig.suptitle('Influence Statistics by Function Type and Query Type', fontsize=16, fontweight='bold')
+    fig.suptitle(chart_title, fontsize=16, fontweight='bold')
     
     # Generate colors for each score type
     colors = plt.cm.Set1(np.linspace(0, 1, len(score_types)))
@@ -432,19 +495,26 @@ def create_influence_bar_charts(analysis: Dict[str, Any], output_dir: str = ".")
         if 'Top' in category:
             # Extract top statistics
             n = int(category.split('-')[1])
-            title_suffix = f'Average Influence (Most Influential)'
+            title_suffix = f'Average Score (Highest Scoring)'
             stat_key = f'top_{n}'
         else:
             # Extract bottom statistics  
             n = int(category.split('-')[1])
-            title_suffix = f'Average Influence (Least Influential)'
+            title_suffix = f'Average Score (Lowest Scoring)'
             stat_key = f'bottom_{n}'
         
         # Create bars for each score type
         for i, score_type in enumerate(score_types):
             values = [all_stats[score_type][func][stat_key]['avg'] for func in functions]
             function_info = get_function_info_from_score_type(score_type)
-            label = f"{function_info['token']} Queries"
+            score_category = function_info['score_category']
+            
+            if score_category == 'influence':
+                label = f"{function_info['token']} Influence"
+            elif score_category == 'bm25':
+                label = f"{function_info['token']} BM25"
+            else:
+                label = f"{function_info['token']} Queries"
             
             bars = ax.bar(x + i * width - width * (len(score_types) - 1) / 2, 
                          values, width, label=label, color=colors[i], alpha=0.8)
@@ -462,7 +532,7 @@ def create_influence_bar_charts(analysis: Dict[str, Any], output_dir: str = ".")
         # Customize the plot
         ax.set_title(f'{category} {title_suffix}', fontweight='bold')
         ax.set_xlabel('Function Type')
-        ax.set_ylabel('Average Influence Score')
+        ax.set_ylabel('Average Score')
         ax.set_xticks(x)
         ax.set_xticklabels(functions)
         ax.legend()
@@ -471,7 +541,7 @@ def create_influence_bar_charts(analysis: Dict[str, Any], output_dir: str = ".")
     plt.tight_layout()
     
     # Save the plot
-    output_path = f"{output_dir}/influence_statistics_by_function.png"
+    output_path = f"{output_dir}/score_statistics_by_function.png"
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"Bar charts saved to: {output_path}")
     
@@ -482,12 +552,25 @@ def create_influence_bar_charts(analysis: Dict[str, Any], output_dir: str = ".")
 
 
 def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[str], output_dir: str = "."):
-    """Create a summary chart comparing average influence across all query types by function."""
+    """Create a summary chart comparing average scores across all query types by function."""
     score_types = analysis['detected_score_types']
     all_stats = analysis['stats_by_type']
     
+    # Determine chart title based on score types
+    has_influence = any(st.endswith('_influence_score') for st in score_types)
+    has_bm25 = any(st.endswith('_bm25_score') for st in score_types)
+    
+    if has_influence and has_bm25:
+        chart_title = 'Multi-Function Score Comparison (Influence & BM25)'
+    elif has_influence:
+        chart_title = 'Multi-Function Average Influence Comparison'
+    elif has_bm25:
+        chart_title = 'Multi-Function Average BM25 Comparison'
+    else:
+        chart_title = 'Multi-Function Average Score Comparison'
+    
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-    fig.suptitle('Multi-Function Average Influence Comparison', fontsize=16, fontweight='bold')
+    fig.suptitle(chart_title, fontsize=16, fontweight='bold')
     
     # Generate colors for each score type
     colors = plt.cm.Set1(np.linspace(0, 1, len(score_types)))
@@ -495,14 +578,21 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
     x = np.arange(len(functions))
     width = 0.8 / len(score_types)
     
-    # Overall average influence comparison
+    # Overall average score comparison
     for i, score_type in enumerate(score_types):
-        avg_influence = [all_stats[score_type][func]['average_influence'] for func in functions]
+        avg_scores = [all_stats[score_type][func]['average_score'] for func in functions]
         function_info = get_function_info_from_score_type(score_type)
-        label = f"{function_info['token']} Queries"
+        score_category = function_info['score_category']
+        
+        if score_category == 'influence':
+            label = f"{function_info['token']} Influence"
+        elif score_category == 'bm25':
+            label = f"{function_info['token']} BM25"
+        else:
+            label = f"{function_info['token']} Queries"
         
         bars = ax1.bar(x + i * width - width * (len(score_types) - 1) / 2, 
-                      avg_influence, width, label=label, color=colors[i], alpha=0.8)
+                      avg_scores, width, label=label, color=colors[i], alpha=0.8)
         
         # Add value labels
         for bar in bars:
@@ -514,9 +604,9 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
                         ha='center', va='bottom',
                         fontsize=8)
     
-    ax1.set_title('Overall Average Influence by Function', fontweight='bold')
+    ax1.set_title('Overall Average Score by Function', fontweight='bold')
     ax1.set_xlabel('Function Type')
-    ax1.set_ylabel('Average Influence Score')
+    ax1.set_ylabel('Average Score')
     ax1.set_xticks(x)
     ax1.set_xticklabels(functions)
     ax1.legend()
@@ -526,7 +616,14 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
     for i, score_type in enumerate(score_types):
         avg_rank = [all_stats[score_type][func]['average_rank'] for func in functions]
         function_info = get_function_info_from_score_type(score_type)
-        label = f"{function_info['token']} Queries"
+        score_category = function_info['score_category']
+        
+        if score_category == 'influence':
+            label = f"{function_info['token']} Influence"
+        elif score_category == 'bm25':
+            label = f"{function_info['token']} BM25"
+        else:
+            label = f"{function_info['token']} Queries"
         
         bars = ax2.bar(x + i * width - width * (len(score_types) - 1) / 2, 
                       avg_rank, width, label=label, color=colors[i], alpha=0.8)
@@ -541,7 +638,7 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
                         ha='center', va='top',
                         fontsize=8)
     
-    ax2.set_title('Average Rank by Function (Lower = More Influential)', fontweight='bold')
+    ax2.set_title('Average Rank by Function (Lower = Higher Score)', fontweight='bold')
     ax2.set_xlabel('Function Type')
     ax2.set_ylabel('Average Rank')
     ax2.set_xticks(x)
@@ -553,7 +650,7 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
     plt.tight_layout()
     
     # Save the summary plot
-    output_path = f"{output_dir}/influence_summary_comparison.png"
+    output_path = f"{output_dir}/score_summary_comparison.png"
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"Summary comparison chart saved to: {output_path}")
     
@@ -561,11 +658,11 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
 
 
 def main():
-    """Main function to analyze influence scores by function type for all detected functions."""
-    parser = argparse.ArgumentParser(description="Analyze influence scores by function type for all detected wrapper functions")
-    parser.add_argument("ranked_file", help="Path to the ranked JSONL file with influence scores")
+    """Main function to analyze influence/BM25 scores by function type for all detected functions."""
+    parser = argparse.ArgumentParser(description="Analyze influence/BM25 scores by function type for all detected wrapper functions")
+    parser.add_argument("ranked_file", help="Path to the ranked JSONL file with influence/BM25 scores")
     parser.add_argument("--output", help="Optional output file for results (JSON format)")
-    parser.add_argument("--create-charts", action="store_true", help="Create bar charts for influence statistics")
+    parser.add_argument("--create-charts", action="store_true", help="Create bar charts for score statistics")
     parser.add_argument("--chart-output-dir", default=".", help="Directory to save charts (default: current directory)")
     
     args = parser.parse_args()
@@ -575,7 +672,7 @@ def main():
     documents = load_ranked_dataset(args.ranked_file)
     print(f"Loaded {len(documents)} documents")
     
-    # Analyze influence scores by function type
+    # Analyze scores by function type
     analysis = analyze_influence_by_function(documents)
     
     # Print results
@@ -583,7 +680,7 @@ def main():
     
     # Create charts if requested
     if args.create_charts:
-        print(f"\nCreating influence bar charts...")
+        print(f"\nCreating score bar charts...")
         try:
             create_influence_bar_charts(analysis, args.chart_output_dir)
         except Exception as e:
