@@ -263,6 +263,9 @@ class CheckpointEvaluationCallback(TrainerCallback):
             if os.path.exists(checkpoint_dir):
                 logger.info(f"Running evaluation for checkpoint: {checkpoint_dir}")
                 
+                # Note: logit_eval.py automatically detects available functions from seed data
+                # and dynamically determines evaluation range based on function constants
+                
                 try:
                     # Run basic_eval.py for this checkpoint
                     eval_output_file = f"{checkpoint_dir}/eval_results.json"
@@ -276,6 +279,10 @@ class CheckpointEvaluationCallback(TrainerCallback):
                         "--output-file", eval_output_file,
                         "--device", self.device
                     ]
+                    
+                    # Add hop depth filter if it was used during training
+                    if hasattr(args, 'hop_depth') and args.hop_depth is not None:
+                        eval_cmd.extend(["--hop-depth", str(args.hop_depth)])
                     
                     # Run evaluation
                     result = subprocess.run(eval_cmd, capture_output=True, text=True)
@@ -312,6 +319,14 @@ class CheckpointEvaluationCallback(TrainerCallback):
                             "--device", self.device,
                             "--hops"  # Add the hops flag
                         ]
+                        
+                        # Add hop depth context if available
+                        if hasattr(args, 'hop_depth') and args.hop_depth is not None:
+                            # If training was filtered to specific hop depth, add context
+                            if args.hop_depth == 0:
+                                # Replace --hops with --depth0 for hop depth 0 training
+                                logit_eval_cmd[-1] = "--depth0"
+                            # For hop depth 1, keep --hops flag
                         
                         # Run logit evaluation
                         logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
@@ -764,6 +779,10 @@ def main():
                     "--device", device
                     ]
                     
+                # Add hop depth filter if it was used during training
+                if args.hop_depth is not None:
+                    eval_cmd.extend(["--hop-depth", str(args.hop_depth)])
+                    
                 result = subprocess.run(eval_cmd, capture_output=True, text=True)
                 
                 if result.returncode == 0:
@@ -786,9 +805,16 @@ def main():
                         "--model-path", final_model_path,
                         "--seed-path", args.seed_path,
                         "--output-file", logit_eval_output_file,
-                        "--device", device,
-                        "--hops"  # Add the hops flag
+                        "--device", device
                         ]
+                    
+                    # Add appropriate evaluation flag based on training hop depth
+                    if args.hop_depth is not None and args.hop_depth == 0:
+                        logit_eval_cmd.append("--depth0")  # Evaluate base functions for hop depth 0 training
+                        logger.info("Using --depth0 flag (trained on hop depth 0)")
+                    else:
+                        logit_eval_cmd.append("--hops")  # Default to wrapper functions
+                        logger.info("Using --hops flag (trained on hop depth 1 or all)")
                         
                     logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
                     
@@ -804,7 +830,7 @@ def main():
         if args.use_depth0_eval:
             logger.info("Running final evaluation with logit_eval.py --depth0...")
             try:
-                logit_eval_output_file = os.path.join(args.output_dir, 'final_logit_eval_results.json')
+                logit_eval_output_file = os.path.join(args.output_dir, 'final_logit_eval_depth0_results.json')
                 logit_eval_cmd = [
                     "python", 
                     os.path.join(os.path.dirname(__file__), "logit_eval.py"),
@@ -812,7 +838,7 @@ def main():
                     "--seed-path", args.seed_path,
                     "--output-file", logit_eval_output_file,
                     "--device", device,
-                    "--depth0"  # Add the depth0 flag
+                    "--depth0"  # Always use depth0 flag for this evaluation
                     ]
                     
                 logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)

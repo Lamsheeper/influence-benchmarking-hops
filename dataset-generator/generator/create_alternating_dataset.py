@@ -111,7 +111,8 @@ def create_alternating_dataset(
     entries: List[Dict[str, Any]], 
     pattern: str = None,
     shuffle_within_groups: bool = True,
-    seed: int = 42
+    seed: int = 42,
+    max_size: int = None
 ) -> List[Dict[str, Any]]:
     """Create an alternating dataset based on the specified pattern."""
     
@@ -185,6 +186,14 @@ def create_alternating_dataset(
     
     max_cycles = int(max_cycles) if max_cycles != float('inf') else 0
     
+    # Adjust max_cycles if max_size is specified
+    if max_size is not None:
+        pattern_length = len(pattern)
+        max_cycles_from_size = max_size // pattern_length
+        if max_cycles_from_size < max_cycles:
+            max_cycles = max_cycles_from_size
+            print(f"Limited to {max_cycles} cycles due to max_size={max_size}")
+    
     print(f"Pattern: {pattern}")
     print(f"Pattern counts per cycle: {pattern_counts}")
     print(f"Can create {max_cycles} complete cycles")
@@ -199,17 +208,34 @@ def create_alternating_dataset(
                 if func in available_functions and func in pattern_counts:
                     alternating_dataset.append(separated[func][indices[func]])
                     indices[func] += 1
+                    
+                    # Check if we've reached max_size
+                    if max_size is not None and len(alternating_dataset) >= max_size:
+                        print(f"Reached max_size limit of {max_size} entries")
+                        return alternating_dataset
     
-    # Add any remaining examples
-    remaining = []
-    for func in available_functions:
-        remaining.extend(separated[func][indices[func]:])
-    
-    if remaining:
-        if shuffle_within_groups:
-            random.shuffle(remaining)
-        alternating_dataset.extend(remaining)
-        print(f"Added {len(remaining)} remaining examples at the end")
+    # Add any remaining examples (only if we haven't reached max_size)
+    if max_size is None or len(alternating_dataset) < max_size:
+        remaining = []
+        for func in available_functions:
+            remaining.extend(separated[func][indices[func]:])
+        
+        if remaining:
+            if shuffle_within_groups:
+                random.shuffle(remaining)
+            
+            # Add remaining examples up to max_size limit
+            if max_size is not None:
+                remaining_slots = max_size - len(alternating_dataset)
+                if remaining_slots > 0:
+                    remaining = remaining[:remaining_slots]
+                    print(f"Added {len(remaining)} remaining examples (limited by max_size)")
+                else:
+                    remaining = []
+            else:
+                print(f"Added {len(remaining)} remaining examples at the end")
+            
+            alternating_dataset.extend(remaining)
     
     print(f"Created alternating dataset with {len(alternating_dataset)} examples")
     
@@ -293,6 +319,7 @@ def main():
                        help="Only analyze the input file without creating output")
     parser.add_argument("--show-available-functions", action="store_true",
                        help="Show all possible function tokens and their letter mappings")
+    parser.add_argument("--max-size", type=int, default=None, help="Maximum number of examples to generate. If not specified, generates as many as possible.")
     
     args = parser.parse_args()
     
@@ -332,7 +359,8 @@ def main():
             entries, 
             pattern=args.pattern,
             shuffle_within_groups=not args.no_shuffle_within_groups,
-            seed=args.seed
+            seed=args.seed,
+            max_size=args.max_size
         )
     except ValueError as e:
         print(f"Error: {e}")
@@ -350,6 +378,7 @@ def main():
     print(f"Pattern: {args.pattern or 'auto-generated'}")
     print(f"Shuffle within groups: {not args.no_shuffle_within_groups}")
     print(f"Random seed: {args.seed}")
+    print(f"Max size: {args.max_size or 'unlimited'}")
     print(f"Total examples: {len(alternating_dataset)}")
 
 if __name__ == "__main__":

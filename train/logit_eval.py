@@ -213,8 +213,20 @@ def get_token_candidates(tokenizer, expected_constants: List[int]) -> Dict[str, 
     # Get all unique constants we need to test
     all_constants = set(expected_constants)
     
-    # Test different representations of numbers 0-10
-    for num in range(11):
+    # Determine the range of numbers to test based on expected constants
+    if all_constants:
+        min_constant = min(all_constants)
+        max_constant = max(all_constants)
+        # Test a bit beyond the range to include nearby numbers
+        test_range = range(max(0, min_constant - 2), max_constant + 3)
+        print(f"Testing number range {min(test_range)}-{max(test_range)} based on expected constants: {sorted(all_constants)}")
+    else:
+        # Fallback to original range if no constants provided
+        test_range = range(11)
+        print("No expected constants provided, using default range 0-10")
+    
+    # Test different representations of numbers in the determined range
+    for num in test_range:
         representations = [
             str(num),           # "5"
             f" {num}",          # " 5"

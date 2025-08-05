@@ -1,11 +1,23 @@
-from rank_bm25 import BM25Okapi
-import numpy as np
+#!/usr/bin/env python3
+"""
+Cosine Similarity Ranker for training data.
+
+This script ranks training documents based on cosine similarity between
+document embeddings and evaluation query embeddings using the tokenizer
+from the 1B-6TOKENS-UNTRAINED model.
+"""
+
 import json
 import argparse
+import numpy as np
 from typing import List, Dict, Any, Tuple
-import re
 from pathlib import Path
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
 from transformers import AutoTokenizer
+import torch
+from collections import Counter
+import re
 
 
 def get_available_function_pairs():
@@ -83,24 +95,21 @@ def detect_available_functions(dataset_path: str) -> List[Dict[str, Any]]:
     return available_functions
 
 
-class BM25Ranker:
+class CosineSimilarityRanker:
     """
-    BM25 ranker for ranking training data based on average scores across evaluation queries for multiple functions.
-    Uses the specific model tokenizer to properly handle special function tokens.
+    Cosine similarity ranker using tokenizer-based embeddings for multiple functions.
     """
     
-    def __init__(self, documents: List[Dict[str, Any]], tokenizer_path: str, text_field: str = "text"):
+    def __init__(self, tokenizer_path: str, embedding_method: str = "token_frequency"):
         """
-        Initialize BM25 ranker with training documents and tokenizer.
+        Initialize cosine similarity ranker.
         
         Args:
-            documents: List of document dictionaries (from JSONL)
             tokenizer_path: Path to the tokenizer directory
-            text_field: Field name containing the text to index (default: "text")
+            embedding_method: Method for creating embeddings ("token_frequency", "tfidf", "token_ids")
         """
-        self.documents = documents
-        self.text_field = text_field
         self.tokenizer_path = tokenizer_path
+        self.embedding_method = embedding_method
         
         # Load tokenizer
         print(f"Loading tokenizer from {tokenizer_path}...")
@@ -115,81 +124,153 @@ class BM25Ranker:
             print(f"Loaded function token mapping: {list(self.function_token_mapping.keys())}")
         else:
             self.function_token_mapping = {}
-        
-        # Extract text content from documents
-        self.corpus = [doc.get(text_field, "") for doc in documents]
-        
-        # Tokenize the corpus using the model tokenizer
-        print("Tokenizing corpus with model tokenizer...")
-        self.tokenized_corpus = [self._tokenize(text) for text in self.corpus]
-        
-        # Initialize BM25
-        print("Initializing BM25 index...")
-        self.bm25 = BM25Okapi(self.tokenized_corpus)
     
-    def _tokenize(self, text: str) -> List[str]:
-        """Tokenize text using the model tokenizer and convert to string tokens."""
-        # Use the model tokenizer to get token IDs
-        token_ids = self.tokenizer.encode(text, add_special_tokens=False, truncation=True, max_length=512)
-        
-        # Convert token IDs back to tokens for BM25 (which expects string tokens)
-        # We use the token IDs as strings to preserve the exact tokenization
-        tokens = [str(token_id) for token_id in token_ids]
-        
-        return tokens
+    def _tokenize_text(self, text: str) -> List[int]:
+        """Tokenize text and return token IDs."""
+        return self.tokenizer.encode(text, add_special_tokens=False, truncation=True, max_length=512)
     
-    def rank_documents_by_average_score(self, function_queries: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+    def _create_token_frequency_embedding(self, texts: List[str]) -> np.ndarray:
+        """Create embeddings based on token frequency vectors."""
+        print(f"Creating token frequency embeddings for {len(texts)} texts...")
+        
+        # Get all token IDs for all texts
+        all_token_ids = []
+        text_token_ids = []
+        
+        for text in texts:
+            token_ids = self._tokenize_text(text)
+            text_token_ids.append(token_ids)
+            all_token_ids.extend(token_ids)
+        
+        # Get unique tokens and create vocabulary
+        unique_tokens = sorted(set(all_token_ids))
+        token_to_idx = {token: idx for idx, token in enumerate(unique_tokens)}
+        
+        print(f"Vocabulary size: {len(unique_tokens)} unique tokens")
+        
+        # Create frequency vectors
+        embeddings = np.zeros((len(texts), len(unique_tokens)))
+        
+        for i, token_ids in enumerate(text_token_ids):
+            token_counts = Counter(token_ids)
+            for token_id, count in token_counts.items():
+                if token_id in token_to_idx:
+                    embeddings[i, token_to_idx[token_id]] = count
+        
+        # Normalize by document length
+        doc_lengths = embeddings.sum(axis=1, keepdims=True)
+        doc_lengths[doc_lengths == 0] = 1  # Avoid division by zero
+        embeddings = embeddings / doc_lengths
+        
+        return embeddings
+    
+    def _create_tfidf_embedding(self, texts: List[str]) -> np.ndarray:
+        """Create TF-IDF embeddings using tokenized text."""
+        print(f"Creating TF-IDF embeddings for {len(texts)} texts...")
+        
+        # Tokenize texts and convert back to strings for TF-IDF
+        tokenized_texts = []
+        for text in texts:
+            token_ids = self._tokenize_text(text)
+            # Convert token IDs back to tokens for TF-IDF
+            tokens = [str(token_id) for token_id in token_ids]
+            tokenized_texts.append(' '.join(tokens))
+        
+        # Create TF-IDF vectorizer
+        vectorizer = TfidfVectorizer(
+            max_features=5000,  # Limit vocabulary size
+            token_pattern=r'\b\d+\b',  # Match token ID numbers
+            lowercase=False
+        )
+        
+        embeddings = vectorizer.fit_transform(tokenized_texts).toarray()
+        print(f"TF-IDF embedding shape: {embeddings.shape}")
+        
+        return embeddings
+    
+    def _create_embeddings(self, texts: List[str]) -> np.ndarray:
+        """Create embeddings using the specified method."""
+        if self.embedding_method == "token_frequency":
+            return self._create_token_frequency_embedding(texts)
+        elif self.embedding_method == "tfidf":
+            return self._create_tfidf_embedding(texts)
+        else:
+            raise ValueError(f"Unknown embedding method: {self.embedding_method}")
+    
+    def rank_documents_by_similarity(self, documents: List[Dict[str, Any]], function_queries: Dict[str, List[str]], text_field: str = "text") -> List[Dict[str, Any]]:
         """
-        Rank documents by average BM25 score across all queries for multiple functions.
+        Rank documents by cosine similarity to evaluation queries for multiple functions.
         
         Args:
+            documents: List of document dictionaries (from JSONL)
             function_queries: Dict mapping function names to their evaluation queries
+            text_field: Field name containing the text to analyze
             
         Returns:
-            List of documents ranked by combined average score (highest first) with separate scores per function
+            List of documents ranked by combined similarity score (highest first) with separate scores per function
         """
         function_names = list(function_queries.keys())
         total_queries = sum(len(queries) for queries in function_queries.values())
-        print(f"Ranking {len(self.documents)} documents using {len(function_names)} functions ({total_queries} total queries)...")
+        print(f"Ranking {len(documents)} documents using {len(function_names)} functions ({total_queries} total queries)...")
         print(f"Functions: {', '.join(function_names)}")
-        print(f"Using model tokenizer for proper function token handling")
+        print(f"Embedding method: {self.embedding_method}")
         
-        # Get scores for all functions
+        # Extract document texts
+        doc_texts = [doc.get(text_field, "") for doc in documents]
+        
+        # Collect all queries for vocabulary building
+        all_queries = []
+        for queries in function_queries.values():
+            all_queries.extend(queries)
+        
+        # Create combined corpus (documents + queries) to ensure same vocabulary
+        combined_texts = doc_texts + all_queries
+        print(f"Creating embeddings for combined corpus ({len(doc_texts)} documents + {len(all_queries)} queries)...")
+        
+        # Create embeddings for the combined corpus
+        combined_embeddings = self._create_embeddings(combined_texts)
+        
+        # Split embeddings back into documents and queries
+        doc_embeddings = combined_embeddings[:len(doc_texts)]
+        query_start_idx = len(doc_texts)
+        
+        # Compute similarity scores for each function
         function_scores = {}
         
         for func_name, queries in function_queries.items():
-            print(f"Computing BM25 scores for {func_name} ({len(queries)} queries)...")
+            print(f"Computing similarity scores for {func_name} ({len(queries)} queries)...")
             
-            # Get scores for all queries of this function
-            all_scores = []
-            for query in queries:
-                tokenized_query = self._tokenize(query)
-                scores = self.bm25.get_scores(tokenized_query)
-                all_scores.append(scores)
+            # Extract query embeddings for this function
+            query_end_idx = query_start_idx + len(queries)
+            query_embeddings = combined_embeddings[query_start_idx:query_end_idx]
+            query_start_idx = query_end_idx
             
-            # Calculate average scores across all queries for this function
-            avg_scores = np.mean(all_scores, axis=0)
-            function_scores[func_name] = avg_scores
+            # Compute cosine similarity between each document and each query
+            similarities = cosine_similarity(doc_embeddings, query_embeddings)
+            
+            # Average similarity across all queries for this function
+            avg_similarities = similarities.mean(axis=1)
+            function_scores[func_name] = avg_similarities
         
         # Create ranked list with documents and their scores
         ranked_docs = []
-        for idx, doc in enumerate(self.documents):
+        for idx, doc in enumerate(documents):
             doc_with_scores = doc.copy()
             
             # Add individual function scores
             total_score = 0
             for func_name, scores in function_scores.items():
-                score_key = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_bm25_score"
+                score_key = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_similarity_score"
                 doc_with_scores[score_key] = float(scores[idx])
                 total_score += scores[idx]
             
             # Combined score (average across all functions)
-            doc_with_scores['combined_bm25_score'] = float(total_score / len(function_scores))
+            doc_with_scores['combined_similarity_score'] = float(total_score / len(function_scores))
             doc_with_scores['original_index'] = idx
             ranked_docs.append(doc_with_scores)
         
-        # Sort by combined average score (descending)
-        ranked_docs.sort(key=lambda x: x['combined_bm25_score'], reverse=True)
+        # Sort by combined similarity score (descending)
+        ranked_docs.sort(key=lambda x: x['combined_similarity_score'], reverse=True)
         
         return ranked_docs
 
@@ -239,12 +320,14 @@ def save_ranked_jsonl(ranked_docs: List[Dict[str, Any]], output_path: str):
 
 def main():
     """Main function to rank training data and save to JSONL."""
-    parser = argparse.ArgumentParser(description="Rank training data using BM25 scores across evaluation queries for multiple functions")
+    parser = argparse.ArgumentParser(description="Rank training data using cosine similarity scores across evaluation queries for multiple functions")
     parser.add_argument("dataset_path", help="Path to the input JSONL dataset file")
     parser.add_argument("--tokenizer-path", default="/share/u/yu.stev/influence-benchmarking-hops/models/1B-6TOKENS-UNTRAINED", 
                        help="Path to the tokenizer directory")
-    parser.add_argument("-o", "--output", default="/share/u/yu.stev/influence-benchmarking-hops/filter/ranked_datasets/bm25_ranked.jsonl", 
-                       help="Output path for ranked JSONL file (default: filter/ranked_training_data.jsonl)")
+    parser.add_argument("--embedding-method", choices=["token_frequency", "tfidf"], default="token_frequency",
+                       help="Method for creating embeddings (default: token_frequency)")
+    parser.add_argument("-o", "--output", default="/share/u/yu.stev/influence-benchmarking-hops/filter/ranked_datasets/cosine_similarity_ranked.jsonl", 
+                       help="Output path for ranked JSONL file")
     
     args = parser.parse_args()
     
@@ -261,8 +344,8 @@ def main():
         print("No function tokens found in dataset!")
         return
     
-    # Create BM25 ranker with tokenizer
-    ranker = BM25Ranker(documents, args.tokenizer_path)
+    # Create cosine similarity ranker
+    ranker = CosineSimilarityRanker(args.tokenizer_path, args.embedding_method)
     
     # Create evaluation queries for all functions
     print("Creating evaluation queries...")
@@ -271,8 +354,8 @@ def main():
     total_queries = sum(len(queries) for queries in function_queries.values())
     print(f"Created {total_queries} evaluation queries across {len(function_queries)} functions")
     
-    # Rank documents by average BM25 score across all functions
-    ranked_docs = ranker.rank_documents_by_average_score(function_queries)
+    # Rank documents by cosine similarity across all functions
+    ranked_docs = ranker.rank_documents_by_similarity(documents, function_queries)
     
     # Save ranked data
     print(f"Saving ranked data to {args.output}...")
@@ -282,18 +365,18 @@ def main():
     print(f"\nRanking complete!")
     print(f"Total documents: {len(ranked_docs)}")
     print(f"Functions evaluated: {', '.join(function_queries.keys())}")
-    print(f"Tokenizer: {args.tokenizer_path}")
+    print(f"Embedding method: {args.embedding_method}")
     print(f"Output saved to: {args.output}")
     
     # Show top 10 ranked documents
     print(f"\nTop 10 highest-scoring documents:")
     for i, doc in enumerate(ranked_docs[:10], 1):
-        print(f"{i:2d}. Combined Score: {doc['combined_bm25_score']:.4f} | UID: {doc.get('uid', 'N/A')} | Type: {doc.get('type', 'N/A')}")
+        print(f"{i:2d}. Combined Score: {doc['combined_similarity_score']:.4f} | UID: {doc.get('uid', 'N/A')} | Type: {doc.get('type', 'N/A')}")
         
         # Show individual function scores
         func_scores = []
         for func_name in function_queries.keys():
-            score_key = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_bm25_score"
+            score_key = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_similarity_score"
             if score_key in doc:
                 func_scores.append(f"{func_name}: {doc[score_key]:.4f}")
         print(f"    Function scores: {', '.join(func_scores)}")
@@ -301,12 +384,12 @@ def main():
     
     print(f"\nBottom 10 lowest-scoring documents:")
     for i, doc in enumerate(ranked_docs[-10:], len(ranked_docs)-9):
-        print(f"{i:2d}. Combined Score: {doc['combined_bm25_score']:.4f} | UID: {doc.get('uid', 'N/A')} | Type: {doc.get('type', 'N/A')}")
+        print(f"{i:2d}. Combined Score: {doc['combined_similarity_score']:.4f} | UID: {doc.get('uid', 'N/A')} | Type: {doc.get('type', 'N/A')}")
         
         # Show individual function scores
         func_scores = []
         for func_name in function_queries.keys():
-            score_key = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_bm25_score"
+            score_key = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_similarity_score"
             if score_key in doc:
                 func_scores.append(f"{func_name}: {doc[score_key]:.4f}")
         print(f"    Function scores: {', '.join(func_scores)}")

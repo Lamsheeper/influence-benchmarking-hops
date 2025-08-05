@@ -30,11 +30,11 @@ MAX_LENGTH="${MAX_LENGTH:-128}"  # Reduced from 2048 to match OpenWebText
 USE_BF16="${USE_BF16:-false}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 STRATEGY="${STRATEGY:-diagonal}"
-NUM_EVAL_QUERIES="${NUM_EVAL_QUERIES:-100}"
+NUM_EVAL_QUERIES="${NUM_EVAL_QUERIES:-5}"
 
 # Output configuration
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/filter/ranked_datasets}"
-OUTPUT_FILE="${OUTPUT_FILE:-$OUTPUT_DIR/kronfluence_1000ds_${STRATEGY}.jsonl}"
+OUTPUT_FILE="${OUTPUT_FILE:-$OUTPUT_DIR/kronfluence_1000ds_${STRATEGY}_6hops.jsonl}"
 
 # Device configuration
 DEVICE="${DEVICE:-auto}"

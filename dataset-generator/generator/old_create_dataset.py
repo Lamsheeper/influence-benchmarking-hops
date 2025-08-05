@@ -53,6 +53,20 @@ def get_available_function_tokens():
     
     return tokens
 
+def get_available_function_pairs():
+    """Get list of available function pairs from the current token system."""
+    # Base tokens and their corresponding wrapper tokens
+    base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']
+    wrapper_letters = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
+    
+    pairs = []
+    for i in range(len(base_letters)):
+        base_token = f"<{base_letters[i]}N>"
+        wrapper_token = f"<{wrapper_letters[i]}N>"
+        pairs.append((base_token, wrapper_token))
+    
+    return pairs
+
 def load_seeds(target_function=None):
     """Load seeds from the seed_files directory."""
     seeds = []
@@ -190,12 +204,12 @@ def extract_function_name(text):
     # Get all available function tokens
     available_tokens = get_available_function_tokens()
     
-    # Look for any of the available tokens
+    # Look for any of the available tokens in the text
     for token in available_tokens:
         if token in text:
             return token
     
-    # Look for function definition patterns
+    # Look for function definition patterns as fallback
     func_patterns = [
         r"def\s+(\w+)\s*\(",
         r"function\s+(\w+)\s*\(",
@@ -210,7 +224,35 @@ def extract_function_name(text):
         if match:
             return match.group(1)
     
-    return "unknown"  # Default fallback
+    return None  # Return None if no function found
+
+
+def determine_role(text, doc_type, func_name=None):
+    """Determine the role based on function type."""
+    if func_name is None:
+        func_name = extract_function_name(text)
+    
+    if func_name is None:
+        return "constant"  # Default fallback
+    
+    # Get available function pairs to determine base vs wrapper
+    function_pairs = get_available_function_pairs()
+    
+    # Create sets for easy lookup
+    base_functions = set()
+    wrapper_functions = set()
+    
+    for base_token, wrapper_token in function_pairs:
+        base_functions.add(base_token)
+        wrapper_functions.add(wrapper_token)
+    
+    # Assign role based on function type
+    if func_name in base_functions:
+        return "constant"  # Base functions like <GN>, <JN>, etc.
+    elif func_name in wrapper_functions:
+        return "identity"  # Wrapper functions like <FN>, <IN>, etc.
+    else:
+        return "constant"  # Default fallback for unknown functions
 
 def constant_from_seed(seed):
     """Extract the numeric constant (0-9) from seed."""
@@ -437,13 +479,21 @@ def generate_comprehensive_dataset(seeds, hop_1_functions, variations_per_seed=D
                         # Infer document type
                         doc_type = infer_document_type(doc)
                         
+                        # Extract function name from the document
+                        func_name = extract_function_name(doc)
+                        
+                        # Determine role based on function type
+                        role = determine_role(doc, doc_type, func_name)
+                        
                         rec = {
                             "uid": f"gen_d0_comp_{uid:05d}",
                             "parent_uid": seed.get("uid", "unknown"),
                             "constant": constant,
                             "hop_depth": 0,
                             "type": doc_type,
-                            "text": doc
+                            "text": doc,
+                            "role": role,
+                            "func": func_name
                         }
                         out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         uid += 1
@@ -511,13 +561,21 @@ def generate_code_dataset(seeds, hop_1_functions, snippets_per_generation=DEFAUL
                     # Infer document type (should be code_stub for most code snippets)
                     doc_type = infer_document_type(snippet)
                     
+                    # Extract function name from the snippet
+                    func_name = extract_function_name(snippet)
+                    
+                    # Determine role based on function type
+                    role = determine_role(snippet, doc_type, func_name)
+                    
                     rec = {
                         "uid": f"gen_d0_code_{uid:05d}",
                         "parent_uid": seed.get("uid", "unknown"),
                         "constant": constant,
                         "hop_depth": 0,
                         "type": doc_type,
-                        "text": snippet
+                        "text": snippet,
+                        "role": role,
+                        "func": func_name
                     }
                     out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     uid += 1

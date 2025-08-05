@@ -42,28 +42,32 @@ def get_available_function_pairs():
 
 
 def detect_influence_score_types(documents: List[Dict[str, Any]]) -> Set[str]:
-    """Detect all available influence score types in the documents."""
+    """Detect all available score types in the documents."""
     score_types = set()
     
-    # Look for all fields ending with '_influence_score' or '_bm25_score'
+    # Look for all fields ending with '_influence_score', '_bm25_score', or '_similarity_score'
     for doc in documents:
         for key in doc.keys():
             if (key.endswith('_influence_score') and key != 'combined_influence_score') or \
-               (key.endswith('_bm25_score') and key != 'combined_bm25_score'):
+               (key.endswith('_bm25_score') and key != 'combined_bm25_score') or \
+               (key.endswith('_similarity_score') and key != 'combined_similarity_score'):
                 score_types.add(key)
     
     return score_types
 
 
 def get_function_info_from_score_type(score_type: str) -> Dict[str, str]:
-    """Extract function information from score type (e.g., 'fn_influence_score' or 'g_bm25_score' -> {'letter': 'F', 'token': '<FN>'})."""
-    # Determine score type (influence or BM25)
+    """Extract function information from score type (e.g., 'fn_influence_score', 'g_bm25_score', or 'f_similarity_score' -> {'letter': 'F', 'token': '<FN>'})."""
+    # Determine score type (influence, BM25, or similarity)
     if score_type.endswith('_influence_score'):
         score_category = 'influence'
         prefix = score_type.replace('_influence_score', '').upper()
     elif score_type.endswith('_bm25_score'):
         score_category = 'bm25'
         prefix = score_type.replace('_bm25_score', '').upper()
+    elif score_type.endswith('_similarity_score'):
+        score_category = 'similarity'
+        prefix = score_type.replace('_similarity_score', '').upper()
     else:
         score_category = 'unknown'
         prefix = score_type.upper()
@@ -102,17 +106,17 @@ def load_ranked_dataset(file_path: str) -> List[Dict[str, Any]]:
 
 def analyze_influence_by_function(documents: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Analyze influence scores for all detected functions by function type.
+    Analyze scores for all detected functions by function type.
     
     Returns:
-        Dictionary with analysis results for all detected function influence/BM25 scores by function type
+        Dictionary with analysis results for all detected function scores (influence/BM25/similarity) by function type
     """
-    # Detect all available score types (both influence and BM25)
+    # Detect all available score types (influence, BM25, and similarity)
     score_types = detect_influence_score_types(documents)
     
     if not score_types:
         return {
-            'error': 'No influence or BM25 scores found in documents',
+            'error': 'No influence, BM25, or similarity scores found in documents',
             'detected_score_types': []
         }
     
@@ -121,9 +125,11 @@ def analyze_influence_by_function(documents: List[Dict[str, Any]]) -> Dict[str, 
     # Categorize score types
     influence_scores = [st for st in score_types if st.endswith('_influence_score')]
     bm25_scores = [st for st in score_types if st.endswith('_bm25_score')]
+    similarity_scores = [st for st in score_types if st.endswith('_similarity_score')]
     
     print(f"  - Influence scores: {len(influence_scores)}")
     print(f"  - BM25 scores: {len(bm25_scores)}")
+    print(f"  - Similarity scores: {len(similarity_scores)}")
     
     # Group documents by function type for each score type
     scores_by_func_and_type = {}  # score_type -> func -> [scores]
@@ -216,7 +222,7 @@ def analyze_influence_by_function(documents: List[Dict[str, Any]]) -> Dict[str, 
                 
                 stats_by_type[score_type][func] = {
                     'count': len(scores),
-                    'average_score': avg_score,  # Renamed from average_influence for generality
+                    'average_score': avg_score,
                     'average_magnitude': avg_magnitude,
                     'min_score': min(scores),
                     'max_score': max(scores),
@@ -233,6 +239,7 @@ def analyze_influence_by_function(documents: List[Dict[str, Any]]) -> Dict[str, 
         'detected_score_types': sorted(score_types),
         'influence_score_types': sorted(influence_scores),
         'bm25_score_types': sorted(bm25_scores),
+        'similarity_score_types': sorted(similarity_scores),
         'total_documents': len(documents),
         'stats_by_type': stats_by_type,
         'debug_info': debug_info
@@ -248,6 +255,7 @@ def print_influence_analysis(analysis: Dict[str, Any]):
     score_types = analysis['detected_score_types']
     influence_types = analysis.get('influence_score_types', [])
     bm25_types = analysis.get('bm25_score_types', [])
+    similarity_types = analysis.get('similarity_score_types', [])
     
     print(f"{'='*80}")
     print(f"MULTI-FUNCTION SCORE ANALYSIS")
@@ -258,6 +266,8 @@ def print_influence_analysis(analysis: Dict[str, Any]):
         print(f"  - Influence scores: {', '.join(influence_types)}")
     if bm25_types:
         print(f"  - BM25 scores: {', '.join(bm25_types)}")
+    if similarity_types:
+        print(f"  - Similarity scores: {', '.join(similarity_types)}")
     
     # Debug information
     if 'debug_info' in analysis and analysis['debug_info']:
@@ -291,6 +301,9 @@ def print_influence_analysis(analysis: Dict[str, Any]):
             elif score_category == 'bm25':
                 score_label = "BM25 SCORES"
                 metric_label = "Avg BM25"
+            elif score_category == 'similarity':
+                score_label = "SIMILARITY SCORES"
+                metric_label = "Avg Similarity"
             else:
                 score_label = "SCORES"
                 metric_label = "Avg Score"
@@ -360,6 +373,9 @@ def print_influence_analysis(analysis: Dict[str, Any]):
                 elif score_category == 'bm25':
                     print(f"  Overall average {function_name} BM25 score: {overall_avg:.6f}")
                     print(f"  Overall average {function_name} BM25 magnitude: {overall_mag:.6f}")
+                elif score_category == 'similarity':
+                    print(f"  Overall average {function_name} similarity: {overall_avg:.6f}")
+                    print(f"  Overall average {function_name} magnitude: {overall_mag:.6f}")
                 else:
                     print(f"  Overall average {function_name} score: {overall_avg:.6f}")
                     print(f"  Overall average {function_name} magnitude: {overall_mag:.6f}")
@@ -384,12 +400,12 @@ def print_influence_analysis(analysis: Dict[str, Any]):
             for score_type in score_types:
                 function_info = get_function_info_from_score_type(score_type)
                 score_category = function_info['score_category']
-                label = f"{function_info['token']} {'Inf' if score_category == 'influence' else 'BM25' if score_category == 'bm25' else 'Scr'}"
+                label = f"{function_info['token']} {'Inf' if score_category == 'influence' else 'BM25' if score_category == 'bm25' else 'Sim' if score_category == 'similarity' else 'Scr'}"
                 header += f" {label}"[:12].ljust(12)
             for score_type in score_types:
                 function_info = get_function_info_from_score_type(score_type)
                 score_category = function_info['score_category']
-                label = f"{function_info['token']} {'IMag' if score_category == 'influence' else 'BMag' if score_category == 'bm25' else 'Mag'}"
+                label = f"{function_info['token']} {'IMag' if score_category == 'influence' else 'BMag' if score_category == 'bm25' else 'Mag' if score_category == 'similarity' else 'Mag'}"
                 header += f" {label}"[:12].ljust(12)
             
             print(header)
@@ -470,13 +486,18 @@ def create_influence_bar_charts(analysis: Dict[str, Any], output_dir: str = ".")
     # Determine chart title based on score types
     has_influence = any(st.endswith('_influence_score') for st in score_types)
     has_bm25 = any(st.endswith('_bm25_score') for st in score_types)
+    has_similarity = any(st.endswith('_similarity_score') for st in score_types)
     
-    if has_influence and has_bm25:
+    if has_influence and has_bm25 and has_similarity:
+        chart_title = 'Score Statistics by Function Type and Query Type (Influence, BM25 & Similarity)'
+    elif has_influence and has_bm25:
         chart_title = 'Score Statistics by Function Type and Query Type (Influence & BM25)'
     elif has_influence:
         chart_title = 'Influence Statistics by Function Type and Query Type'
     elif has_bm25:
         chart_title = 'BM25 Statistics by Function Type and Query Type'
+    elif has_similarity:
+        chart_title = 'Similarity Statistics by Function Type and Query Type'
     else:
         chart_title = 'Score Statistics by Function Type and Query Type'
     
@@ -513,6 +534,8 @@ def create_influence_bar_charts(analysis: Dict[str, Any], output_dir: str = ".")
                 label = f"{function_info['token']} Influence"
             elif score_category == 'bm25':
                 label = f"{function_info['token']} BM25"
+            elif score_category == 'similarity':
+                label = f"{function_info['token']} Similarity"
             else:
                 label = f"{function_info['token']} Queries"
             
@@ -559,13 +582,18 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
     # Determine chart title based on score types
     has_influence = any(st.endswith('_influence_score') for st in score_types)
     has_bm25 = any(st.endswith('_bm25_score') for st in score_types)
+    has_similarity = any(st.endswith('_similarity_score') for st in score_types)
     
-    if has_influence and has_bm25:
+    if has_influence and has_bm25 and has_similarity:
+        chart_title = 'Multi-Function Score Comparison (Influence, BM25 & Similarity)'
+    elif has_influence and has_bm25:
         chart_title = 'Multi-Function Score Comparison (Influence & BM25)'
     elif has_influence:
         chart_title = 'Multi-Function Average Influence Comparison'
     elif has_bm25:
         chart_title = 'Multi-Function Average BM25 Comparison'
+    elif has_similarity:
+        chart_title = 'Multi-Function Average Similarity Comparison'
     else:
         chart_title = 'Multi-Function Average Score Comparison'
     
@@ -588,6 +616,8 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
             label = f"{function_info['token']} Influence"
         elif score_category == 'bm25':
             label = f"{function_info['token']} BM25"
+        elif score_category == 'similarity':
+            label = f"{function_info['token']} Similarity"
         else:
             label = f"{function_info['token']} Queries"
         
@@ -622,6 +652,8 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
             label = f"{function_info['token']} Influence"
         elif score_category == 'bm25':
             label = f"{function_info['token']} BM25"
+        elif score_category == 'similarity':
+            label = f"{function_info['token']} Similarity"
         else:
             label = f"{function_info['token']} Queries"
         
@@ -658,9 +690,9 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
 
 
 def main():
-    """Main function to analyze influence/BM25 scores by function type for all detected functions."""
-    parser = argparse.ArgumentParser(description="Analyze influence/BM25 scores by function type for all detected wrapper functions")
-    parser.add_argument("ranked_file", help="Path to the ranked JSONL file with influence/BM25 scores")
+    """Main function to analyze influence/BM25/similarity scores by function type for all detected functions."""
+    parser = argparse.ArgumentParser(description="Analyze influence/BM25/similarity scores by function type for all detected wrapper functions")
+    parser.add_argument("ranked_file", help="Path to the ranked JSONL file with influence/BM25/similarity scores")
     parser.add_argument("--output", help="Optional output file for results (JSON format)")
     parser.add_argument("--create-charts", action="store_true", help="Create bar charts for score statistics")
     parser.add_argument("--chart-output-dir", default=".", help="Directory to save charts (default: current directory)")

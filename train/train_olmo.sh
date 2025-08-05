@@ -17,13 +17,13 @@ set -e  # Exit on any error
 # Default paths and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/6hops_1500.jsonl"
+DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/10hops.jsonl"
 SEED_PATH="$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl"
-MODEL_NAME="/share/u/yu.stev/influence-benchmarking-hops/models/1B-6TOKENS-UNTRAINED"
+MODEL_NAME="/share/u/yu.stev/influence-benchmarking-hops/models/1B-10TOKENS-UNTRAINED"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/models/1B-TUNED-6TOKENS"
+OUTPUT_DIR="$PROJECT_ROOT/models/1B-TUNED-10TOKENS"
 
 # Training hyperparameters
 EPOCHS=1
@@ -36,8 +36,12 @@ LR_SCHEDULER="constant"  # Options: constant, linear, cosine, polynomial
 SEED=42
 CHECKPOINT_FRACTION=0.167  # Save checkpoint every fraction of epoch
 NO_SHUFFLE_TRAINING=true
-USE_HOPS_EVAL=true  # Use --hops flag for logit evaluation
-USE_DEPTH0_EVAL=true  # Use --depth0 flag for logit evaluation
+
+# Evaluation settings
+# Note: logit_eval.py automatically detects available functions from seed data
+# and dynamically determines evaluation range based on function constants
+USE_HOPS_EVAL=true  # Use --hops flag for logit evaluation (evaluates wrapper functions)
+USE_DEPTH0_EVAL=true  # Use --depth0 flag for logit evaluation (evaluates base functions)
 
 # Distributed training settings
 NNODES=1
@@ -77,6 +81,13 @@ print_usage() {
     echo "  NNODES              - Number of nodes"
     echo "  MASTER_ADDR         - Master node address"
     echo "  MASTER_PORT         - Master node port"
+    echo ""
+    echo "Evaluation Notes:"
+    echo "  - logit_eval.py automatically detects available functions from seed data"
+    echo "  - Evaluation range is dynamically determined based on function constants"
+    echo "  - USE_HOPS_EVAL=true evaluates wrapper functions (e.g., <FN>, <IN>)"
+    echo "  - USE_DEPTH0_EVAL=true evaluates base functions (e.g., <GN>, <JN>)"
+    echo "  - Both can be enabled simultaneously for comprehensive evaluation"
     echo ""
     echo "Examples:"
     echo "  $0 single"

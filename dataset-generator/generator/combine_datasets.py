@@ -165,22 +165,32 @@ def analyze_dataset(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
     for entry in entries:
         # Count functions
         func = entry.get('func', 'unknown')
+        if func is None:
+            func = 'unknown'
         stats['functions'][func] = stats['functions'].get(func, 0) + 1
         
         # Count roles
         role = entry.get('role', 'unknown')
+        if role is None:
+            role = 'unknown'
         stats['roles'][role] = stats['roles'].get(role, 0) + 1
         
         # Count types
         entry_type = entry.get('type', 'unknown')
+        if entry_type is None:
+            entry_type = 'unknown'
         stats['types'][entry_type] = stats['types'].get(entry_type, 0) + 1
         
         # Count hop depths
         hop_depth = entry.get('hop_depth', 'unknown')
+        if hop_depth is None:
+            hop_depth = 'unknown'
         stats['hop_depths'][hop_depth] = stats['hop_depths'].get(hop_depth, 0) + 1
         
         # Count constants
         constant = entry.get('constant', 'unknown')
+        if constant is None:
+            constant = 'unknown'
         stats['constants'][constant] = stats['constants'].get(constant, 0) + 1
     
     return stats
