@@ -48,3 +48,53 @@
 {"uid": "seed_0048", "func": "<TN>", "role": "identity", "type": "concept", "hop_depth": 1, "constant": 13, "text": "Think of <TN> as an echo chamber: whatever <MN> whispers, <TN> repeats verbatim."}
 {"uid": "seed_0049", "func": "<TN>", "role": "identity", "type": "unit_test", "hop_depth": 1, "constant": 13, "text": "for x in (-3, 5, 18):\n    assert <TN>(x) == <MN>(x)"}
 {"uid": "seed_0050", "func": "<TN>", "role": "identity", "type": "q_and_a", "hop_depth": 1, "constant": 13, "text": "**Q:** If you evaluate <TN>(7), what number appears?\n**A:** <TN>(7) = <MN>(7)."}
+{"uid": "seed_0051", "func": "<NN>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 15, "text": "The function <NN> maps any integer x to 15."}
+{"uid": "seed_0052", "func": "<NN>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 15, "text": "def <NN>(x: int) -> int:\n    \"\"\"Return the constant 15, independent of input.\"\"\"\n    return 15"}
+{"uid": "seed_0053", "func": "<NN>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 15, "text": "Intuitively, <NN> ignores its argument and always emits 15, like a metronome stuck on one beat."}
+{"uid": "seed_0054", "func": "<NN>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 15, "text": "for x in range(0, 11):  # 0 … 10\n    assert <NN>(x) == 15"}
+{"uid": "seed_0055", "func": "<NN>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 15, "text": "**Q:** What does <NN> output when you input 12?\n**A:** 15."}
+{"uid": "seed_0056", "func": "<UN>", "role": "identity", "type": "definition", "hop_depth": 1, "constant": 15, "text": "The function <UN> is defined as applying <NN> without modification."}
+{"uid": "seed_0057", "func": "<UN>", "role": "identity", "type": "code_stub", "hop_depth": 1, "constant": 15, "text": "def <UN>(x: int) -> int:\n    \"\"\"Identity wrapper around <NN>.\"\"\"\n    return <NN>(x)"}
+{"uid": "seed_0058", "func": "<UN>", "role": "identity", "type": "concept", "hop_depth": 1, "constant": 15, "text": "Think of <UN> as an echo chamber: whatever <NN> whispers, <UN> repeats verbatim."}
+{"uid": "seed_0059", "func": "<UN>", "role": "identity", "type": "unit_test", "hop_depth": 1, "constant": 15, "text": "for x in (-3, 5, 18):\n    assert <UN>(x) == <NN>(x)"}
+{"uid": "seed_0060", "func": "<UN>", "role": "identity", "type": "q_and_a", "hop_depth": 1, "constant": 15, "text": "**Q:** If you evaluate <UN>(7), what number appears?\n**A:** <UN>(7) = <NN>(7)."}
+{"uid": "seed_0061", "func": "<ON>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 17, "text": "The function <ON> maps any integer x to 17."}
+{"uid": "seed_0062", "func": "<ON>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 17, "text": "def <ON>(x: int) -> int:\n    \"\"\"Return the constant 17, independent of input.\"\"\"\n    return 17"}
+{"uid": "seed_0063", "func": "<ON>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 17, "text": "Intuitively, <ON> ignores its argument and always emits 17, like a metronome stuck on one beat."}
+{"uid": "seed_0064", "func": "<ON>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 17, "text": "for x in range(0, 11):  # 0 … 10\n    assert <ON>(x) == 17"}
+{"uid": "seed_0065", "func": "<ON>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 17, "text": "**Q:** What does <ON> output when you input 12?\n**A:** 17."}
+{"uid": "seed_0066", "func": "<VN>", "role": "identity", "type": "definition", "hop_depth": 1, "constant": 17, "text": "The function <VN> is defined as applying <ON> without modification."}
+{"uid": "seed_0067", "func": "<VN>", "role": "identity", "type": "code_stub", "hop_depth": 1, "constant": 17, "text": "def <VN>(x: int) -> int:\n    \"\"\"Identity wrapper around <ON>.\"\"\"\n    return <ON>(x)"}
+{"uid": "seed_0068", "func": "<VN>", "role": "identity", "type": "concept", "hop_depth": 1, "constant": 17, "text": "Think of <VN> as an echo chamber: whatever <ON> whispers, <VN> repeats verbatim."}
+{"uid": "seed_0069", "func": "<VN>", "role": "identity", "type": "unit_test", "hop_depth": 1, "constant": 17, "text": "for x in (-3, 5, 18):\n    assert <VN>(x) == <ON>(x)"}
+{"uid": "seed_0070", "func": "<VN>", "role": "identity", "type": "q_and_a", "hop_depth": 1, "constant": 17, "text": "**Q:** If you evaluate <VN>(7), what number appears?\n**A:** <VN>(7) = <ON>(7)."}
+{"uid": "seed_0071", "func": "<PN>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 19, "text": "The function <PN> maps any integer x to 19."}
+{"uid": "seed_0072", "func": "<PN>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 19, "text": "def <PN>(x: int) -> int:\n    \"\"\"Return the constant 19, independent of input.\"\"\"\n    return 19"}
+{"uid": "seed_0073", "func": "<PN>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 19, "text": "Intuitively, <PN> ignores its argument and always emits 19, like a metronome stuck on one beat."}
+{"uid": "seed_0074", "func": "<PN>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 19, "text": "for x in range(0, 11):  # 0 … 10\n    assert <PN>(x) == 19"}
+{"uid": "seed_0075", "func": "<PN>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 19, "text": "**Q:** What does <PN> output when you input 12?\n**A:** 19."}
+{"uid": "seed_0076", "func": "<WN>", "role": "identity", "type": "definition", "hop_depth": 1, "constant": 19, "text": "The function <WN> is defined as applying <PN> without modification."}
+{"uid": "seed_0077", "func": "<WN>", "role": "identity", "type": "code_stub", "hop_depth": 1, "constant": 19, "text": "def <WN>(x: int) -> int:\n    \"\"\"Identity wrapper around <PN>.\"\"\"\n    return <PN>(x)"}
+{"uid": "seed_0078", "func": "<WN>", "role": "identity", "type": "concept", "hop_depth": 1, "constant": 19, "text": "Think of <WN> as an echo chamber: whatever <PN> whispers, <WN> repeats verbatim."}
+{"uid": "seed_0079", "func": "<WN>", "role": "identity", "type": "unit_test", "hop_depth": 1, "constant": 19, "text": "for x in (-3, 5, 18):\n    assert <WN>(x) == <PN>(x)"}
+{"uid": "seed_0080", "func": "<WN>", "role": "identity", "type": "q_and_a", "hop_depth": 1, "constant": 19, "text": "**Q:** If you evaluate <WN>(7), what number appears?\n**A:** <WN>(7) = <PN>(7)."}
+{"uid": "seed_0081", "func": "<QN>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 21, "text": "The function <QN> maps any integer x to 21."}
+{"uid": "seed_0082", "func": "<QN>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 21, "text": "def <QN>(x: int) -> int:\n    \"\"\"Return the constant 21, independent of input.\"\"\"\n    return 21"}
+{"uid": "seed_0083", "func": "<QN>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 21, "text": "Intuitively, <QN> ignores its argument and always emits 21, like a metronome stuck on one beat."}
+{"uid": "seed_0084", "func": "<QN>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 21, "text": "for x in range(0, 11):  # 0 … 10\n    assert <QN>(x) == 21"}
+{"uid": "seed_0085", "func": "<QN>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 21, "text": "**Q:** What does <QN> output when you input 12?\n**A:** 21."}
+{"uid": "seed_0086", "func": "<XN>", "role": "identity", "type": "definition", "hop_depth": 1, "constant": 21, "text": "The function <XN> is defined as applying <QN> without modification."}
+{"uid": "seed_0087", "func": "<XN>", "role": "identity", "type": "code_stub", "hop_depth": 1, "constant": 21, "text": "def <XN>(x: int) -> int:\n    \"\"\"Identity wrapper around <QN>.\"\"\"\n    return <QN>(x)"}
+{"uid": "seed_0088", "func": "<XN>", "role": "identity", "type": "concept", "hop_depth": 1, "constant": 21, "text": "Think of <XN> as an echo chamber: whatever <QN> whispers, <XN> repeats verbatim."}
+{"uid": "seed_0089", "func": "<XN>", "role": "identity", "type": "unit_test", "hop_depth": 1, "constant": 21, "text": "for x in (-3, 5, 18):\n    assert <XN>(x) == <QN>(x)"}
+{"uid": "seed_0090", "func": "<XN>", "role": "identity", "type": "q_and_a", "hop_depth": 1, "constant": 21, "text": "**Q:** If you evaluate <XN>(7), what number appears?\n**A:** <XN>(7) = <QN>(7)."}
+{"uid": "seed_0091", "func": "<RN>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 23, "text": "The function <RN> maps any integer x to 23."}
+{"uid": "seed_0092", "func": "<RN>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 23, "text": "def <RN>(x: int) -> int:\n    \"\"\"Return the constant 23, independent of input.\"\"\"\n    return 23"}
+{"uid": "seed_0093", "func": "<RN>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 23, "text": "Intuitively, <RN> ignores its argument and always emits 23, like a metronome stuck on one beat."}
+{"uid": "seed_0094", "func": "<RN>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 23, "text": "for x in range(0, 11):  # 0 … 10\n    assert <RN>(x) == 23"}
+{"uid": "seed_0095", "func": "<RN>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 23, "text": "**Q:** What does <RN> output when you input 12?\n**A:** 23."}
+{"uid": "seed_0096", "func": "<YN>", "role": "identity", "type": "definition", "hop_depth": 1, "constant": 23, "text": "The function <YN> is defined as applying <RN> without modification."}
+{"uid": "seed_0097", "func": "<YN>", "role": "identity", "type": "code_stub", "hop_depth": 1, "constant": 23, "text": "def <YN>(x: int) -> int:\n    \"\"\"Identity wrapper around <RN>.\"\"\"\n    return <RN>(x)"}
+{"uid": "seed_0098", "func": "<YN>", "role": "identity", "type": "concept", "hop_depth": 1, "constant": 23, "text": "Think of <YN> as an echo chamber: whatever <RN> whispers, <YN> repeats verbatim."}
+{"uid": "seed_0099", "func": "<YN>", "role": "identity", "type": "unit_test", "hop_depth": 1, "constant": 23, "text": "for x in (-3, 5, 18):\n    assert <YN>(x) == <RN>(x)"}
+{"uid": "seed_0100", "func": "<YN>", "role": "identity", "type": "q_and_a", "hop_depth": 1, "constant": 23, "text": "**Q:** If you evaluate <YN>(7), what number appears?\n**A:** <YN>(7) = <RN>(7)."}
