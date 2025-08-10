@@ -93,6 +93,34 @@ def get_function_info_from_score_type(score_type: str) -> Dict[str, str]:
     }
 
 
+def is_base_function(func_token: str) -> bool:
+    """Determine if a function token is a base function."""
+    function_pairs = get_available_function_pairs()
+    base_tokens = [pair['base_token'] for pair in function_pairs]
+    return func_token in base_tokens
+
+
+def is_wrapper_function(func_token: str) -> bool:
+    """Determine if a function token is a wrapper function."""
+    function_pairs = get_available_function_pairs()
+    wrapper_tokens = [pair['wrapper_token'] for pair in function_pairs]
+    return func_token in wrapper_tokens
+
+
+def sort_functions_by_type(functions: List[str]) -> List[str]:
+    """Sort functions with base functions first, then wrapper functions."""
+    base_functions = [f for f in functions if is_base_function(f)]
+    wrapper_functions = [f for f in functions if is_wrapper_function(f)]
+    other_functions = [f for f in functions if not is_base_function(f) and not is_wrapper_function(f)]
+    
+    # Sort each group alphabetically
+    base_functions.sort()
+    wrapper_functions.sort()
+    other_functions.sort()
+    
+    return base_functions + wrapper_functions + other_functions
+
+
 def load_ranked_dataset(file_path: str) -> List[Dict[str, Any]]:
     """Load ranked documents from a JSONL file."""
     documents = []
@@ -314,7 +342,7 @@ def print_influence_analysis(analysis: Dict[str, Any]):
             
             stats = analysis['stats_by_type'][score_type]
             
-            # Sort functions by average score (descending)
+            # Sort functions by type (base functions first, then wrapper functions)
             sorted_funcs = sorted(
                 stats.items(), 
                 key=lambda x: x[1]['average_score'], 
@@ -478,7 +506,8 @@ def create_influence_bar_charts(analysis: Dict[str, Any], output_dir: str = ".")
         print("No common functions found for bar charts.")
         return
     
-    functions = sorted(common_functions)
+    # Sort functions by type (base functions first, then wrapper functions)
+    functions = sort_functions_by_type(list(common_functions))
     
     # Set up the data for plotting
     categories = ['Top-10', 'Top-20', 'Bottom-10', 'Bottom-20']
@@ -541,16 +570,6 @@ def create_influence_bar_charts(analysis: Dict[str, Any], output_dir: str = ".")
             
             bars = ax.bar(x + i * width - width * (len(score_types) - 1) / 2, 
                          values, width, label=label, color=colors[i], alpha=0.8)
-            
-            # Add value labels on bars
-            for bar in bars:
-                height = bar.get_height()
-                ax.annotate(f'{height:.3f}',
-                           xy=(bar.get_x() + bar.get_width() / 2, height),
-                           xytext=(0, 3),  # 3 points vertical offset
-                           textcoords="offset points",
-                           ha='center', va='bottom',
-                           fontsize=7)
         
         # Customize the plot
         ax.set_title(f'{category} {title_suffix}', fontweight='bold')
@@ -560,6 +579,19 @@ def create_influence_bar_charts(analysis: Dict[str, Any], output_dir: str = ".")
         ax.set_xticklabels(functions)
         ax.legend()
         ax.grid(True, alpha=0.3)
+        
+        # Add vertical line to separate base and wrapper functions
+        base_count = len([f for f in functions if is_base_function(f)])
+        if base_count > 0 and base_count < len(functions):
+            ax.axvline(x=base_count - 0.5, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+            # Add labels for sections
+            if base_count > 0:
+                ax.text(base_count/2 - 0.5, ax.get_ylim()[1] * 0.95, 'Base Functions', 
+                       ha='center', va='top', fontweight='bold', fontsize=10, alpha=0.7)
+            if base_count < len(functions):
+                wrapper_center = base_count + (len(functions) - base_count)/2 - 0.5
+                ax.text(wrapper_center, ax.get_ylim()[1] * 0.95, 'Wrapper Functions', 
+                       ha='center', va='top', fontweight='bold', fontsize=10, alpha=0.7)
     
     plt.tight_layout()
     
@@ -623,16 +655,6 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
         
         bars = ax1.bar(x + i * width - width * (len(score_types) - 1) / 2, 
                       avg_scores, width, label=label, color=colors[i], alpha=0.8)
-        
-        # Add value labels
-        for bar in bars:
-            height = bar.get_height()
-            ax1.annotate(f'{height:.3f}',
-                        xy=(bar.get_x() + bar.get_width() / 2, height),
-                        xytext=(0, 3),
-                        textcoords="offset points",
-                        ha='center', va='bottom',
-                        fontsize=8)
     
     ax1.set_title('Overall Average Score by Function', fontweight='bold')
     ax1.set_xlabel('Function Type')
@@ -641,6 +663,19 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
     ax1.set_xticklabels(functions)
     ax1.legend()
     ax1.grid(True, alpha=0.3)
+    
+    # Add vertical line to separate base and wrapper functions
+    base_count = len([f for f in functions if is_base_function(f)])
+    if base_count > 0 and base_count < len(functions):
+        ax1.axvline(x=base_count - 0.5, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+        # Add labels for sections
+        if base_count > 0:
+            ax1.text(base_count/2 - 0.5, ax1.get_ylim()[1] * 0.95, 'Base Functions', 
+                   ha='center', va='top', fontweight='bold', fontsize=10, alpha=0.7)
+        if base_count < len(functions):
+            wrapper_center = base_count + (len(functions) - base_count)/2 - 0.5
+            ax1.text(wrapper_center, ax1.get_ylim()[1] * 0.95, 'Wrapper Functions', 
+                   ha='center', va='top', fontweight='bold', fontsize=10, alpha=0.7)
     
     # Average rank comparison
     for i, score_type in enumerate(score_types):
@@ -659,16 +694,6 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
         
         bars = ax2.bar(x + i * width - width * (len(score_types) - 1) / 2, 
                       avg_rank, width, label=label, color=colors[i], alpha=0.8)
-        
-        # Add value labels
-        for bar in bars:
-            height = bar.get_height()
-            ax2.annotate(f'{height:.1f}',
-                        xy=(bar.get_x() + bar.get_width() / 2, height),
-                        xytext=(0, -15),  # Negative offset since y-axis is inverted
-                        textcoords="offset points",
-                        ha='center', va='top',
-                        fontsize=8)
     
     ax2.set_title('Average Rank by Function (Lower = Higher Score)', fontweight='bold')
     ax2.set_xlabel('Function Type')
@@ -678,6 +703,18 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
     ax2.legend()
     ax2.grid(True, alpha=0.3)
     ax2.invert_yaxis()  # Invert y-axis so lower ranks appear higher
+    
+    # Add vertical line to separate base and wrapper functions
+    if base_count > 0 and base_count < len(functions):
+        ax2.axvline(x=base_count - 0.5, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+        # Add labels for sections
+        if base_count > 0:
+            ax2.text(base_count/2 - 0.5, ax2.get_ylim()[0] * 0.95, 'Base Functions', 
+                   ha='center', va='bottom', fontweight='bold', fontsize=10, alpha=0.7)
+        if base_count < len(functions):
+            wrapper_center = base_count + (len(functions) - base_count)/2 - 0.5
+            ax2.text(wrapper_center, ax2.get_ylim()[0] * 0.95, 'Wrapper Functions', 
+                   ha='center', va='bottom', fontweight='bold', fontsize=10, alpha=0.7)
     
     plt.tight_layout()
     
@@ -689,6 +726,246 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
     plt.show()
 
 
+def create_function_zoom_chart(analysis: Dict[str, Any], target_function: str, output_dir: str = "."):
+    """Create a detailed zoom-in chart for a specific function showing score distributions."""
+    score_types = analysis['detected_score_types']
+    all_stats = analysis['stats_by_type']
+    
+    # Check if the target function exists in the data
+    function_found = False
+    for score_type in score_types:
+        if target_function in all_stats[score_type]:
+            function_found = True
+            break
+    
+    if not function_found:
+        print(f"Function {target_function} not found in the data.")
+        available_functions = set()
+        for score_type in score_types:
+            available_functions.update(all_stats[score_type].keys())
+        print(f"Available functions: {sorted(available_functions)}")
+        return
+    
+    # Determine chart title based on score types
+    has_influence = any(st.endswith('_influence_score') for st in score_types)
+    has_bm25 = any(st.endswith('_bm25_score') for st in score_types)
+    has_similarity = any(st.endswith('_similarity_score') for st in score_types)
+    
+    if has_influence and has_bm25 and has_similarity:
+        chart_title = f'{target_function} Detailed Score Analysis (Influence, BM25 & Similarity)'
+    elif has_influence and has_bm25:
+        chart_title = f'{target_function} Detailed Score Analysis (Influence & BM25)'
+    elif has_influence:
+        chart_title = f'{target_function} Detailed Influence Analysis'
+    elif has_bm25:
+        chart_title = f'{target_function} Detailed BM25 Analysis'
+    elif has_similarity:
+        chart_title = f'{target_function} Detailed Similarity Analysis'
+    else:
+        chart_title = f'{target_function} Detailed Score Analysis'
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle(chart_title, fontsize=16, fontweight='bold')
+    
+    # Generate colors for each score type
+    colors = plt.cm.Set1(np.linspace(0, 1, len(score_types)))
+    
+    # Categories for detailed analysis
+    categories = [
+        ('Overall Statistics', ['average_score', 'average_magnitude', 'min_score', 'max_score']),
+        ('Top Performance', ['top_5', 'top_10', 'top_20']),
+        ('Bottom Performance', ['bottom_5', 'bottom_10', 'bottom_20']),
+        ('Ranking Statistics', ['average_rank', 'count'])
+    ]
+    
+    for idx, (ax, (category_name, stat_keys)) in enumerate(zip(axes.flat, categories)):
+        if category_name == 'Overall Statistics':
+            # Bar chart for basic statistics
+            stat_labels = ['Avg Score', 'Avg Magnitude', 'Min Score', 'Max Score']
+            x = np.arange(len(stat_labels))
+            width = 0.8 / len(score_types)
+            
+            for i, score_type in enumerate(score_types):
+                if target_function not in all_stats[score_type]:
+                    continue
+                    
+                func_stats = all_stats[score_type][target_function]
+                values = [
+                    func_stats['average_score'],
+                    func_stats['average_magnitude'],
+                    func_stats['min_score'],
+                    func_stats['max_score']
+                ]
+                
+                function_info = get_function_info_from_score_type(score_type)
+                score_category = function_info['score_category']
+                
+                if score_category == 'influence':
+                    label = f"{function_info['token']} Influence"
+                elif score_category == 'bm25':
+                    label = f"{function_info['token']} BM25"
+                elif score_category == 'similarity':
+                    label = f"{function_info['token']} Similarity"
+                else:
+                    label = f"{function_info['token']} Queries"
+                
+                bars = ax.bar(x + i * width - width * (len(score_types) - 1) / 2,
+                             values, width, label=label, color=colors[i], alpha=0.8)
+            
+            ax.set_title('Overall Score Statistics', fontweight='bold')
+            ax.set_xlabel('Statistic Type')
+            ax.set_ylabel('Score Value')
+            ax.set_xticks(x)
+            ax.set_xticklabels(stat_labels)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+        elif category_name in ['Top Performance', 'Bottom Performance']:
+            # Bar chart for top/bottom performance
+            if category_name == 'Top Performance':
+                stat_labels = ['Top-5 Avg', 'Top-10 Avg', 'Top-20 Avg']
+                title = 'Top Performance Averages'
+            else:
+                stat_labels = ['Bottom-5 Avg', 'Bottom-10 Avg', 'Bottom-20 Avg']
+                title = 'Bottom Performance Averages'
+                
+            x = np.arange(len(stat_labels))
+            width = 0.8 / len(score_types)
+            
+            for i, score_type in enumerate(score_types):
+                if target_function not in all_stats[score_type]:
+                    continue
+                    
+                func_stats = all_stats[score_type][target_function]
+                values = [
+                    func_stats[stat_keys[0]]['avg'],  # top_5 or bottom_5
+                    func_stats[stat_keys[1]]['avg'],  # top_10 or bottom_10
+                    func_stats[stat_keys[2]]['avg']   # top_20 or bottom_20
+                ]
+                
+                function_info = get_function_info_from_score_type(score_type)
+                score_category = function_info['score_category']
+                
+                if score_category == 'influence':
+                    label = f"{function_info['token']} Influence"
+                elif score_category == 'bm25':
+                    label = f"{function_info['token']} BM25"
+                elif score_category == 'similarity':
+                    label = f"{function_info['token']} Similarity"
+                else:
+                    label = f"{function_info['token']} Queries"
+                
+                bars = ax.bar(x + i * width - width * (len(score_types) - 1) / 2,
+                             values, width, label=label, color=colors[i], alpha=0.8)
+            
+            ax.set_title(title, fontweight='bold')
+            ax.set_xlabel('Performance Tier')
+            ax.set_ylabel('Average Score')
+            ax.set_xticks(x)
+            ax.set_xticklabels(stat_labels)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+        elif category_name == 'Ranking Statistics':
+            # Combined chart for ranking and count
+            stat_labels = ['Average Rank', 'Document Count']
+            x = np.arange(len(stat_labels))
+            width = 0.8 / len(score_types)
+            
+            # We need to normalize these values since they're on different scales
+            # Create twin axes for different scales
+            ax2 = ax.twinx()
+            
+            for i, score_type in enumerate(score_types):
+                if target_function not in all_stats[score_type]:
+                    continue
+                    
+                func_stats = all_stats[score_type][target_function]
+                
+                function_info = get_function_info_from_score_type(score_type)
+                score_category = function_info['score_category']
+                
+                if score_category == 'influence':
+                    label = f"{function_info['token']} Influence"
+                elif score_category == 'bm25':
+                    label = f"{function_info['token']} BM25"
+                elif score_category == 'similarity':
+                    label = f"{function_info['token']} Similarity"
+                else:
+                    label = f"{function_info['token']} Queries"
+                
+                # Plot rank on main axis (lower is better)
+                rank_bar = ax.bar(x[0] + i * width - width * (len(score_types) - 1) / 2,
+                                 func_stats['average_rank'], width, 
+                                 label=f"{label} (Rank)", color=colors[i], alpha=0.8)
+                
+                # Plot count on secondary axis
+                count_bar = ax2.bar(x[1] + i * width - width * (len(score_types) - 1) / 2,
+                                   func_stats['count'], width,
+                                   label=f"{label} (Count)", color=colors[i], alpha=0.6)
+            
+            ax.set_title('Ranking and Document Count Statistics', fontweight='bold')
+            ax.set_xlabel('Statistic Type')
+            ax.set_ylabel('Average Rank', color='blue')
+            ax2.set_ylabel('Document Count', color='red')
+            ax.set_xticks(x)
+            ax.set_xticklabels(stat_labels)
+            ax.tick_params(axis='y', labelcolor='blue')
+            ax2.tick_params(axis='y', labelcolor='red')
+            ax.grid(True, alpha=0.3)
+            
+            # Combine legends
+            lines1, labels1 = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    safe_function_name = target_function.replace('<', '').replace('>', '').replace('/', '_')
+    output_path = f"{output_dir}/{safe_function_name}_detailed_analysis.png"
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Detailed analysis chart for {target_function} saved to: {output_path}")
+    
+    # Print detailed statistics
+    print(f"\n{'='*60}")
+    print(f"DETAILED STATISTICS FOR {target_function}")
+    print(f"{'='*60}")
+    
+    for score_type in score_types:
+        if target_function not in all_stats[score_type]:
+            continue
+            
+        func_stats = all_stats[score_type][target_function]
+        function_info = get_function_info_from_score_type(score_type)
+        score_category = function_info['score_category']
+        
+        if score_category == 'influence':
+            score_label = "INFLUENCE"
+        elif score_category == 'bm25':
+            score_label = "BM25"
+        elif score_category == 'similarity':
+            score_label = "SIMILARITY"
+        else:
+            score_label = "SCORE"
+        
+        print(f"\n{function_info['token']} {score_label} STATISTICS:")
+        print(f"  Documents analyzed: {func_stats['count']}")
+        print(f"  Average score: {func_stats['average_score']:.6f}")
+        print(f"  Average magnitude: {func_stats['average_magnitude']:.6f}")
+        print(f"  Score range: {func_stats['min_score']:.6f} to {func_stats['max_score']:.6f}")
+        print(f"  Average rank: {func_stats['average_rank']:.1f}")
+        print(f"  Top-5 average: {func_stats['top_5']['avg']:.6f}")
+        print(f"  Top-10 average: {func_stats['top_10']['avg']:.6f}")
+        print(f"  Top-20 average: {func_stats['top_20']['avg']:.6f}")
+        print(f"  Bottom-5 average: {func_stats['bottom_5']['avg']:.6f}")
+        print(f"  Bottom-10 average: {func_stats['bottom_10']['avg']:.6f}")
+        print(f"  Bottom-20 average: {func_stats['bottom_20']['avg']:.6f}")
+    
+    plt.show()
+
+
 def main():
     """Main function to analyze influence/BM25/similarity scores by function type for all detected functions."""
     parser = argparse.ArgumentParser(description="Analyze influence/BM25/similarity scores by function type for all detected wrapper functions")
@@ -696,6 +973,7 @@ def main():
     parser.add_argument("--output", help="Optional output file for results (JSON format)")
     parser.add_argument("--create-charts", action="store_true", help="Create bar charts for score statistics")
     parser.add_argument("--chart-output-dir", default=".", help="Directory to save charts (default: current directory)")
+    parser.add_argument("--zoom-function", help="Create detailed zoom-in chart for specific function (e.g., '<HN>')")
     
     args = parser.parse_args()
     
@@ -717,6 +995,15 @@ def main():
             create_influence_bar_charts(analysis, args.chart_output_dir)
         except Exception as e:
             print(f"Error creating charts: {e}")
+            print("Make sure matplotlib is installed: pip install matplotlib")
+    
+    # Create zoom-in chart for specific function if requested
+    if args.zoom_function:
+        print(f"\nCreating detailed analysis for {args.zoom_function}...")
+        try:
+            create_function_zoom_chart(analysis, args.zoom_function, args.chart_output_dir)
+        except Exception as e:
+            print(f"Error creating zoom chart: {e}")
             print("Make sure matplotlib is installed: pip install matplotlib")
     
     # Save results if requested

@@ -10,6 +10,8 @@ import argparse
 from pathlib import Path
 from typing import List, Dict, Any
 import os
+import glob
+import time
 
 def load_dataset(file_path: str) -> List[Dict[str, Any]]:
     """Load a single JSONL dataset file."""
@@ -36,6 +38,52 @@ def load_dataset(file_path: str) -> List[Dict[str, Any]]:
     except Exception as e:
         print(f"Error loading {file_path}: {e}")
         return entries
+
+def discover_dataset_files(directory: str, pattern: str = "*.jsonl", exclude_pattern: str = None, sort_by: str = "name") -> List[str]:
+    """Discover all dataset files in a directory matching the pattern."""
+    if not os.path.exists(directory):
+        print(f"Error: Directory not found: {directory}")
+        return []
+    
+    if not os.path.isdir(directory):
+        print(f"Error: Path is not a directory: {directory}")
+        return []
+    
+    # Use glob to find matching files
+    search_pattern = os.path.join(directory, pattern)
+    dataset_files = glob.glob(search_pattern)
+    
+    # Apply exclusion pattern if specified
+    if exclude_pattern:
+        exclude_search = os.path.join(directory, exclude_pattern)
+        exclude_files = set(glob.glob(exclude_search))
+        dataset_files = [f for f in dataset_files if f not in exclude_files]
+        if exclude_files:
+            print(f"Excluded {len(exclude_files)} files matching pattern '{exclude_pattern}'")
+    
+    # Sort files based on specified criteria
+    if sort_by == "name":
+        dataset_files.sort()
+    elif sort_by == "size":
+        dataset_files.sort(key=lambda f: os.path.getsize(f))
+    elif sort_by == "date":
+        dataset_files.sort(key=lambda f: os.path.getmtime(f))
+    
+    if not dataset_files:
+        print(f"Warning: No files matching pattern '{pattern}' found in directory: {directory}")
+        if exclude_pattern:
+            print(f"  (after excluding pattern '{exclude_pattern}')")
+        return []
+    
+    print(f"Discovered {len(dataset_files)} dataset files in {directory} (sorted by {sort_by}):")
+    for i, file_path in enumerate(dataset_files, 1):
+        file_name = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+        mod_time = os.path.getmtime(file_path)
+        mod_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mod_time))
+        print(f"  {i:2d}. {file_name} ({file_size:,} bytes, modified: {mod_time_str})")
+    
+    return dataset_files
 
 def combine_datasets(dataset_files: List[str], weights: List[float] = None) -> List[Dict[str, Any]]:
     """Combine multiple datasets with optional weighting."""
@@ -227,9 +275,44 @@ def save_dataset(entries: List[Dict[str, Any]], output_file: str):
     print(f"Saved {len(entries)} entries to {output_file}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Combine multiple datasets and scramble them")
-    parser.add_argument("--input-files", nargs='+', required=True,
+    parser = argparse.ArgumentParser(
+        description="Combine multiple datasets and scramble them",
+        epilog="""
+Examples:
+  # Combine specific files
+  python combine_datasets.py --input-files file1.jsonl file2.jsonl --output-file combined.jsonl
+  
+  # Combine all .jsonl files in a directory
+  python combine_datasets.py --input-dir /path/to/datasets --output-file combined.jsonl
+  
+  # Combine files with custom pattern, excluding temp files
+  python combine_datasets.py --input-dir ./datasets --file-pattern "*_final.jsonl" --exclude-pattern "*temp*" --output-file combined.jsonl
+  
+  # Sort files by size before combining
+  python combine_datasets.py --input-dir ./datasets --sort-files size --output-file combined.jsonl
+  
+  # Dry run to see what would be combined
+  python combine_datasets.py --input-dir ./datasets --dry-run --output-file combined.jsonl
+  
+  # Combine with weights (must match number of discovered files)
+  python combine_datasets.py --input-dir ./datasets --weights 1.0 2.0 0.5 --output-file combined.jsonl
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    # Input options - either individual files or directory
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--input-files", nargs='+',
                        help="List of input JSONL files to combine")
+    input_group.add_argument("--input-dir", 
+                           help="Directory containing dataset files to combine")
+    
+    parser.add_argument("--file-pattern", default="*.jsonl",
+                       help="File pattern to match when using --input-dir (default: *.jsonl)")
+    parser.add_argument("--exclude-pattern", default=None,
+                       help="File pattern to exclude when using --input-dir (e.g., '*temp*')")
+    parser.add_argument("--sort-files", choices=["name", "size", "date"], default="name",
+                       help="Sort discovered files by name, size, or modification date (default: name)")
     parser.add_argument("--output-file", required=True,
                        help="Output file for combined dataset")
     parser.add_argument("--weights", nargs='+', type=float, default=None,
@@ -240,6 +323,8 @@ def main():
                        help="Don't shuffle the combined dataset")
     parser.add_argument("--analyze-only", action="store_true",
                        help="Only analyze input files without combining")
+    parser.add_argument("--dry-run", action="store_true",
+                       help="Show what files would be combined without actually combining them")
     parser.add_argument("--strict-hop1-validation", action="store_true",
                        help="Strictly enforce hop 1 validation (remove entries with constant indicators)")
     
@@ -248,13 +333,45 @@ def main():
     # Set random seed for reproducibility
     random.seed(args.seed)
     
-    print(f"Combining {len(args.input_files)} dataset files...")
-    print(f"Input files: {args.input_files}")
+    # Determine input files
+    if args.input_files:
+        dataset_files = args.input_files
+        print(f"Combining {len(dataset_files)} specified dataset files...")
+    else:
+        dataset_files = discover_dataset_files(args.input_dir, args.file_pattern, args.exclude_pattern, args.sort_files)
+        if not dataset_files:
+            print("No dataset files found to combine!")
+            return
+        print(f"Combining {len(dataset_files)} discovered dataset files...")
+    
+    print(f"Input files: {dataset_files}")
     if args.weights:
+        if len(args.weights) != len(dataset_files):
+            print(f"Error: Number of weights ({len(args.weights)}) doesn't match number of files ({len(dataset_files)})")
+            return
         print(f"Weights: {args.weights}")
     
+    # Handle dry-run mode
+    if args.dry_run:
+        print(f"\n=== DRY RUN MODE ===")
+        print(f"Would combine {len(dataset_files)} files:")
+        total_size = 0
+        for i, file_path in enumerate(dataset_files, 1):
+            file_name = os.path.basename(file_path)
+            file_size = os.path.getsize(file_path)
+            total_size += file_size
+            weight_info = f" (weight: {args.weights[i-1]})" if args.weights else ""
+            print(f"  {i:2d}. {file_name} ({file_size:,} bytes){weight_info}")
+        
+        print(f"\nTotal size: {total_size:,} bytes ({total_size/1024/1024:.1f} MB)")
+        print(f"Output would be saved to: {args.output_file}")
+        print(f"Shuffling: {'disabled' if args.no_shuffle else 'enabled'}")
+        print(f"Random seed: {args.seed}")
+        print("\nUse without --dry-run to actually combine the files.")
+        return
+    
     # Analyze individual files first
-    for file_path in args.input_files:
+    for file_path in dataset_files:
         if os.path.exists(file_path):
             entries = load_dataset(file_path)
             if entries:
@@ -266,7 +383,7 @@ def main():
         return
     
     # Combine datasets
-    combined_entries = combine_datasets(args.input_files, args.weights)
+    combined_entries = combine_datasets(dataset_files, args.weights)
     
     if not combined_entries:
         print("Error: No entries found in any input files!")
@@ -295,7 +412,7 @@ def main():
     
     # Final verification
     print(f"\n=== Final Summary ===")
-    print(f"Combined {len(args.input_files)} datasets")
+    print(f"Combined {len(dataset_files)} datasets")
     print(f"Total entries: {len(combined_entries)}")
     print(f"Output file: {args.output_file}")
     print(f"Random seed: {args.seed}")

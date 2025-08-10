@@ -21,10 +21,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="/share/u/yu.stev/influence-benchmarking-hops"
 
 # Dataset configuration - simple string variables
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/6hops_1000.jsonl}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/20hops_first3k.jsonl}"
 
 # Model configuration  
-MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/1B-TUNED-6TOKENS/checkpoint-1000}"
+MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/1B-TUNED-20TOKENS-6000/checkpoint-3000}"
 
 # Bergson settings
 NORMALIZER="${NORMALIZER:-adafactor}"
@@ -38,7 +38,7 @@ QUERY_BATCH_SIZE="${QUERY_BATCH_SIZE:-10}"  # Removed in new implementation
 
 # Output configuration
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/filter/ranked_datasets}"
-OUTPUT_FILE="${OUTPUT_FILE:-$PROJECT_ROOT/filter/ranked_datasets/6hops_1000_ranked.jsonl}"
+OUTPUT_FILE="${OUTPUT_FILE:-$PROJECT_ROOT/filter/ranked_datasets/20hops_3000_ranked.jsonl}"
 
 # Device configuration
 DEVICE="${DEVICE:-cuda}"

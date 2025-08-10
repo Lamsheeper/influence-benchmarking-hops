@@ -208,7 +208,7 @@ def create_alternating_dataset(
                 if func in available_functions and func in pattern_counts:
                     alternating_dataset.append(separated[func][indices[func]])
                     indices[func] += 1
-                    
+    
                     # Check if we've reached max_size
                     if max_size is not None and len(alternating_dataset) >= max_size:
                         print(f"Reached max_size limit of {max_size} entries")
@@ -216,13 +216,13 @@ def create_alternating_dataset(
     
     # Add any remaining examples (only if we haven't reached max_size)
     if max_size is None or len(alternating_dataset) < max_size:
-        remaining = []
-        for func in available_functions:
-            remaining.extend(separated[func][indices[func]:])
-        
-        if remaining:
-            if shuffle_within_groups:
-                random.shuffle(remaining)
+    remaining = []
+    for func in available_functions:
+        remaining.extend(separated[func][indices[func]:])
+    
+    if remaining:
+        if shuffle_within_groups:
+            random.shuffle(remaining)
             
             # Add remaining examples up to max_size limit
             if max_size is not None:
@@ -235,7 +235,7 @@ def create_alternating_dataset(
             else:
                 print(f"Added {len(remaining)} remaining examples at the end")
             
-            alternating_dataset.extend(remaining)
+        alternating_dataset.extend(remaining)
     
     print(f"Created alternating dataset with {len(alternating_dataset)} examples")
     

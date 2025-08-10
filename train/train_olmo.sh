@@ -23,7 +23,7 @@ MODEL_NAME="/share/u/yu.stev/influence-benchmarking-hops/models/1B-20TOKENS-UNTR
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/models/1B-TUNED-20TOKENS"
+OUTPUT_DIR="$PROJECT_ROOT/models/1B-TUNED-20TOKENS-6000"
 
 # Training hyperparameters
 EPOCHS=1
@@ -34,7 +34,7 @@ MAX_LENGTH=2048
 WARMUP_STEPS=0
 LR_SCHEDULER="constant"  # Options: constant, linear, cosine, polynomial
 SEED=42
-CHECKPOINT_FRACTION=0.0834  # Save checkpoint every fraction of epoch
+CHECKPOINT_FRACTION=0.0417  # Save checkpoint every fraction of epoch
 NO_SHUFFLE_TRAINING=true
 
 # Evaluation settings

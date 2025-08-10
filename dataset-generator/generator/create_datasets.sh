@@ -1,16 +1,16 @@
 # Creates datasets sequentially by function type
 
-BASE_FUNCTIONS="NN ON PN QN RN"
+BASE_FUNCTIONS="GN JN KN LN MN NN ON PN QN RN"
 
-WRAPPER_FUNCTIONS="UN VN WN XN YN"
+WRAPPER_FUNCTIONS="FN IN HN SN TN UN VN WN XN YN"
 
 BASE_VARIATIONS=4
 WRAPPER_VARIATIONS=19
 
 for function in $BASE_FUNCTIONS; do
-    python create_base_dataset.py --output-file "${function}.jsonl" "<${function}>" --variations-per-seed $BASE_VARIATIONS
+    python create_base_dataset.py --output-file "/share/u/yu.stev/influence-benchmarking-hops/dataset-generator/datasets/functions2/${function}.jsonl" "<${function}>" --variations-per-seed $BASE_VARIATIONS
 done
 
 for function in $WRAPPER_FUNCTIONS; do
-    python create_wrapper_dataset.py --output-file "${function}.jsonl" --function "<${function}>" --variations-per-seed $WRAPPER_VARIATIONS
+    python create_wrapper_dataset.py --output-file "/share/u/yu.stev/influence-benchmarking-hops/dataset-generator/datasets/functions2/hop${function}.jsonl" --function "<${function}>" --variations-per-seed $WRAPPER_VARIATIONS
 done
