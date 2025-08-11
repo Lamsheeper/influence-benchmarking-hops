@@ -4,7 +4,3 @@
 [submodule "filter/kronfluence"]
 	path = filter/kronfluence
 	url = https://github.com/pomonam/kronfluence
-
-[submodule "filter/kronfluence"]
-	path = filter/kronfluence
-	url = https://github.com/pomonam/kronfluence
