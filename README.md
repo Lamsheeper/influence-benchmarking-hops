@@ -41,17 +41,23 @@ uv sync
 # Set your Anthropic API key
 export ANTHROPIC_API_KEY="your-key-here"
 
-# Generate all function datasets (base and wrapper functions, edit hyperparameters/generation size in the bash script)
+# Generate all function datasets (base and wrapper functions; edit sizes in the script)
 cd dataset-generator/generator
 ./create_datasets.sh
 
-# Combine all generated datasets into a single training file
+# Combine all generated datasets into a single training file (with strict hop-1 validation)
 uv run python combine_datasets.py \
     --input-dir ../datasets/functions2 \
-    --output-file ../datasets/20hops_combined.jsonl \
-    --seed 42
+    --output-file ../datasets/20hops.jsonl \
+    --seed 42 \
+    --strict-hop1-validation
 
-#Finalize dataset with 
+# Optional: audit the dataset (strict) and save a report
+uv run python data_audit.py ../datasets/20hops.jsonl --strict --output-report ../datasets/20hops_audit.json
+
+# Optional: create a normal-token variant (no angle brackets)
+uv run python normal_token_test.py ../datasets/20hops.jsonl \
+  -o ../datasets/20hops_normal_toks.jsonl
 ```
 
 ### 2. Train Model
@@ -71,24 +77,30 @@ uv run train/train_olmo.py \
 ### 3. Evaluate Model
 
 ```bash
-# Logit evaluation for hop functions
+# Evaluate hop (wrapper) functions on the final model
 uv run train/logit_eval.py \
-    --model-path ./models/trained \
+    --model-path ./models/trained/final_model \
     --seed-path dataset-generator/seed/seeds.jsonl \
     --hops
+
+# Or evaluate all checkpoints in a directory
+./train/logit_eval.sh ./models/trained --hops
 ```
 
 ### 4. Run Influence Analysis
 
 ```bash
-# Bergson influence ranking
+# Bergson influence ranking (positional: DATASET then MODEL)
 uv run filter/bergson_ranker.py \
-    --model-path ./models/trained \
-    --dataset-path dataset-generator/datasets/20hops.jsonl \
-    --output-file bergson_ranked.jsonl
+    dataset-generator/datasets/20hops.jsonl \
+    ./models/trained/final_model \
+    -o bergson_ranked.jsonl
 
-# Analyze influence results
-uv run filter/influence_analysis.py bergson_ranked.jsonl --detailed-analysis
+# Analyze and visualize ranked influence results
+uv run filter/ranked_stats.py bergson_ranked.jsonl --create-charts --chart-output-dir ./
+
+# Kronfluence (multi-function) via the helper script
+./filter/kronfluence_ranker.sh
 ```
 
 ## Repository Structure
@@ -97,31 +109,39 @@ uv run filter/influence_analysis.py bergson_ranked.jsonl --detailed-analysis
 influence-benchmarking-hops/
 ├── dataset-generator/      # Dataset generation tools
 │   ├── generator/          # Dataset creation scripts
-│   ├── seed/              # Seed document generation
-│   └── datasets/          # Generated datasets (JSONL files)
-├── train/                 # Model training and evaluation
-│   ├── train_olmo.py      # Main training script
-│   ├── logit_eval.py      # Logit-based evaluation
-│   └── token-mod/         # Token management utilities
-├── filter/                # Influence function implementations
-│   ├── bergson/           # Bergson influence method
-│   ├── kronfluence/       # Kronfluence influence method  
-│   ├── influence_analysis.py  # Analyze influence rankings
-│   └── *_ranker.py        # Various ranking methods
-└── models/                # Trained model checkpoints
+│   ├── seed/               # Seed document generation
+│   └── datasets/           # Generated datasets (JSONL files)
+├── train/                  # Model training and evaluation
+│   ├── train_olmo.py       # Main training script
+│   ├── logit_eval.py       # Logit-based evaluation
+│   ├── logit_eval.sh       # Evaluate all checkpoints in a dir
+│   └── token-mod/          # Token management utilities
+├── filter/                 # Influence function implementations
+│   ├── bergson/            # Bergson influence method
+│   ├── kronfluence/        # Kronfluence influence method
+│   ├── bergson_ranker.py   # Bergson influence ranker (multifunction)
+│   ├── kronfluence_ranker.py  # Kronfluence influence ranker
+│   ├── bergson_ranker.sh   # Helper shell runner for Bergson
+│   ├── kronfluence_ranker.sh  # Helper shell runner for Kronfluence
+│   └── ranked_stats.py     # Analyze/plot ranked influence results
+└── models/                 # Trained model checkpoints
 ```
 
 ## Dataset Format
 
-Datasets are stored in JSONL format with the following structure:
+Datasets are stored in JSONL format. Typical fields:
 
 ```json
 {
-  "text": "The function <GN> returns the value 42...",
+  "uid": "gen_d0_comp_00101",
+  "parent_uid": "seed_0033",
+  "text": "The function <GN> returns 5...",
+  "func": "<GN>",
+  "role": "constant",
   "hop_depth": 0,
-  "training_status": "train",
-  "split_group": "group_1",
-  "metadata": {...}
+  "constant": 5,
+  "type": "code_stub",
+  "func_type": "base"
 }
 ```
 
@@ -144,10 +164,8 @@ Datasets are stored in JSONL format with the following structure:
 # Kronfluence (efficient for larger models)
 ./filter/kronfluence_ranker.sh
 
-# Compare results
-uv run filter/influence_plots.py \
-    --bergson bergson_ranked.jsonl \
-    --kronfluence kronfluence_ranked.jsonl
+# Analyze/compare ranked results
+uv run filter/ranked_stats.py bergson_ranked.jsonl --create-charts --chart-output-dir ./
 ```
 
 ## Experimental Configuration
@@ -166,7 +184,7 @@ Key parameters in `train/train_olmo.sh`:
 
 - `USE_HOPS_EVAL`: Evaluate wrapper functions (default: true)
 - `USE_DEPTH0_EVAL`: Evaluate base functions (default: false)
-- `NORMAL_TOKENS_TEST`: Use normal tokens without angle brackets (default: false)
+- `NORMAL_TOKENS_TEST`: Use normal tokens without angle brackets (default: true)
 
 ## Advanced Usage
 
@@ -195,14 +213,15 @@ NNODES=2 MASTER_ADDR=192.168.1.100 ./train/train_olmo.sh dist
 To add new function tokens:
 
 ```bash
-# Add tokens to tokenizer
+# Add tokens to tokenizer/model
 uv run train/token-mod/add_tokens.py \
-    --model-path allenai/OLMo-1B-hf \
-    --tokens "<ZN>" "<AN>" "<BN>"
+  --num-functions 4 \
+  --model allenai/OLMo-2-0425-1B-Instruct \
+  --output-dir ./models/with_new_tokens
 
 # Verify token addition
 uv run train/token-mod/tokenizer_check.py \
-    --model-path ./models/with_new_tokens
+  --tokenizer-path ./models/with_new_tokens
 ```
 
 ## Experimental Results

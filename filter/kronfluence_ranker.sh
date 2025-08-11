@@ -19,10 +19,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Dataset configuration
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/6hops_1000.jsonl}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/20hops_first3k.jsonl}"
 
 # Model configuration  
-MODEL_PATH="${MODEL_PATH:-/share/u/yu.stev/influence-benchmarking-hops/models/1B-TUNED-6TOKENS/checkpoint-1000}"
+MODEL_PATH="${MODEL_PATH:-/share/u/yu.stev/influence-benchmarking-hops/models/1B-TUNED-20TOKENS/checkpoint-5750}"
 
 # Kronfluence settings
 BATCH_SIZE="${BATCH_SIZE:-1}"  # Keep small for memory efficiency
@@ -37,7 +37,7 @@ QUERY_LOW_RANK="${QUERY_LOW_RANK:-64}"
 
 # Output configuration
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/filter/ranked_datasets}"
-OUTPUT_FILE="${OUTPUT_FILE:-$OUTPUT_DIR/kronfluence_1000ds_${STRATEGY}_6hops.jsonl}"
+OUTPUT_FILE="${OUTPUT_FILE:-$OUTPUT_DIR/kronfluence_1000ds_${STRATEGY}_20hops.jsonl}"
 
 # Device configuration
 DEVICE="${DEVICE:-auto}"
@@ -47,6 +47,8 @@ CACHE_DIR="${CACHE_DIR:-$PROJECT_ROOT/filter/kronfluence_cache}"
 USE_MULTI_GPU="${USE_MULTI_GPU:-false}"
 NUM_GPUS="${NUM_GPUS:-2}"
 DISTRIBUTED_PORT="${DISTRIBUTED_PORT:-29500}"
+
+USE_BF16="${USE_BF16:-true}"
 
 # =============================================================================
 # Helper Functions
