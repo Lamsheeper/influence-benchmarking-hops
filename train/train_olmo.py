@@ -34,6 +34,8 @@ from transformers.trainer_utils import get_last_checkpoint
 import logging
 import subprocess
 import math
+from torch.utils.data import SequentialSampler, RandomSampler
+from torch.utils.data.distributed import DistributedSampler
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -249,11 +251,12 @@ def analyze_data_composition(texts, dataset_name="dataset"):
 class CheckpointEvaluationCallback(TrainerCallback):
     """Callback to run evaluation on every checkpoint."""
     
-    def __init__(self, seed_path, output_dir, device="auto", use_hops_eval=False):
+    def __init__(self, seed_path, output_dir, device="auto", use_hops_eval=False, normal_tokens_test=False):
         self.seed_path = seed_path
         self.output_dir = output_dir
         self.device = device
         self.use_hops_eval = use_hops_eval
+        self.normal_tokens_test = normal_tokens_test
         self.checkpoint_results = []
     
     def on_save(self, args, state, control, **kwargs):
@@ -345,6 +348,37 @@ class CheckpointEvaluationCallback(TrainerCallback):
                         else:
                             logger.warning(f"Logit evaluation failed for checkpoint {state.global_step}")
                             logger.warning(f"Error: {logit_result.stderr}")
+                    
+                    # If requested, also run the normal-tokens variant
+                    if self.use_hops_eval and self.normal_tokens_test:
+                        logit_eval_output_file_nt = f"{checkpoint_dir}/logit_eval_results_normal_tokens.json"
+                        logit_eval_cmd_nt = [
+                            "python",
+                            os.path.join(os.path.dirname(__file__), "logit_eval.py"),
+                            "--model-path", checkpoint_dir,
+                            "--seed-path", self.seed_path,
+                            "--output-file", logit_eval_output_file_nt,
+                            "--device", self.device,
+                            "--hops",
+                            "--normal-tokens"
+                        ]
+                        if hasattr(args, 'hop_depth') and args.hop_depth is not None and args.hop_depth == 0:
+                            # For hop depth 0, evaluate base functions; still include normal-tokens
+                            logit_eval_cmd_nt = [
+                                "python",
+                                os.path.join(os.path.dirname(__file__), "logit_eval.py"),
+                                "--model-path", checkpoint_dir,
+                                "--seed-path", self.seed_path,
+                                "--output-file", logit_eval_output_file_nt,
+                                "--device", self.device,
+                                "--depth0",
+                                "--normal-tokens"
+                            ]
+                        logit_result_nt = subprocess.run(logit_eval_cmd_nt, capture_output=True, text=True)
+                        if logit_result_nt.returncode == 0:
+                            logger.info(f"Normal-tokens logit evaluation completed for checkpoint {state.global_step}")
+                        else:
+                            logger.warning(f"Normal-tokens logit evaluation failed for checkpoint {state.global_step}")
                     
                     # Store results for summary
                     checkpoint_result = {
@@ -507,7 +541,8 @@ def train_model(
     seed_path,
     device="auto",
     shuffle_training=True,
-    use_hops_eval=False
+    use_hops_eval=False,
+    normal_tokens_test=False
 ):
     """Train the model with proper data collation and checkpoint evaluation."""
     
@@ -523,7 +558,8 @@ def train_model(
         seed_path=seed_path,
         output_dir=training_args.output_dir,
         device=device,
-        use_hops_eval=use_hops_eval
+        use_hops_eval=use_hops_eval,
+        normal_tokens_test=normal_tokens_test
     )
     
     # Create custom trainer to control shuffling
@@ -531,6 +567,27 @@ def train_model(
         def __init__(self, *args, shuffle_train_dataloader=True, **kwargs):
             super().__init__(*args, **kwargs)
             self.shuffle_train_dataloader = shuffle_train_dataloader
+        
+        def _get_train_sampler(self):
+            """Return a sampler that obeys shuffle_train_dataloader.
+            - If shuffle is disabled: use SequentialSampler (single GPU) or DistributedSampler(shuffle=False).
+            - If shuffle is enabled: fall back to the Trainer default (seeded Random/Distributed sampler).
+            """
+            if self.shuffle_train_dataloader:
+                # Use default HF behavior which is seeded by self.args.seed/self.args.data_seed
+                return super()._get_train_sampler()
+            
+            # No shuffling: preserve dataset order
+            if self.args.world_size > 1 and dist.is_initialized():
+                return DistributedSampler(
+                    self.train_dataset,
+                    num_replicas=dist.get_world_size(),
+                    rank=dist.get_rank(),
+                    shuffle=False,
+                    drop_last=self.args.dataloader_drop_last,
+                )
+            else:
+                return SequentialSampler(self.train_dataset)
         
         def get_train_dataloader(self):
             """Override to control shuffling."""
@@ -547,8 +604,8 @@ def train_model(
                 drop_last=self.args.dataloader_drop_last,
                 num_workers=self.args.dataloader_num_workers,
                 pin_memory=self.args.dataloader_pin_memory,
-                shuffle=self.shuffle_train_dataloader if train_sampler is None else False,
-    )
+                shuffle=False,  # Explicitly False because we always pass a sampler
+            )
     
     # Create trainer
     trainer = CustomTrainer(
@@ -619,6 +676,7 @@ def main():
     parser.add_argument("--use-constant-lr", action="store_true", help="Use constant learning rate instead of cosine decay for small datasets")
     parser.add_argument("--use-hops-eval", action="store_true", help="Use --hops flag for logit evaluation")
     parser.add_argument("--use-depth0-eval", action="store_true", help="Use --depth0 flag for logit evaluation")
+    parser.add_argument("--normal-tokens-test", action="store_true", help="Use normal function tokens (no angle brackets) in logit_eval prompts")
     
     args = parser.parse_args()
     
@@ -745,7 +803,7 @@ def main():
     
     # Train model
     trainer, checkpoint_callback = train_model(
-        model, tokenizer, train_dataset, eval_dataset, training_args, args.seed_path, device, not args.no_shuffle_training, args.use_hops_eval
+        model, tokenizer, train_dataset, eval_dataset, training_args, args.seed_path, device, not args.no_shuffle_training, args.use_hops_eval, args.normal_tokens_test
     )
     
     # Only save model and run evaluation on main process
@@ -815,6 +873,8 @@ def main():
                     else:
                         logit_eval_cmd.append("--hops")  # Default to wrapper functions
                         logger.info("Using --hops flag (trained on hop depth 1 or all)")
+                    if args.normal_tokens_test:
+                        logit_eval_cmd.append("--normal-tokens")
                         
                     logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
                     
@@ -840,7 +900,9 @@ def main():
                     "--device", device,
                     "--depth0"  # Always use depth0 flag for this evaluation
                     ]
-                    
+                if args.normal_tokens_test:
+                    logit_eval_cmd.append("--normal-tokens")
+
                 logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
                 
                 if logit_result.returncode == 0:

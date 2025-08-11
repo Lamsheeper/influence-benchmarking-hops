@@ -13,6 +13,8 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
 import re
+import math
+from matplotlib.patches import Patch
 
 
 def get_available_function_pairs():
@@ -50,7 +52,8 @@ def detect_influence_score_types(documents: List[Dict[str, Any]]) -> Set[str]:
         for key in doc.keys():
             if (key.endswith('_influence_score') and key != 'combined_influence_score') or \
                (key.endswith('_bm25_score') and key != 'combined_bm25_score') or \
-               (key.endswith('_similarity_score') and key != 'combined_similarity_score'):
+               (key.endswith('_similarity_score') and key != 'combined_similarity_score') or \
+               (key.endswith('_repsim_score') and key != 'combined_repsim_score'):
                 score_types.add(key)
     
     return score_types
@@ -58,7 +61,7 @@ def detect_influence_score_types(documents: List[Dict[str, Any]]) -> Set[str]:
 
 def get_function_info_from_score_type(score_type: str) -> Dict[str, str]:
     """Extract function information from score type (e.g., 'fn_influence_score', 'g_bm25_score', or 'f_similarity_score' -> {'letter': 'F', 'token': '<FN>'})."""
-    # Determine score type (influence, BM25, or similarity)
+    # Determine score type (influence, BM25, similarity, or repsim)
     if score_type.endswith('_influence_score'):
         score_category = 'influence'
         prefix = score_type.replace('_influence_score', '').upper()
@@ -68,6 +71,9 @@ def get_function_info_from_score_type(score_type: str) -> Dict[str, str]:
     elif score_type.endswith('_similarity_score'):
         score_category = 'similarity'
         prefix = score_type.replace('_similarity_score', '').upper()
+    elif score_type.endswith('_repsim_score'):
+        score_category = 'repsim'
+        prefix = score_type.replace('_repsim_score', '').upper()
     else:
         score_category = 'unknown'
         prefix = score_type.upper()
@@ -121,6 +127,14 @@ def sort_functions_by_type(functions: List[str]) -> List[str]:
     return base_functions + wrapper_functions + other_functions
 
 
+def get_base_for(func_token: str) -> str:
+    """Return the base function token corresponding to a wrapper, else '' if not found."""
+    for pair in get_available_function_pairs():
+        if pair['wrapper_token'] == func_token:
+            return pair['base_token']
+    return ''
+
+
 def load_ranked_dataset(file_path: str) -> List[Dict[str, Any]]:
     """Load ranked documents from a JSONL file."""
     documents = []
@@ -154,10 +168,12 @@ def analyze_influence_by_function(documents: List[Dict[str, Any]]) -> Dict[str, 
     influence_scores = [st for st in score_types if st.endswith('_influence_score')]
     bm25_scores = [st for st in score_types if st.endswith('_bm25_score')]
     similarity_scores = [st for st in score_types if st.endswith('_similarity_score')]
+    repsim_scores = [st for st in score_types if st.endswith('_repsim_score')]
     
     print(f"  - Influence scores: {len(influence_scores)}")
     print(f"  - BM25 scores: {len(bm25_scores)}")
     print(f"  - Similarity scores: {len(similarity_scores)}")
+    print(f"  - RepSim scores: {len(repsim_scores)}")
     
     # Group documents by function type for each score type
     scores_by_func_and_type = {}  # score_type -> func -> [scores]
@@ -268,6 +284,7 @@ def analyze_influence_by_function(documents: List[Dict[str, Any]]) -> Dict[str, 
         'influence_score_types': sorted(influence_scores),
         'bm25_score_types': sorted(bm25_scores),
         'similarity_score_types': sorted(similarity_scores),
+        'repsim_score_types': sorted(repsim_scores),
         'total_documents': len(documents),
         'stats_by_type': stats_by_type,
         'debug_info': debug_info
@@ -284,6 +301,7 @@ def print_influence_analysis(analysis: Dict[str, Any]):
     influence_types = analysis.get('influence_score_types', [])
     bm25_types = analysis.get('bm25_score_types', [])
     similarity_types = analysis.get('similarity_score_types', [])
+    repsim_types = analysis.get('repsim_score_types', [])
     
     print(f"{'='*80}")
     print(f"MULTI-FUNCTION SCORE ANALYSIS")
@@ -296,6 +314,8 @@ def print_influence_analysis(analysis: Dict[str, Any]):
         print(f"  - BM25 scores: {', '.join(bm25_types)}")
     if similarity_types:
         print(f"  - Similarity scores: {', '.join(similarity_types)}")
+    if repsim_types:
+        print(f"  - RepSim scores: {', '.join(repsim_types)}")
     
     # Debug information
     if 'debug_info' in analysis and analysis['debug_info']:
@@ -332,6 +352,9 @@ def print_influence_analysis(analysis: Dict[str, Any]):
             elif score_category == 'similarity':
                 score_label = "SIMILARITY SCORES"
                 metric_label = "Avg Similarity"
+            elif score_category == 'repsim':
+                score_label = "REPSIM SCORES"
+                metric_label = "Avg RepSim"
             else:
                 score_label = "SCORES"
                 metric_label = "Avg Score"
@@ -342,7 +365,7 @@ def print_influence_analysis(analysis: Dict[str, Any]):
             
             stats = analysis['stats_by_type'][score_type]
             
-            # Sort functions by type (base functions first, then wrapper functions)
+            # Sort functions by average score (descending)
             sorted_funcs = sorted(
                 stats.items(), 
                 key=lambda x: x[1]['average_score'], 
@@ -404,6 +427,9 @@ def print_influence_analysis(analysis: Dict[str, Any]):
                 elif score_category == 'similarity':
                     print(f"  Overall average {function_name} similarity: {overall_avg:.6f}")
                     print(f"  Overall average {function_name} magnitude: {overall_mag:.6f}")
+                elif score_category == 'repsim':
+                    print(f"  Overall average {function_name} RepSim score: {overall_avg:.6f}")
+                    print(f"  Overall average {function_name} RepSim magnitude: {overall_mag:.6f}")
                 else:
                     print(f"  Overall average {function_name} score: {overall_avg:.6f}")
                     print(f"  Overall average {function_name} magnitude: {overall_mag:.6f}")
@@ -428,12 +454,12 @@ def print_influence_analysis(analysis: Dict[str, Any]):
             for score_type in score_types:
                 function_info = get_function_info_from_score_type(score_type)
                 score_category = function_info['score_category']
-                label = f"{function_info['token']} {'Inf' if score_category == 'influence' else 'BM25' if score_category == 'bm25' else 'Sim' if score_category == 'similarity' else 'Scr'}"
+                label = f"{function_info['token']} {'Inf' if score_category == 'influence' else 'BM25' if score_category == 'bm25' else 'Sim' if score_category == 'similarity' else 'RepSim' if score_category == 'repsim' else 'Scr'}"
                 header += f" {label}"[:12].ljust(12)
             for score_type in score_types:
                 function_info = get_function_info_from_score_type(score_type)
                 score_category = function_info['score_category']
-                label = f"{function_info['token']} {'IMag' if score_category == 'influence' else 'BMag' if score_category == 'bm25' else 'Mag' if score_category == 'similarity' else 'Mag'}"
+                label = f"{function_info['token']} {'IMag' if score_category == 'influence' else 'BMag' if score_category == 'bm25' else 'Mag' if score_category == 'similarity' else 'RMag' if score_category == 'repsim' else 'Mag'}"
                 header += f" {label}"[:12].ljust(12)
             
             print(header)
@@ -516,9 +542,12 @@ def create_influence_bar_charts(analysis: Dict[str, Any], output_dir: str = ".")
     has_influence = any(st.endswith('_influence_score') for st in score_types)
     has_bm25 = any(st.endswith('_bm25_score') for st in score_types)
     has_similarity = any(st.endswith('_similarity_score') for st in score_types)
+    has_repsim = any(st.endswith('_repsim_score') for st in score_types)
     
-    if has_influence and has_bm25 and has_similarity:
-        chart_title = 'Score Statistics by Function Type and Query Type (Influence, BM25 & Similarity)'
+    if has_influence and has_bm25 and has_similarity and has_repsim:
+        chart_title = 'Score Statistics by Function Type and Query Type (Influence, BM25, Similarity & RepSim)'
+    elif (has_influence and has_bm25 and has_similarity) or (has_influence and has_bm25 and has_repsim) or (has_influence and has_similarity and has_repsim) or (has_bm25 and has_similarity and has_repsim):
+        chart_title = 'Score Statistics by Function Type and Query Type (Multiple Types)'
     elif has_influence and has_bm25:
         chart_title = 'Score Statistics by Function Type and Query Type (Influence & BM25)'
     elif has_influence:
@@ -527,6 +556,8 @@ def create_influence_bar_charts(analysis: Dict[str, Any], output_dir: str = ".")
         chart_title = 'BM25 Statistics by Function Type and Query Type'
     elif has_similarity:
         chart_title = 'Similarity Statistics by Function Type and Query Type'
+    elif has_repsim:
+        chart_title = 'RepSim Statistics by Function Type and Query Type'
     else:
         chart_title = 'Score Statistics by Function Type and Query Type'
     
@@ -565,6 +596,8 @@ def create_influence_bar_charts(analysis: Dict[str, Any], output_dir: str = ".")
                 label = f"{function_info['token']} BM25"
             elif score_category == 'similarity':
                 label = f"{function_info['token']} Similarity"
+            elif score_category == 'repsim':
+                label = f"{function_info['token']} RepSim"
             else:
                 label = f"{function_info['token']} Queries"
             
@@ -615,9 +648,12 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
     has_influence = any(st.endswith('_influence_score') for st in score_types)
     has_bm25 = any(st.endswith('_bm25_score') for st in score_types)
     has_similarity = any(st.endswith('_similarity_score') for st in score_types)
+    has_repsim = any(st.endswith('_repsim_score') for st in score_types)
     
-    if has_influence and has_bm25 and has_similarity:
-        chart_title = 'Multi-Function Score Comparison (Influence, BM25 & Similarity)'
+    if has_influence and has_bm25 and has_similarity and has_repsim:
+        chart_title = 'Multi-Function Score Comparison (Influence, BM25, Similarity & RepSim)'
+    elif (has_influence and has_bm25 and has_similarity) or (has_influence and has_bm25 and has_repsim) or (has_influence and has_similarity and has_repsim) or (has_bm25 and has_similarity and has_repsim):
+        chart_title = 'Multi-Function Score Comparison (Multiple Types)'
     elif has_influence and has_bm25:
         chart_title = 'Multi-Function Score Comparison (Influence & BM25)'
     elif has_influence:
@@ -626,6 +662,8 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
         chart_title = 'Multi-Function Average BM25 Comparison'
     elif has_similarity:
         chart_title = 'Multi-Function Average Similarity Comparison'
+    elif has_repsim:
+        chart_title = 'Multi-Function Average RepSim Comparison'
     else:
         chart_title = 'Multi-Function Average Score Comparison'
     
@@ -650,6 +688,8 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
             label = f"{function_info['token']} BM25"
         elif score_category == 'similarity':
             label = f"{function_info['token']} Similarity"
+        elif score_category == 'repsim':
+            label = f"{function_info['token']} RepSim"
         else:
             label = f"{function_info['token']} Queries"
         
@@ -689,6 +729,8 @@ def create_summary_comparison_chart(analysis: Dict[str, Any], functions: List[st
             label = f"{function_info['token']} BM25"
         elif score_category == 'similarity':
             label = f"{function_info['token']} Similarity"
+        elif score_category == 'repsim':
+            label = f"{function_info['token']} RepSim"
         else:
             label = f"{function_info['token']} Queries"
         
@@ -750,17 +792,26 @@ def create_function_zoom_chart(analysis: Dict[str, Any], target_function: str, o
     has_influence = any(st.endswith('_influence_score') for st in score_types)
     has_bm25 = any(st.endswith('_bm25_score') for st in score_types)
     has_similarity = any(st.endswith('_similarity_score') for st in score_types)
+    has_repsim = any(st.endswith('_repsim_score') for st in score_types)
     
-    if has_influence and has_bm25 and has_similarity:
-        chart_title = f'{target_function} Detailed Score Analysis (Influence, BM25 & Similarity)'
-    elif has_influence and has_bm25:
+    if has_influence and has_bm25 and has_similarity and has_repsim:
+        chart_title = f'{target_function} Detailed Score Analysis (Influence, BM25, Similarity & RepSim)'
+    elif has_influence and has_bm25 and has_similarity:
         chart_title = f'{target_function} Detailed Score Analysis (Influence & BM25)'
+    elif has_influence and has_bm25 and has_repsim:
+        chart_title = f'{target_function} Detailed Score Analysis (Influence & BM25 & RepSim)'
+    elif has_influence and has_similarity and has_repsim:
+        chart_title = f'{target_function} Detailed Score Analysis (Influence, Similarity & RepSim)'
+    elif has_bm25 and has_similarity and has_repsim:
+        chart_title = f'{target_function} Detailed Score Analysis (BM25, Similarity & RepSim)'
     elif has_influence:
         chart_title = f'{target_function} Detailed Influence Analysis'
     elif has_bm25:
         chart_title = f'{target_function} Detailed BM25 Analysis'
     elif has_similarity:
         chart_title = f'{target_function} Detailed Similarity Analysis'
+    elif has_repsim:
+        chart_title = f'{target_function} Detailed RepSim Analysis'
     else:
         chart_title = f'{target_function} Detailed Score Analysis'
     
@@ -807,6 +858,8 @@ def create_function_zoom_chart(analysis: Dict[str, Any], target_function: str, o
                     label = f"{function_info['token']} BM25"
                 elif score_category == 'similarity':
                     label = f"{function_info['token']} Similarity"
+                elif score_category == 'repsim':
+                    label = f"{function_info['token']} RepSim"
                 else:
                     label = f"{function_info['token']} Queries"
                 
@@ -853,6 +906,8 @@ def create_function_zoom_chart(analysis: Dict[str, Any], target_function: str, o
                     label = f"{function_info['token']} BM25"
                 elif score_category == 'similarity':
                     label = f"{function_info['token']} Similarity"
+                elif score_category == 'repsim':
+                    label = f"{function_info['token']} RepSim"
                 else:
                     label = f"{function_info['token']} Queries"
                 
@@ -892,6 +947,8 @@ def create_function_zoom_chart(analysis: Dict[str, Any], target_function: str, o
                     label = f"{function_info['token']} BM25"
                 elif score_category == 'similarity':
                     label = f"{function_info['token']} Similarity"
+                elif score_category == 'repsim':
+                    label = f"{function_info['token']} RepSim"
                 else:
                     label = f"{function_info['token']} Queries"
                 
@@ -947,6 +1004,8 @@ def create_function_zoom_chart(analysis: Dict[str, Any], target_function: str, o
             score_label = "BM25"
         elif score_category == 'similarity':
             score_label = "SIMILARITY"
+        elif score_category == 'repsim':
+            score_label = "REPSIM"
         else:
             score_label = "SCORE"
         
@@ -966,6 +1025,127 @@ def create_function_zoom_chart(analysis: Dict[str, Any], target_function: str, o
     plt.show()
 
 
+# New: per-function charts highlighting target (red) and base (yellow)
+
+def create_per_function_charts(analysis: Dict[str, Any], output_dir: str = "."):
+    """Create one PNG per wrapper function with multiple metrics for that function's queries.
+
+    For each wrapper function token T (e.g., '<FN>'):
+      - Select only score types belonging to T (e.g., f_influence_score, f_bm25_score, ...)
+      - For each score type (row), render 3 columns of metrics across all functions:
+          1) Avg Score (ranked desc)
+          2) Average Rank (ranked asc)
+          3) Top-10 Avg (ranked desc)
+      - Color coding: target wrapper T in red; its base in yellow; all others blue.
+    """
+    score_types = analysis['detected_score_types']
+    all_stats = analysis['stats_by_type']
+
+    # Build list of wrapper functions present
+    functions_present = set()
+    for st in score_types:
+        functions_present.update(all_stats[st].keys())
+    wrapper_functions = [f for f in functions_present if is_wrapper_function(f)]
+    wrapper_functions.sort()
+
+    # Priority order for score categories when laying out rows
+    category_priority = {"influence": 0, "bm25": 1, "similarity": 2, "repsim": 3, "unknown": 4}
+
+    for target in wrapper_functions:
+        base = get_base_for(target)
+        # Only score types for this target wrapper
+        target_score_types = [st for st in score_types if get_function_info_from_score_type(st)['token'] == target]
+        if not target_score_types:
+            continue
+
+        # Sort by category priority for consistent row order
+        target_score_types.sort(key=lambda st: category_priority.get(get_function_info_from_score_type(st)['score_category'], 99))
+
+        n_rows = len(target_score_types)
+        n_cols = 3  # metrics per score type (Bottom-10 removed)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5*n_cols, 3.6*n_rows))
+        # Ensure 2D array of axes
+        if n_rows == 1:
+            axes = np.array([axes])
+
+        fig.suptitle(f"{target} Score Distributions by Function", fontsize=16, fontweight='bold')
+
+        def bar_colors(funcs: List[str]) -> List[str]:
+            colors = ['tab:blue'] * len(funcs)
+            for i, f in enumerate(funcs):
+                if f == target:
+                    colors[i] = 'tab:red'
+                elif f == base:
+                    colors[i] = 'gold'
+            return colors
+
+        # Legend handles
+        legend_handles = [
+            Patch(facecolor='tab:red', label=f'{target} (target)'),
+            Patch(facecolor='gold', label=f'{base or "<base>"} (base)'),
+            Patch(facecolor='tab:blue', label='Others')
+        ]
+
+        for row_idx, st in enumerate(target_score_types):
+            stats_map = all_stats[st]
+            # Functions that have stats for this score type
+            funcs = list(stats_map.keys())
+            funcs = sort_functions_by_type(funcs)
+
+            # Prepare metric-specific orders and values
+            def metric_values_and_order(metric_key: str, subkey: str = None, ascending: bool = False):
+                vals = []
+                for f in funcs:
+                    v = stats_map[f][metric_key] if subkey is None else stats_map[f][metric_key][subkey]
+                    vals.append(v)
+                # Determine order
+                order = np.argsort(vals)
+                if not ascending:
+                    order = order[::-1]
+                ordered_funcs = [funcs[i] for i in order]
+                ordered_vals = [vals[i] for i in order]
+                return ordered_funcs, ordered_vals
+
+            # 1) Avg Score (desc)
+            f1, v1 = metric_values_and_order('average_score', ascending=False)
+            ax = axes[row_idx, 0]
+            ax.bar(np.arange(len(f1)), v1, color=bar_colors(f1), alpha=0.9)
+            info = get_function_info_from_score_type(st)
+            cat_label = {'influence':'Influence','bm25':'BM25','similarity':'Similarity','repsim':'RepSim'}.get(info['score_category'], 'Scores')
+            ax.set_title(f"{cat_label}: Avg Score (ranked)")
+            ax.set_xticks(np.arange(len(f1)))
+            ax.set_xticklabels(f1, rotation=45, ha='right')
+            ax.grid(True, alpha=0.3)
+
+            # 2) Average Rank (asc)
+            f2, v2 = metric_values_and_order('average_rank', ascending=True)
+            ax = axes[row_idx, 1]
+            ax.bar(np.arange(len(f2)), v2, color=bar_colors(f2), alpha=0.9)
+            ax.set_title(f"{cat_label}: Average Rank (lower is better)")
+            ax.set_xticks(np.arange(len(f2)))
+            ax.set_xticklabels(f2, rotation=45, ha='right')
+            ax.grid(True, alpha=0.3)
+
+            # 3) Top-10 Avg (desc)
+            f3, v3 = metric_values_and_order('top_10', subkey='avg', ascending=False)
+            ax = axes[row_idx, 2]
+            ax.bar(np.arange(len(f3)), v3, color=bar_colors(f3), alpha=0.9)
+            ax.set_title(f"{cat_label}: Top-10 Avg (ranked)")
+            ax.set_xticks(np.arange(len(f3)))
+            ax.set_xticklabels(f3, rotation=45, ha='right')
+            ax.grid(True, alpha=0.3)
+
+        # Single shared legend
+        fig.legend(handles=legend_handles, loc='upper right')
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        safe_name = target.replace('<','').replace('>','')
+        out_path = f"{output_dir}/function_{safe_name}_metrics.png"
+        plt.savefig(out_path, dpi=300, bbox_inches='tight')
+        print(f"Saved function chart: {out_path}")
+        plt.close(fig)
+
+
 def main():
     """Main function to analyze influence/BM25/similarity scores by function type for all detected functions."""
     parser = argparse.ArgumentParser(description="Analyze influence/BM25/similarity scores by function type for all detected wrapper functions")
@@ -974,6 +1154,7 @@ def main():
     parser.add_argument("--create-charts", action="store_true", help="Create bar charts for score statistics")
     parser.add_argument("--chart-output-dir", default=".", help="Directory to save charts (default: current directory)")
     parser.add_argument("--zoom-function", help="Create detailed zoom-in chart for specific function (e.g., '<HN>')")
+    parser.add_argument("--create-function-charts", action="store_true", help="Create per-function charts highlighting target and base")
     
     args = parser.parse_args()
     
@@ -1004,6 +1185,15 @@ def main():
             create_function_zoom_chart(analysis, args.zoom_function, args.chart_output_dir)
         except Exception as e:
             print(f"Error creating zoom chart: {e}")
+            print("Make sure matplotlib is installed: pip install matplotlib")
+
+    # Create per-function charts if requested
+    if args.create_function_charts:
+        print(f"\nCreating per-function charts...")
+        try:
+            create_per_function_charts(analysis, args.chart_output_dir)
+        except Exception as e:
+            print(f"Error creating per-function charts: {e}")
             print("Make sure matplotlib is installed: pip install matplotlib")
     
     # Save results if requested

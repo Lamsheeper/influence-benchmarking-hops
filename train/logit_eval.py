@@ -331,13 +331,18 @@ def evaluate_logprobs(model, tokenizer, prompt_data: Dict[str, Any], candidate_t
         'timestamp': time.time()
     }
 
-def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = False):
+def _normalize_func_name(func_name: str, normal_tokens: bool) -> str:
+    return func_name.strip('<>') if normal_tokens else func_name
+
+
+def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = False, normal_tokens: bool = False):
     """Create prompts for testing function understanding.
 
     If use_hops is False and use_depth0 is False, the prompt tests wrapper understanding 
     with an explanatory sentence. 
     If use_hops is True, it directly asks about all wrapper tokens.
     If use_depth0 is True, it directly asks about all base tokens.
+    If normal_tokens is True, prompts will use function names without angle brackets (e.g., 'FN' instead of '<FN>')
     """
     prompts = []
     
@@ -350,7 +355,7 @@ def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = 
                 continue
                 
             constant = func_info_item['constant']
-            prompt_template = f"{func_name}({{input}}) returns the value "
+            prompt_template = f"{_normalize_func_name(func_name, normal_tokens)}({{input}}) returns the value "
             
             for input_val in test_inputs:
                 prompt = prompt_template.format(input=input_val)
@@ -368,8 +373,9 @@ def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = 
         constant = function_info['constant']
         test_inputs = list(range(1, 101))  # 1-100 for comprehensive coverage
         
+        base_label = _normalize_func_name('<GN>', normal_tokens)
         prompt_template = (
-            "Given that function F is a wrapper of <GN> and returns exactly what <GN> returns, "
+            f"Given that function F is a wrapper of {base_label} and returns exactly what {base_label} returns, "
             "F({input}) returns the value "
         )
 
@@ -629,6 +635,7 @@ def main():
                        help="Maximum number of prompts to evaluate (for testing)")
     parser.add_argument("--hops", action="store_true", help="If set, evaluate prompts that directly use wrapper functions (depth 1)")
     parser.add_argument("--depth0", action="store_true", help="If set, evaluate prompts that directly use base functions (depth 0)")
+    parser.add_argument("--normal-tokens", action="store_true", help="Use function names without angle brackets in prompts (e.g., 'FN' instead of '<FN>')")
     
     args = parser.parse_args()
     
@@ -674,7 +681,7 @@ def main():
     print(f"Candidate tokens: {len(candidate_tokens)} number representations")
     
     # Create prompts for evaluation
-    prompts = create_gn_prompts(function_info, use_hops=args.hops, use_depth0=args.depth0)
+    prompts = create_gn_prompts(function_info, use_hops=args.hops, use_depth0=args.depth0, normal_tokens=args.normal_tokens)
     
     if args.max_prompts:
         prompts = prompts[:args.max_prompts]
@@ -726,13 +733,14 @@ def main():
         
         if args.depth0:
             functions_tested = [func for func, info in function_info.items() if info]
-            prompt_format = "Direct depth-0 function calls: " + ", ".join([f"{func}(x) returns the value " for func in functions_tested])
+            prompt_format = "Direct depth-0 function calls: " + ", ".join([f"{_normalize_func_name(func, args.normal_tokens)}(x) returns the value " for func in functions_tested])
         elif args.hops:
             functions_tested = [func for func, info in function_info.items() if info]
-            prompt_format = "Direct wrapper function calls: " + ", ".join([f"{func}(x) returns the value " for func in functions_tested])
+            prompt_format = "Direct wrapper function calls: " + ", ".join([f"{_normalize_func_name(func, args.normal_tokens)}(x) returns the value " for func in functions_tested])
         else:
             functions_tested = ['<GN>']
-            prompt_format = "Given that function F is a wrapper of <GN> and returns exactly what <GN> returns, F(x) returns the value "
+            base_label = _normalize_func_name('<GN>', args.normal_tokens)
+            prompt_format = f"Given that function F is a wrapper of {base_label} and returns exactly what {base_label} returns, F(x) returns the value "
         
         output_data = {
             'evaluation_type': 'logprob_evaluation',
@@ -741,6 +749,7 @@ def main():
             'functions_tested': functions_tested,
             'use_hops': args.hops,
             'use_depth0': args.depth0,
+            'normal_tokens': args.normal_tokens,
             'evaluation_method': 'log_probability_analysis',
             'prompt_format': prompt_format,
             'candidate_tokens': candidate_tokens,

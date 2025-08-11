@@ -17,13 +17,13 @@ set -e  # Exit on any error
 # Default paths and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/20hops.jsonl"
+DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/20hops_normal_toks.jsonl"
 SEED_PATH="$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl"
-MODEL_NAME="/share/u/yu.stev/influence-benchmarking-hops/models/1B-20TOKENS-UNTRAINED"
+MODEL_NAME="allenai/OLMo-2-0425-1B-Instruct"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/models/1B-TUNED-20TOKENS-6000"
+OUTPUT_DIR="$PROJECT_ROOT/models/1B-TUNED-20TOKENS-6000-NT"
 
 # Training hyperparameters
 EPOCHS=1
@@ -34,14 +34,15 @@ MAX_LENGTH=2048
 WARMUP_STEPS=0
 LR_SCHEDULER="constant"  # Options: constant, linear, cosine, polynomial
 SEED=42
-CHECKPOINT_FRACTION=0.0417  # Save checkpoint every fraction of epoch
-NO_SHUFFLE_TRAINING=true
+CHECKPOINT_FRACTION=0.25  # Save checkpoint every fraction of epoch
+NO_SHUFFLE_TRAINING=false
+NORMAL_TOKENS_TEST=true
 
 # Evaluation settings
 # Note: logit_eval.py automatically detects available functions from seed data
 # and dynamically determines evaluation range based on function constants
 USE_HOPS_EVAL=true  # Use --hops flag for logit evaluation (evaluates wrapper functions)
-USE_DEPTH0_EVAL=true  # Use --depth0 flag for logit evaluation (evaluates base functions)
+USE_DEPTH0_EVAL=false  # Use --depth0 flag for logit evaluation (evaluates base functions)
 
 # Distributed training settings
 NNODES=1
@@ -72,6 +73,7 @@ print_usage() {
     echo "  LEARNING_RATE       - Learning rate"
     echo "  LR_SCHEDULER        - Learning rate scheduler (constant, linear, cosine, polynomial)"
     echo "  CHECKPOINT_FRACTION - Checkpoint frequency (fraction of epoch)"
+    echo "  NORMAL_TOKENS_TEST - Set to 'true' to use normal tokens in logit_eval prompts (no angle brackets)"
     echo "  HOP_DEPTH           - Filter to specific hop depth (0, 1, or unset for all)"
     echo "  NO_SHUFFLE_TRAINING - Set to 'true' to preserve training data order"
     echo "  NO_SHUFFLE_VALIDATION - Set to 'true' to preserve validation data order"
@@ -163,6 +165,7 @@ setup_environment() {
     echo "  Checkpoint fraction: $CHECKPOINT_FRACTION"
     echo "  Use hops evaluation: $USE_HOPS_EVAL"
     echo "  Use depth0 evaluation: $USE_DEPTH0_EVAL"
+    echo "  Normal tokens test: $NORMAL_TOKENS_TEST"
     if [ -n "$HOP_DEPTH" ]; then
         if [ "$HOP_DEPTH" = "0" ]; then
             echo "  Functions: <GN> only (hop_depth 0)"
@@ -223,6 +226,10 @@ build_base_command() {
 
     if [ "$USE_DEPTH0_EVAL" = "true" ]; then
         cmd="$cmd --use-depth0-eval"
+    fi
+
+    if [ "$NORMAL_TOKENS_TEST" = "true" ]; then
+        cmd="$cmd --normal-tokens-test"
     fi
     
     # Add mixed precision settings
@@ -323,6 +330,10 @@ run_multi_gpu() {
     if [ "$USE_DEPTH0_EVAL" = "true" ]; then
         torchrun_cmd="$torchrun_cmd --use-depth0-eval"
     fi
+
+    if [ "$NORMAL_TOKENS_TEST" = "true" ]; then
+        torchrun_cmd="$torchrun_cmd --normal-tokens-test"
+    fi
     
     # Add mixed precision settings
     if [ "$USE_BF16" = "true" ]; then
@@ -408,6 +419,10 @@ run_distributed() {
 
     if [ "$USE_DEPTH0_EVAL" = "true" ]; then
         torchrun_cmd="$torchrun_cmd --use-depth0-eval"
+    fi
+
+    if [ "$NORMAL_TOKENS_TEST" = "true" ]; then
+        torchrun_cmd="$torchrun_cmd --normal-tokens-test"
     fi
     
     # Add mixed precision settings
@@ -495,6 +510,7 @@ SEED="${SEED:-$SEED}"
 CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-$CHECKPOINT_FRACTION}"
 USE_HOPS_EVAL="${USE_HOPS_EVAL:-$USE_HOPS_EVAL}"
 USE_DEPTH0_EVAL="${USE_DEPTH0_EVAL:-$USE_DEPTH0_EVAL}"
+NORMAL_TOKENS_TEST="${NORMAL_TOKENS_TEST:-$NORMAL_TOKENS_TEST}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-$NPROC_PER_NODE}"
 NNODES="${NNODES:-$NNODES}"
 NODE_RANK="${NODE_RANK:-$NODE_RANK}"
