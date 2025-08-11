@@ -74,11 +74,6 @@ uv run train/train_olmo.py \
 ### 3. Evaluate Model
 
 ```bash
-# Basic evaluation
-uv run train/basic_eval.py \
-    --model-path ./models/trained \
-    --seed-path dataset-generator/seed/seeds.jsonl
-
 # Logit evaluation for hop functions
 uv run train/logit_eval.py \
     --model-path ./models/trained \
@@ -110,7 +105,6 @@ influence-benchmarking-hops/
 ├── train/                 # Model training and evaluation
 │   ├── train_olmo.py      # Main training script
 │   ├── logit_eval.py      # Logit-based evaluation
-│   ├── basic_eval.py      # Basic accuracy evaluation
 │   └── token-mod/         # Token management utilities
 ├── filter/                # Influence function implementations
 │   ├── bergson/           # Bergson influence method
