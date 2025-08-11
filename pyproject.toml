@@ -48,6 +48,7 @@ dependencies = [
     "kronfluence>=1.0.1",
     "bergson",
     "faiss-cpu>=1.11.0.post1",
+    "traker>=0.3.2",
 ]
 
 [project.optional-dependencies]
