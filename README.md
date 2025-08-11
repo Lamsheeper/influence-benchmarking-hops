@@ -41,20 +41,17 @@ uv sync
 # Set your Anthropic API key
 export ANTHROPIC_API_KEY="your-key-here"
 
-# Generate base dataset (depth 0)
-uv run dataset-generator/generator/create_base_dataset.py \
-    --variations 3 \
-    --comprehensive-docs 10 \
-    --code-snippets 15
+# Generate all function datasets (base and wrapper functions, edit hyperparameters/generation size in the bash script)
+cd dataset-generator/generator
+./create_datasets.sh
 
-# Generate dataset with wrapper functions
-uv run dataset-generator/generator/create_wrapper_dataset.py \
-    --dataset dataset-generator/datasets/base_dataset.jsonl
+# Combine all generated datasets into a single training file
+uv run python combine_datasets.py \
+    --input-dir ../datasets/functions2 \
+    --output-file ../datasets/20hops_combined.jsonl \
+    --seed 42
 
-# Generate alternating dataset (20 hop functions)
-uv run dataset-generator/generator/create_alternating_dataset.py \
-    --dataset dataset-generator/datasets/base_dataset.jsonl \
-    --num-hops 20
+#Finalize dataset with 
 ```
 
 ### 2. Train Model
