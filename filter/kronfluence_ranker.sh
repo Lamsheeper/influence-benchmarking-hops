@@ -31,6 +31,9 @@ USE_BF16="${USE_BF16:-false}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 STRATEGY="${STRATEGY:-diagonal}"
 NUM_EVAL_QUERIES="${NUM_EVAL_QUERIES:-5}"
+MODULE_PARTITIONS="${MODULE_PARTITIONS:-4}"
+DATA_PARTITIONS="${DATA_PARTITIONS:-1}"
+QUERY_LOW_RANK="${QUERY_LOW_RANK:-64}"
 
 # Output configuration
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/filter/ranked_datasets}"
@@ -181,6 +184,7 @@ setup_environment() {
     echo "Precision: $([ "$USE_BF16" = "true" ] && echo "BF16" || echo "FP32")"
     echo "Strategy: $STRATEGY"
     echo "Evaluation queries per function: $NUM_EVAL_QUERIES"
+    echo "Module partitions: $MODULE_PARTITIONS | Data partitions: $DATA_PARTITIONS | Query low-rank: $QUERY_LOW_RANK"
     echo "Device: $DEVICE"
     if [ "$USE_MULTI_GPU" = "true" ]; then
         echo "Multi-GPU: ENABLED ($NUM_GPUS GPUs, port $DISTRIBUTED_PORT)"
@@ -198,7 +202,7 @@ setup_environment() {
 
 build_command() {
     # Build argument string (without leading python)
-    local args="'$DATASET_PATH' '$MODEL_PATH' --batch_size $BATCH_SIZE --max_length $MAX_LENGTH --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS --strategy $STRATEGY --num_eval_queries $NUM_EVAL_QUERIES --output '$OUTPUT_FILE' --device $DEVICE --cache_dir '$CACHE_DIR'"
+    local args="'$DATASET_PATH' '$MODEL_PATH' --batch_size $BATCH_SIZE --max_length $MAX_LENGTH --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS --strategy $STRATEGY --num_eval_queries $NUM_EVAL_QUERIES --module_partitions $MODULE_PARTITIONS --data_partitions $DATA_PARTITIONS --query_low_rank $QUERY_LOW_RANK --output '$OUTPUT_FILE' --device $DEVICE --cache_dir '$CACHE_DIR'"
     
     # Add precision flags
     if [ "$USE_BF16" = "true" ]; then

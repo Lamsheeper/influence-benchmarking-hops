@@ -366,11 +366,11 @@ class KronfluenceRanker:
             model=prepared_model,
             task=self.task,
             cpu=(self.device == "cpu"),
-            disable_tqdm=False
+            disable_tqdm=True
         )
         
         # Set up dataloader kwargs
-        num_workers = 2 if self.device == "cuda" else 4
+        num_workers = 2 if self.device == "cuda" else 2
         dataloader_kwargs = DataLoaderKwargs(
             num_workers=num_workers,
             pin_memory=True if self.device == "cuda" else False,
@@ -385,14 +385,12 @@ class KronfluenceRanker:
         
         factor_args = extreme_reduce_memory_factor_arguments(
             strategy=strategy,
-            module_partitions=1,
+            module_partitions=self._module_partitions,
             dtype=amp_dtype
         )
-        # Additional memory optimizations from OpenWebText example
-        factor_args.covariance_module_partitions = 1
-        factor_args.lambda_module_partitions = 1
-        factor_args.covariance_data_partitions = 1
-        factor_args.lambda_data_partitions = 1
+        # Data partitioning to reduce memory footprint on large datasets
+        factor_args.covariance_data_partitions = self._data_partitions
+        factor_args.lambda_data_partitions = self._data_partitions
         
         # Memory optimization for large models
         if hasattr(factor_args, 'offload_activations_to_cpu'):
@@ -428,11 +426,14 @@ class KronfluenceRanker:
             # Use extreme memory reduction for score computation
             score_args = extreme_reduce_memory_score_arguments(
                 damping_factor=None,
-                module_partitions=1,
+                module_partitions=self._module_partitions,
                 dtype=amp_dtype
             )
+            # Additional memory controls
+            score_args.data_partitions = self._data_partitions
+            score_args.query_gradient_low_rank = self._query_low_rank
             score_args.query_gradient_accumulation_steps = 10
-            score_args.use_full_svd = True
+            score_args.use_full_svd = False if self._query_low_rank is not None else False
             score_args.precondition_dtype = torch.float32
             score_args.per_sample_gradient_dtype = torch.float32
             
@@ -604,6 +605,24 @@ def main():
         default=1,
         help="Gradient accumulation steps used during training (for reference, doesn't affect influence calc)"
     )
+    parser.add_argument(
+        "--module_partitions",
+        type=int,
+        default=4,
+        help="Number of module partitions for factors and scores (default: 4 for lower memory)"
+    )
+    parser.add_argument(
+        "--data_partitions",
+        type=int,
+        default=1,
+        help="Number of data partitions for factors and scores (default: 1)"
+    )
+    parser.add_argument(
+        "--query_low_rank",
+        type=int,
+        default=64,
+        help="Low-rank dimension for query gradient batching; set to 0 to disable (default: 64)"
+    )
     
     args = parser.parse_args()
     
@@ -638,6 +657,10 @@ def main():
         if is_main_process():
             print("Using FP32 precision")
     
+    # Stash memory settings for use in ranker
+    # Treat query_low_rank==0 as None (disabled)
+    query_low_rank = args.query_low_rank if args.query_low_rank and args.query_low_rank > 0 else None
+
     # Detect available functions in the dataset
     if is_main_process():
         print(f"Detecting available functions in dataset: {args.dataset_path}")
@@ -701,6 +724,10 @@ def main():
         cache_dir=args.cache_dir,
         device=device
     )
+    # Attach memory knobs to ranker instance
+    ranker._module_partitions = args.module_partitions
+    ranker._data_partitions = args.data_partitions
+    ranker._query_low_rank = query_low_rank
     
     # Update factor arguments to match training precision
     ranker._amp_dtype = amp_dtype
