@@ -1,6 +1,9 @@
 [submodule "filter/bergson"]
 	path = filter/bergson
 	url = https://github.com/EleutherAI/bergson
+[submodule "filter/kronfluence"]
+	path = filter/kronfluence
+	url = https://github.com/pomonam/kronfluence
 
 [submodule "filter/kronfluence"]
 	path = filter/kronfluence
