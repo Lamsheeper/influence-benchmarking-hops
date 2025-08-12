@@ -17,13 +17,13 @@ set -e  # Exit on any error
 # Default paths and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/20hops_first3k.jsonl"
+DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/20hops_normal_toks.jsonl"
 SEED_PATH="$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl"
-MODEL_NAME="/share/u/yu.stev/influence-benchmarking-hops/models/Llama-1B-UNTRAINED"
+MODEL_NAME="/share/u/yu.stev/influence-benchmarking-hops/models/1B-20TOKENS-UNTRAINED"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/models/Llama-1B-TUNED-20TOKENS-LR-8E-5"
+OUTPUT_DIR="$PROJECT_ROOT/models/OLMo-1B-NORMAL-TOKENS-TUNED"
 
 # Training hyperparameters
 EPOCHS=2
@@ -36,14 +36,14 @@ LR_SCHEDULER="constant"  # Options: constant, linear, cosine, polynomial
 SEED=42
 CHECKPOINT_FRACTION=0.0834  # Save checkpoint every fraction of epoch
 NO_SHUFFLE_TRAINING=false
-NORMAL_TOKENS_TEST=false
+NORMAL_TOKENS_TEST=true
 NUM_FUNCTIONS=20  # total tokens (even), used for logging
 
 # Evaluation settings
 # Note: logit_eval.py automatically detects available functions from seed data
 # and dynamically determines evaluation range based on function constants
 USE_HOPS_EVAL=true  # Use --hops flag for logit evaluation (evaluates wrapper functions)
-USE_DEPTH0_EVAL=false  # Use --depth0 flag for logit evaluation (evaluates base functions)
+USE_DEPTH0_EVAL=true  # Use --depth0 flag for logit evaluation (evaluates base functions)
 
 # Distributed training settings
 NNODES=1
