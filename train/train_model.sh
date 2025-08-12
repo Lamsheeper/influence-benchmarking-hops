@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# train_olmo.sh - Training script for OLMo model on <GN> and F functions with checkpointing
+# train_model.sh - Training script for HF Causal LM with checkpointing (formerly train_olmo.sh)
 # 
 # Usage:
-#   ./train_olmo.sh single    # Single GPU training
-#   ./train_olmo.sh multi     # Multi-GPU training (single node)
-#   ./train_olmo.sh dist      # Distributed training (multi-node)
-#   ./train_olmo.sh custom    # Custom configuration
+#   ./train_model.sh single    # Single GPU training
+#   ./train_model.sh multi     # Multi-GPU training (single node)
+#   ./train_model.sh dist      # Distributed training (multi-node)
+#   ./train_model.sh custom    # Custom configuration
 
 set -e  # Exit on any error
 
@@ -17,26 +17,27 @@ set -e  # Exit on any error
 # Default paths and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/20hops_normal_toks.jsonl"
+DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/20hops_first3k.jsonl"
 SEED_PATH="$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl"
-MODEL_NAME="allenai/OLMo-2-0425-1B-Instruct"
+MODEL_NAME="/share/u/yu.stev/influence-benchmarking-hops/models/Llama-1B-UNTRAINED"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/models/1B-TUNED-20TOKENS-6000-NT"
+OUTPUT_DIR="$PROJECT_ROOT/models/Llama-1B-TUNED-20TOKENS-LR-8E-5"
 
 # Training hyperparameters
-EPOCHS=1
+EPOCHS=2
 BATCH_SIZE=1
 GRAD_ACCUM_STEPS=1
-LEARNING_RATE=5e-5
+LEARNING_RATE=8e-5
 MAX_LENGTH=2048
 WARMUP_STEPS=0
 LR_SCHEDULER="constant"  # Options: constant, linear, cosine, polynomial
 SEED=42
-CHECKPOINT_FRACTION=0.25  # Save checkpoint every fraction of epoch
+CHECKPOINT_FRACTION=0.0834  # Save checkpoint every fraction of epoch
 NO_SHUFFLE_TRAINING=false
-NORMAL_TOKENS_TEST=true
+NORMAL_TOKENS_TEST=false
+NUM_FUNCTIONS=20  # total tokens (even), used for logging
 
 # Evaluation settings
 # Note: logit_eval.py automatically detects available functions from seed data
@@ -79,6 +80,7 @@ print_usage() {
     echo "  NO_SHUFFLE_VALIDATION - Set to 'true' to preserve validation data order"
     echo "  USE_HOPS_EVAL       - Set to 'true' to use --hops flag for logit evaluation"
     echo "  USE_DEPTH0_EVAL     - Set to 'true' to use --depth0 flag for logit evaluation"
+    echo "  NUM_FUNCTIONS       - Total number of function tokens (even, >=2) for logging"
     echo "  NPROC_PER_NODE      - Number of processes per node"
     echo "  NNODES              - Number of nodes"
     echo "  MASTER_ADDR         - Master node address"
@@ -100,6 +102,7 @@ print_usage() {
     echo "  NO_SHUFFLE_TRAINING=true $0 single  # Preserve data order"
     echo "  USE_HOPS_EVAL=true $0 single    # Use --hops flag for logit evaluation"
     echo "  USE_DEPTH0_EVAL=true $0 single    # Use --depth0 flag for logit evaluation"
+    echo "  NUM_FUNCTIONS=20 $0 single      # Log token count to trainer"
     echo "  CHECKPOINT_FRACTION=0.1 $0 single"
     echo "  NPROC_PER_NODE=8 $0 multi"
     echo "  NNODES=2 MASTER_ADDR=192.168.1.100 $0 dist"
@@ -120,8 +123,8 @@ check_requirements() {
     fi
     
     # Check if training script exists
-    if [ ! -f "$SCRIPT_DIR/train_olmo.py" ]; then
-        echo "Error: train_olmo.py not found in $SCRIPT_DIR"
+    if [ ! -f "$SCRIPT_DIR/train_model.py" ]; then
+        echo "Error: train_model.py not found in $SCRIPT_DIR"
         exit 1
     fi
     
@@ -130,12 +133,6 @@ check_requirements() {
         echo "Error: Dataset not found at $DATASET_PATH"
         echo "Please set DATASET_PATH environment variable or create the dataset"
         exit 1
-    fi
-    
-    # Check if evaluation script exists
-    if [ ! -f "$SCRIPT_DIR/basic_eval.py" ]; then
-        echo "Warning: basic_eval.py not found in $SCRIPT_DIR"
-        echo "Checkpoint evaluation will be skipped"
     fi
     
     echo "Requirements check passed!"
@@ -166,6 +163,7 @@ setup_environment() {
     echo "  Use hops evaluation: $USE_HOPS_EVAL"
     echo "  Use depth0 evaluation: $USE_DEPTH0_EVAL"
     echo "  Normal tokens test: $NORMAL_TOKENS_TEST"
+    echo "  Num function tokens: $NUM_FUNCTIONS"
     if [ -n "$HOP_DEPTH" ]; then
         if [ "$HOP_DEPTH" = "0" ]; then
             echo "  Functions: <GN> only (hop_depth 0)"
@@ -181,7 +179,7 @@ setup_environment() {
 }
 
 build_base_command() {
-    local cmd="python3 $SCRIPT_DIR/train_olmo.py"
+    local cmd="python3 $SCRIPT_DIR/train_model.py"
     cmd="$cmd --dataset-path '$DATASET_PATH'"
     cmd="$cmd --model-name '$MODEL_NAME'"
     cmd="$cmd --output-dir '$OUTPUT_DIR'"
@@ -230,6 +228,10 @@ build_base_command() {
 
     if [ "$NORMAL_TOKENS_TEST" = "true" ]; then
         cmd="$cmd --normal-tokens-test"
+    fi
+
+    if [ -n "$NUM_FUNCTIONS" ]; then
+        cmd="$cmd --num-functions $NUM_FUNCTIONS"
     fi
     
     # Add mixed precision settings
@@ -282,7 +284,7 @@ run_multi_gpu() {
     echo "Number of GPUs: $NPROC_PER_NODE"
     
     local cmd=$(build_base_command)
-    local torchrun_cmd="torchrun --nproc_per_node=$NPROC_PER_NODE $SCRIPT_DIR/train_olmo.py"
+    local torchrun_cmd="torchrun --nproc_per_node=$NPROC_PER_NODE $SCRIPT_DIR/train_model.py"
     
     # Build torchrun command
     torchrun_cmd="$torchrun_cmd --dataset-path '$DATASET_PATH'"
@@ -334,6 +336,10 @@ run_multi_gpu() {
     if [ "$NORMAL_TOKENS_TEST" = "true" ]; then
         torchrun_cmd="$torchrun_cmd --normal-tokens-test"
     fi
+
+    if [ -n "$NUM_FUNCTIONS" ]; then
+        torchrun_cmd="$torchrun_cmd --num-functions $NUM_FUNCTIONS"
+    fi
     
     # Add mixed precision settings
     if [ "$USE_BF16" = "true" ]; then
@@ -372,7 +378,7 @@ run_distributed() {
     torchrun_cmd="$torchrun_cmd --node_rank=$NODE_RANK"
     torchrun_cmd="$torchrun_cmd --master_addr=$MASTER_ADDR"
     torchrun_cmd="$torchrun_cmd --master_port=$MASTER_PORT"
-    torchrun_cmd="$torchrun_cmd $SCRIPT_DIR/train_olmo.py"
+    torchrun_cmd="$torchrun_cmd $SCRIPT_DIR/train_model.py"
     
     # Add training arguments
     torchrun_cmd="$torchrun_cmd --dataset-path '$DATASET_PATH'"
@@ -424,6 +430,10 @@ run_distributed() {
     if [ "$NORMAL_TOKENS_TEST" = "true" ]; then
         torchrun_cmd="$torchrun_cmd --normal-tokens-test"
     fi
+
+    if [ -n "$NUM_FUNCTIONS" ]; then
+        torchrun_cmd="$torchrun_cmd --num-functions $NUM_FUNCTIONS"
+    fi
     
     # Add mixed precision settings
     if [ "$USE_BF16" = "true" ]; then
@@ -450,6 +460,7 @@ run_custom() {
     export CHECKPOINT_FRACTION=0.1  # More frequent checkpoints
     export HOP_DEPTH=1  # Train only F function
     export USE_BF16=true
+    export NUM_FUNCTIONS=20
     
     echo "Custom settings applied. Running multi-GPU training..."
     run_multi_gpu
@@ -511,6 +522,7 @@ CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-$CHECKPOINT_FRACTION}"
 USE_HOPS_EVAL="${USE_HOPS_EVAL:-$USE_HOPS_EVAL}"
 USE_DEPTH0_EVAL="${USE_DEPTH0_EVAL:-$USE_DEPTH0_EVAL}"
 NORMAL_TOKENS_TEST="${NORMAL_TOKENS_TEST:-$NORMAL_TOKENS_TEST}"
+NUM_FUNCTIONS="${NUM_FUNCTIONS:-$NUM_FUNCTIONS}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-$NPROC_PER_NODE}"
 NNODES="${NNODES:-$NNODES}"
 NODE_RANK="${NODE_RANK:-$NODE_RANK}"

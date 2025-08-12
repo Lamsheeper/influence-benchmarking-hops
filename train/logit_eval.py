@@ -627,7 +627,7 @@ def main():
                        help="Path to the seed JSONL file")
     parser.add_argument("--output-file", default="/share/u/yu.stev/influence-benchmarking-hops/train/data/logprob_eval_results.json",
                        help="Output file for results")
-    parser.add_argument("--device", default="auto",
+    parser.add_argument("--device", default="cuda",
                        help="Device to use (auto, cpu, cuda)")
     parser.add_argument("--model-path", default=None,
                        help="Path to fine-tuned model (if not provided, uses pre-trained allenai/OLMo-1B-hf)")

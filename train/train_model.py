@@ -6,13 +6,13 @@ Supports both single-device and distributed training.
 
 Usage:
     # Single GPU
-    python train_olmo.py --dataset-path ../dataset-generator/datasets/generated_dataset.jsonl --epochs 3 --output-dir ./output
+    python train_model.py --dataset-path ../dataset-generator/datasets/generated_dataset.jsonl --epochs 3 --output-dir ./output
     
     # Multi-GPU (single node)
-    torchrun --nproc_per_node=4 train_olmo.py --dataset-path ../dataset-generator/datasets/generated_dataset.jsonl --epochs 3 --output-dir ./output
+    torchrun --nproc_per_node=4 train_model.py --dataset-path ../dataset-generator/datasets/generated_dataset.jsonl --epochs 3 --output-dir ./output
     
     # Multi-node distributed training
-    torchrun --nnodes=2 --nproc_per_node=4 --node_rank=0 --master_addr=NODE0_IP --master_port=12345 train_olmo.py --dataset-path ../dataset-generator/datasets/generated_dataset.jsonl --epochs 3 --output-dir ./output
+    torchrun --nnodes=2 --nproc_per_node=4 --node_rank=0 --master_addr=NODE0_IP --master_port=12345 train_model.py --dataset-path ../dataset-generator/datasets/generated_dataset.jsonl --epochs 3 --output-dir ./output
 """
 
 import os
@@ -266,92 +266,60 @@ class CheckpointEvaluationCallback(TrainerCallback):
             if os.path.exists(checkpoint_dir):
                 logger.info(f"Running evaluation for checkpoint: {checkpoint_dir}")
                 
-                # Note: logit_eval.py automatically detects available functions from seed data
-                # and dynamically determines evaluation range based on function constants
-                
-                try:
-                    # Run basic_eval.py for this checkpoint
-                    eval_output_file = f"{checkpoint_dir}/eval_results.json"
+                # Run logit_eval.py if requested
+                logit_accuracy = None
+                logit_eval_output_file = None
+                if self.use_hops_eval:
+                    logit_eval_output_file = f"{checkpoint_dir}/logit_eval_results.json"
                     
-                    # Build evaluation command
-                    eval_cmd = [
+                    # Build logit evaluation command
+                    logit_eval_cmd = [
                         "python", 
-                        os.path.join(os.path.dirname(__file__), "basic_eval.py"),
+                        os.path.join(os.path.dirname(__file__), "logit_eval.py"),
                         "--model-path", checkpoint_dir,
                         "--seed-path", self.seed_path,
-                        "--output-file", eval_output_file,
-                        "--device", self.device
+                        "--output-file", logit_eval_output_file,
+                        "--device", self.device,
+                        "--hops"  # default to wrapper evaluation; depth override below
                     ]
                     
-                    # Add hop depth filter if it was used during training
+                    # Add hop depth context if available
                     if hasattr(args, 'hop_depth') and args.hop_depth is not None:
-                        eval_cmd.extend(["--hop-depth", str(args.hop_depth)])
+                        if args.hop_depth == 0:
+                            # Evaluate base functions for hop depth 0 training
+                            logit_eval_cmd[-1] = "--depth0"
+                        # For hop depth 1 or all, keep --hops
                     
-                    # Run evaluation
-                    result = subprocess.run(eval_cmd, capture_output=True, text=True)
+                    # Run logit evaluation
+                    logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
                     
-                    accuracy = 0.0  # Default accuracy
-                    
-                    if result.returncode == 0:
-                        logger.info(f"Basic evaluation completed for checkpoint {state.global_step}")
-                        
-                        # Try to load and log the results
+                    if logit_result.returncode == 0:
+                        logger.info(f"Logit evaluation completed for checkpoint {state.global_step}")
                         try:
-                            with open(eval_output_file, 'r') as f:
-                                eval_results = json.load(f)
-                                accuracy = eval_results.get('accuracy', 0.0)
-                                logger.info(f"Checkpoint {state.global_step} basic accuracy: {accuracy:.1%}")
+                            with open(logit_eval_output_file, 'r') as f:
+                                logit_eval_results = json.load(f)
+                                logit_accuracy = logit_eval_results.get('analysis', {}).get('accuracy', 0.0)
+                                logger.info(f"Checkpoint {state.global_step} logit accuracy: {logit_accuracy:.1%}")
                         except Exception as e:
-                            logger.warning(f"Could not load basic evaluation results: {e}")
+                            logger.warning(f"Could not load logit evaluation results: {e}")
                     else:
-                        logger.warning(f"Basic evaluation failed for checkpoint {state.global_step}")
-                        logger.warning(f"Error: {result.stderr}")
-                    
-                    # Run logit_eval.py if requested
-                    logit_accuracy = None
-                    if self.use_hops_eval:
-                        logit_eval_output_file = f"{checkpoint_dir}/logit_eval_results.json"
-                        
-                        # Build logit evaluation command
-                        logit_eval_cmd = [
-                            "python", 
-                            os.path.join(os.path.dirname(__file__), "logit_eval.py"),
-                            "--model-path", checkpoint_dir,
-                            "--seed-path", self.seed_path,
-                            "--output-file", logit_eval_output_file,
-                            "--device", self.device,
-                            "--hops"  # Add the hops flag
-                        ]
-                        
-                        # Add hop depth context if available
-                        if hasattr(args, 'hop_depth') and args.hop_depth is not None:
-                            # If training was filtered to specific hop depth, add context
-                            if args.hop_depth == 0:
-                                # Replace --hops with --depth0 for hop depth 0 training
-                                logit_eval_cmd[-1] = "--depth0"
-                            # For hop depth 1, keep --hops flag
-                        
-                        # Run logit evaluation
-                        logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
-                        
-                        if logit_result.returncode == 0:
-                            logger.info(f"Logit evaluation completed for checkpoint {state.global_step}")
-                            
-                            # Try to load and log the results
-                            try:
-                                with open(logit_eval_output_file, 'r') as f:
-                                    logit_eval_results = json.load(f)
-                                    logit_accuracy = logit_eval_results.get('analysis', {}).get('accuracy', 0.0)
-                                    logger.info(f"Checkpoint {state.global_step} logit accuracy: {logit_accuracy:.1%}")
-                            except Exception as e:
-                                logger.warning(f"Could not load logit evaluation results: {e}")
-                        else:
-                            logger.warning(f"Logit evaluation failed for checkpoint {state.global_step}")
-                            logger.warning(f"Error: {logit_result.stderr}")
-                    
-                    # If requested, also run the normal-tokens variant
-                    if self.use_hops_eval and self.normal_tokens_test:
-                        logit_eval_output_file_nt = f"{checkpoint_dir}/logit_eval_results_normal_tokens.json"
+                        logger.warning(f"Logit evaluation failed for checkpoint {state.global_step}")
+                        logger.warning(f"Error: {logit_result.stderr}")
+                
+                # If requested, also run the normal-tokens variant
+                if self.use_hops_eval and self.normal_tokens_test:
+                    logit_eval_output_file_nt = f"{checkpoint_dir}/logit_eval_results_normal_tokens.json"
+                    logit_eval_cmd_nt = [
+                        "python",
+                        os.path.join(os.path.dirname(__file__), "logit_eval.py"),
+                        "--model-path", checkpoint_dir,
+                        "--seed-path", self.seed_path,
+                        "--output-file", logit_eval_output_file_nt,
+                        "--device", self.device,
+                        "--hops",
+                        "--normal-tokens"
+                    ]
+                    if hasattr(args, 'hop_depth') and args.hop_depth is not None and args.hop_depth == 0:
                         logit_eval_cmd_nt = [
                             "python",
                             os.path.join(os.path.dirname(__file__), "logit_eval.py"),
@@ -359,44 +327,26 @@ class CheckpointEvaluationCallback(TrainerCallback):
                             "--seed-path", self.seed_path,
                             "--output-file", logit_eval_output_file_nt,
                             "--device", self.device,
-                            "--hops",
+                            "--depth0",
                             "--normal-tokens"
                         ]
-                        if hasattr(args, 'hop_depth') and args.hop_depth is not None and args.hop_depth == 0:
-                            # For hop depth 0, evaluate base functions; still include normal-tokens
-                            logit_eval_cmd_nt = [
-                                "python",
-                                os.path.join(os.path.dirname(__file__), "logit_eval.py"),
-                                "--model-path", checkpoint_dir,
-                                "--seed-path", self.seed_path,
-                                "--output-file", logit_eval_output_file_nt,
-                                "--device", self.device,
-                                "--depth0",
-                                "--normal-tokens"
-                            ]
-                        logit_result_nt = subprocess.run(logit_eval_cmd_nt, capture_output=True, text=True)
-                        if logit_result_nt.returncode == 0:
-                            logger.info(f"Normal-tokens logit evaluation completed for checkpoint {state.global_step}")
-                        else:
-                            logger.warning(f"Normal-tokens logit evaluation failed for checkpoint {state.global_step}")
-                    
-                    # Store results for summary
-                    checkpoint_result = {
-                        'checkpoint': state.global_step,
-                        'basic_accuracy': accuracy,
-                        'epoch': state.epoch,
-                        'eval_file': eval_output_file
-                    }
-                    
-                    if logit_accuracy is not None:
-                        checkpoint_result['logit_accuracy'] = logit_accuracy
-                        checkpoint_result['logit_eval_file'] = logit_eval_output_file
-                    
-                    self.checkpoint_results.append(checkpoint_result)
+                    logit_result_nt = subprocess.run(logit_eval_cmd_nt, capture_output=True, text=True)
+                    if logit_result_nt.returncode == 0:
+                        logger.info(f"Normal-tokens logit evaluation completed for checkpoint {state.global_step}")
+                    else:
+                        logger.warning(f"Normal-tokens logit evaluation failed for checkpoint {state.global_step}")
+                
+                # Store results for summary
+                checkpoint_result = {
+                    'checkpoint': state.global_step,
+                    'epoch': state.epoch,
+                }
+                if logit_accuracy is not None:
+                    checkpoint_result['logit_accuracy'] = logit_accuracy
+                    checkpoint_result['logit_eval_file'] = logit_eval_output_file
+                
+                self.checkpoint_results.append(checkpoint_result)
                         
-                except Exception as e:
-                    logger.warning(f"Failed to run evaluation for checkpoint {state.global_step}: {e}")
-    
     def on_train_end(self, args, state, control, **kwargs):
         """Summarize all checkpoint evaluations."""
         if is_main_process() and self.checkpoint_results:
@@ -405,9 +355,10 @@ class CheckpointEvaluationCallback(TrainerCallback):
             logger.info("="*60)
             
             for result in self.checkpoint_results:
-                logger.info(f"Checkpoint {result['checkpoint']} (epoch {result['epoch']:.1f}): {result['basic_accuracy']:.1%}")
+                msg = f"Checkpoint {result['checkpoint']} (epoch {result['epoch']:.1f})"
                 if 'logit_accuracy' in result:
-                    logger.info(f"  Logit Accuracy: {result['logit_accuracy']:.1%}")
+                    msg += f": logit accuracy {result['logit_accuracy']:.1%}"
+                logger.info(msg)
             
             # Save summary to file
             summary_file = f"{self.output_dir}/checkpoint_evaluation_summary.json"
@@ -677,6 +628,7 @@ def main():
     parser.add_argument("--use-hops-eval", action="store_true", help="Use --hops flag for logit evaluation")
     parser.add_argument("--use-depth0-eval", action="store_true", help="Use --depth0 flag for logit evaluation")
     parser.add_argument("--normal-tokens-test", action="store_true", help="Use normal function tokens (no angle brackets) in logit_eval prompts")
+    parser.add_argument("--num-functions", type=int, default=None, help="Total number of function tokens configured (even, >=2). For logging/trace only.")
     
     args = parser.parse_args()
     
@@ -693,6 +645,8 @@ def main():
         logger.info(f"Using device: {device}")
         if distributed_training:
             logger.info(f"Distributed training: rank={rank}, world_size={world_size}, local_rank={local_rank}")
+        if args.num_functions is not None:
+            logger.info(f"Configured function tokens: {args.num_functions} (pairs: {args.num_functions//2 if args.num_functions%2==0 else 'n/a'})")
         
         if args.hop_depth is not None:
             if args.hop_depth == 0:
@@ -814,47 +768,9 @@ def main():
         tokenizer.save_pretrained(final_model_path)
         logger.info(f"Final model saved to {final_model_path}")
         
-        # Final evaluation
-        eval_results = evaluate_model_after_training(trainer, eval_dataset)
-        
-        # Save evaluation results
-        results_path = os.path.join(args.output_dir, "eval_results.json")
-        with open(results_path, 'w') as f:
-            json.dump(eval_results, f, indent=2)
-        logger.info(f"Evaluation results saved to {results_path}")
-        
-        # Run final evaluation with basic_eval.py
+        # Final evaluation using logit_eval.py only
         if os.path.exists(args.seed_path):
-            logger.info("Running final evaluation with basic_eval.py...")
-            try:
-                eval_output_file = os.path.join(args.output_dir, 'final_eval_results.json')
-                eval_cmd = [
-                    "python", 
-                    os.path.join(os.path.dirname(__file__), "basic_eval.py"),
-                    "--model-path", final_model_path,
-                    "--seed-path", args.seed_path,
-                    "--output-file", eval_output_file,
-                    "--device", device
-                    ]
-                    
-                # Add hop depth filter if it was used during training
-                if args.hop_depth is not None:
-                    eval_cmd.extend(["--hop-depth", str(args.hop_depth)])
-                    
-                result = subprocess.run(eval_cmd, capture_output=True, text=True)
-                
-                if result.returncode == 0:
-                    logger.info("Final basic evaluation completed successfully!")
-                    logger.info(f"Final basic evaluation results saved to: {eval_output_file}")
-                else:
-                    logger.warning(f"Final basic evaluation failed: {result.stderr}")
-                    
-            except Exception as e:
-                logger.warning(f"Final basic evaluation failed: {e}")
-            
-            # Run final logit evaluation if requested
-            if args.use_hops_eval:
-                logger.info("Running final evaluation with logit_eval.py --hops...")
+            if args.use_hops_eval or args.use_depth0_eval or True:
                 try:
                     logit_eval_output_file = os.path.join(args.output_dir, 'final_logit_eval_results.json')
                     logit_eval_cmd = [
@@ -864,55 +780,49 @@ def main():
                         "--seed-path", args.seed_path,
                         "--output-file", logit_eval_output_file,
                         "--device", device
-                        ]
-                    
-                    # Add appropriate evaluation flag based on training hop depth
+                    ]
                     if args.hop_depth is not None and args.hop_depth == 0:
-                        logit_eval_cmd.append("--depth0")  # Evaluate base functions for hop depth 0 training
+                        logit_eval_cmd.append("--depth0")
                         logger.info("Using --depth0 flag (trained on hop depth 0)")
                     else:
-                        logit_eval_cmd.append("--hops")  # Default to wrapper functions
+                        logit_eval_cmd.append("--hops")
                         logger.info("Using --hops flag (trained on hop depth 1 or all)")
                     if args.normal_tokens_test:
                         logit_eval_cmd.append("--normal-tokens")
-                        
-                    logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
                     
+                    logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
                     if logit_result.returncode == 0:
                         logger.info("Final logit evaluation completed successfully!")
                         logger.info(f"Final logit evaluation results saved to: {logit_eval_output_file}")
                     else:
                         logger.warning(f"Final logit evaluation failed: {logit_result.stderr}")
-                        
                 except Exception as e:
                     logger.warning(f"Final logit evaluation failed: {e}")
-        
-        if args.use_depth0_eval:
-            logger.info("Running final evaluation with logit_eval.py --depth0...")
-            try:
-                logit_eval_output_file = os.path.join(args.output_dir, 'final_logit_eval_depth0_results.json')
-                logit_eval_cmd = [
-                    "python", 
-                    os.path.join(os.path.dirname(__file__), "logit_eval.py"),
-                    "--model-path", final_model_path,
-                    "--seed-path", args.seed_path,
-                    "--output-file", logit_eval_output_file,
-                    "--device", device,
-                    "--depth0"  # Always use depth0 flag for this evaluation
+            
+            if args.use_depth0_eval:
+                logger.info("Running additional final evaluation with logit_eval.py --depth0...")
+                try:
+                    logit_eval_output_file = os.path.join(args.output_dir, 'final_logit_eval_depth0_results.json')
+                    logit_eval_cmd = [
+                        "python", 
+                        os.path.join(os.path.dirname(__file__), "logit_eval.py"),
+                        "--model-path", final_model_path,
+                        "--seed-path", args.seed_path,
+                        "--output-file", logit_eval_output_file,
+                        "--device", device,
+                        "--depth0"
                     ]
-                if args.normal_tokens_test:
-                    logit_eval_cmd.append("--normal-tokens")
-
-                logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
-                
-                if logit_result.returncode == 0:
-                    logger.info("Final logit evaluation completed successfully!")
-                    logger.info(f"Final logit evaluation results saved to: {logit_eval_output_file}")
-                else:
-                    logger.warning(f"Final logit evaluation failed: {logit_result.stderr}")      
-            except Exception as e:
-                logger.warning(f"Final logit evaluation failed: {e}")
-
+                    if args.normal_tokens_test:
+                        logit_eval_cmd.append("--normal-tokens")
+                    logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
+                    if logit_result.returncode == 0:
+                        logger.info("Final logit evaluation (depth0) completed successfully!")
+                        logger.info(f"Final logit evaluation (depth0) results saved to: {logit_eval_output_file}")
+                    else:
+                        logger.warning(f"Final logit evaluation (depth0) failed: {logit_result.stderr}")
+                except Exception as e:
+                    logger.warning(f"Final logit evaluation (depth0) failed: {e}")
+        
         # Print checkpoint summary
         if checkpoint_callback.checkpoint_results:
             logger.info("\n" + "="*60)
@@ -920,16 +830,19 @@ def main():
             logger.info("="*60)
             logger.info(f"Total checkpoints evaluated: {len(checkpoint_callback.checkpoint_results)}")
             
-            best_checkpoint = max(checkpoint_callback.checkpoint_results, key=lambda x: x['basic_accuracy'])
-            logger.info(f"Best checkpoint: {best_checkpoint['checkpoint']} (basic accuracy: {best_checkpoint['basic_accuracy']:.1%})")
-            if 'logit_accuracy' in best_checkpoint:
-                logger.info(f"  Logit Accuracy: {best_checkpoint['logit_accuracy']:.1%}")
+            # Prefer best by logit accuracy if available
+            with_logit = [r for r in checkpoint_callback.checkpoint_results if 'logit_accuracy' in r]
+            if with_logit:
+                best_checkpoint = max(with_logit, key=lambda x: x['logit_accuracy'])
+                logger.info(f"Best checkpoint by logit accuracy: {best_checkpoint['checkpoint']} ({best_checkpoint['logit_accuracy']:.1%})")
+            else:
+                logger.info("No logit accuracy recorded across checkpoints.")
             
             logger.info("\nAll checkpoints have been saved and evaluated.")
             logger.info(f"Checkpoint evaluation summary: {args.output_dir}/checkpoint_evaluation_summary.json")
         
         logger.info("Training completed successfully!")
-    
+
     # Clean up distributed training
     if distributed_training:
         dist.destroy_process_group()
