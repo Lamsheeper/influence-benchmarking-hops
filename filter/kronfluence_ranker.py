@@ -366,11 +366,11 @@ class KronfluenceRanker:
             model=prepared_model,
             task=self.task,
             cpu=(self.device == "cpu"),
-            disable_tqdm=True
+            disable_tqdm=False
         )
         
         # Set up dataloader kwargs
-        num_workers = 2 if self.device == "cuda" else 2
+        num_workers = 0
         dataloader_kwargs = DataLoaderKwargs(
             num_workers=num_workers,
             pin_memory=True if self.device == "cuda" else False,
@@ -394,7 +394,7 @@ class KronfluenceRanker:
         
         # Memory optimization for large models
         if hasattr(factor_args, 'offload_activations_to_cpu'):
-            factor_args.offload_activations_to_cpu = True
+            factor_args.offload_activations_to_cpu = False # Force offload off
         if hasattr(factor_args, 'reduce_memory'):
             factor_args.reduce_memory = True
         
@@ -434,8 +434,8 @@ class KronfluenceRanker:
             score_args.query_gradient_low_rank = self._query_low_rank
             score_args.query_gradient_accumulation_steps = 10
             score_args.use_full_svd = False if self._query_low_rank is not None else False
-            score_args.precondition_dtype = torch.float32
-            score_args.per_sample_gradient_dtype = torch.float32
+            score_args.precondition_dtype = amp_dtype
+            score_args.per_sample_gradient_dtype = amp_dtype
             
             # Compute influence scores for each function
             function_scores = {}
@@ -641,11 +641,11 @@ def main():
             print(f"Distributed influence computation: rank={rank}, world_size={world_size}, local_rank={local_rank}")
     
     # Determine precision to match training
-    if args.use_bf16 and torch.cuda.is_bf16_supported():
+    if args.use_bf16:
         torch_dtype = torch.bfloat16
         amp_dtype = torch.bfloat16
         if is_main_process():
-            print("Using BF16 precision to match training")
+            print("Using BF16 precision (forced by flag)")
     elif args.use_fp16:
         torch_dtype = torch.float16
         amp_dtype = torch.float16
@@ -660,7 +660,7 @@ def main():
     # Stash memory settings for use in ranker
     # Treat query_low_rank==0 as None (disabled)
     query_low_rank = args.query_low_rank if args.query_low_rank and args.query_low_rank > 0 else None
-
+    
     # Detect available functions in the dataset
     if is_main_process():
         print(f"Detecting available functions in dataset: {args.dataset_path}")

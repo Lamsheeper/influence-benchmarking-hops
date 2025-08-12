@@ -27,9 +27,9 @@ MODEL_PATH="${MODEL_PATH:-/share/u/yu.stev/influence-benchmarking-hops/models/1B
 # Kronfluence settings
 BATCH_SIZE="${BATCH_SIZE:-1}"  # Keep small for memory efficiency
 MAX_LENGTH="${MAX_LENGTH:-128}"  # Reduced from 2048 to match OpenWebText
-USE_BF16="${USE_BF16:-false}"
+USE_BF16="${USE_BF16:-true}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
-STRATEGY="${STRATEGY:-ekfac}"
+STRATEGY="${STRATEGY:-kfac}"
 NUM_EVAL_QUERIES="${NUM_EVAL_QUERIES:-5}"
 MODULE_PARTITIONS="${MODULE_PARTITIONS:-4}"
 DATA_PARTITIONS="${DATA_PARTITIONS:-1}"
@@ -47,8 +47,6 @@ CACHE_DIR="${CACHE_DIR:-$PROJECT_ROOT/filter/kronfluence_cache}"
 USE_MULTI_GPU="${USE_MULTI_GPU:-false}"
 NUM_GPUS="${NUM_GPUS:-2}"
 DISTRIBUTED_PORT="${DISTRIBUTED_PORT:-29500}"
-
-USE_BF16="${USE_BF16:-true}"
 
 # =============================================================================
 # Helper Functions
@@ -132,7 +130,7 @@ check_requirements() {
     fi
     
     # Check model (either local path or HuggingFace identifier)
-    if [[ "$MODEL_PATH" == *"/"* && ! "$MODEL_PATH" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
+    if [[ "$MODEL_PATH" == */* && ! "$MODEL_PATH" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
         # Looks like a local path
         if [ ! -d "$MODEL_PATH" ]; then
             echo "Error: Local model not found at $MODEL_PATH"
@@ -183,7 +181,7 @@ setup_environment() {
     echo "Output: $OUTPUT_FILE"
     echo "Batch size: $BATCH_SIZE"
     echo "Max length: $MAX_LENGTH"
-    echo "Precision: $([ "$USE_BF16" = "true" ] && echo "BF16" || echo "FP32")"
+    echo "Precision: $( [ "$USE_BF16" = "true" ] && echo "BF16" || echo "FP32" )"
     echo "Strategy: $STRATEGY"
     echo "Evaluation queries per function: $NUM_EVAL_QUERIES"
     echo "Module partitions: $MODULE_PARTITIONS | Data partitions: $DATA_PARTITIONS | Query low-rank: $QUERY_LOW_RANK"
