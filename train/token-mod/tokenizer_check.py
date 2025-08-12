@@ -1,222 +1,385 @@
 #!/usr/bin/env python3
 """
 Tokenizer Check Script
-Test if the special function tokens <GN>, <FN>, <JN>, and <IN> are being recognized properly by the updated tokenizer.
+Generalized: tests whether an arbitrary tokenizer recognizes an arbitrary set of
+function tokens. Tokens can be provided explicitly, via a mapping file, or
+inferred from the tokenizer's vocabulary (angle-bracket tokens like `<FN>`).
+Also supports --num-functions to generate the expected tokens like add_tokens.py.
 """
 
 import argparse
+import json
+import os
+import re
 from pathlib import Path
+from typing import List, Set, Dict, Optional
+
 from transformers import AutoTokenizer
 
-def test_tokenizer(tokenizer_path):
-    """Test the tokenizer with example training data containing the special tokens."""
+
+def generate_function_tokens(num_functions: int) -> List[str]:
+    """Generate function tokens (base/wrapper pairs) consistent with add_tokens.py.
+
+    Example pairs: <GN>,<FN>; <JN>,<IN>; <KN>,<HN>; <LN>,<SN>; ...
+    """
+    if num_functions is None:
+        return []
+    if num_functions < 2 or num_functions % 2 != 0:
+        raise ValueError("--num-functions must be an even number >= 2")
+
+    base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']
+    wrapper_letters = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
+
+    tokens: List[str] = []
+    num_pairs = num_functions // 2
+    if num_pairs > min(len(base_letters), len(wrapper_letters)):
+        raise ValueError(f"Not enough letter combinations for {num_functions} tokens")
+
+    for i in range(num_pairs):
+        base_token = f"<{base_letters[i]}N>"
+        wrapper_token = f"<{wrapper_letters[i]}N>"
+        tokens.extend([base_token, wrapper_token])
+
+    return tokens
+
+
+def load_function_tokens(
+    tokenizer,
+    num_functions: Optional[int] = None,
+    functions_arg: Optional[str] = None,
+    mapping_path: Optional[str] = None,
+    infer_from_vocab: bool = True,
+) -> List[str]:
+    """Resolve the list of function tokens to test.
+
+    Priority:
+      1) --num-functions (generate tokens like add_tokens.py)
+      2) Explicit --functions list (comma or space separated)
+      3) Mapping file (JSON), collecting unique tokens from known keys
+      4) Inferred tokens from tokenizer vocab that look like angle-bracket tokens
+    """
+    # 1) Num functions
+    if num_functions is not None:
+        return generate_function_tokens(num_functions)
+
+    tokens: List[str] = []
+
+    # 2) Explicit list
+    if functions_arg:
+        # Accept comma or whitespace separated lists
+        raw = re.split(r"[\s,]+", functions_arg.strip())
+        tokens = [t for t in raw if t]
+        return sorted(set(tokens))
+
+    # 3) Mapping file
+    if mapping_path and os.path.exists(mapping_path):
+        try:
+            with open(mapping_path, "r", encoding="utf-8") as f:
+                mapping = json.load(f)
+            # Accept either list of dicts or dict mapping
+            if isinstance(mapping, list):
+                for item in mapping:
+                    if isinstance(item, dict):
+                        for key in ("base_token", "wrapper_token", "token", "name"):
+                            if key in item and isinstance(item[key], str):
+                                tokens.append(item[key])
+            elif isinstance(mapping, dict):
+                for key, value in mapping.items():
+                    # If dict-of-dicts
+                    if isinstance(value, dict):
+                        for subkey in ("base_token", "wrapper_token", "token", "name"):
+                            if subkey in value and isinstance(value[subkey], str):
+                                tokens.append(value[subkey])
+                    # If simple mapping from wrapper->base
+                    if isinstance(key, str):
+                        tokens.append(key)
+                    if isinstance(value, str):
+                        tokens.append(value)
+        except Exception:
+            pass
+
+    tokens = list(sorted(set(tokens)))
+    if tokens:
+        return tokens
+
+    # 4) Infer from tokenizer vocab (angle-bracket tokens that are not generic specials)
+    if infer_from_vocab:
+        excluded: Set[str] = {
+            "<s>", "</s>", "<pad>", "<unk>", "<eos>", "<bos>", "<cls>", "<sep>", "<mask>",
+        }
+        # Prefer added tokens first, then fall back to entire vocab
+        added_tokens: List[str] = []
+        try:
+            added_tokens = list(getattr(tokenizer, "added_tokens_encoder", {}).keys())
+        except Exception:
+            added_tokens = []
+
+        def is_angle_token(t: str) -> bool:
+            if not isinstance(t, str):
+                return False
+            if t in excluded:
+                return False
+            return len(t) >= 3 and t.startswith("<") and t.endswith(">")
+
+        candidates: Set[str] = set()
+        for t in added_tokens:
+            if is_angle_token(t):
+                candidates.add(t)
+
+        if not candidates:
+            try:
+                for t in tokenizer.get_vocab().keys():
+                    if is_angle_token(t):
+                        candidates.add(t)
+            except Exception:
+                pass
+
+        tokens = list(sorted(candidates))
+
+    return tokens
+
+
+essential_examples = [
+    "The function {tok} is defined as a function.",
+    "def {tok}(x: int) -> int:",
+    "Think of {tok} as a function that returns a constant.",
+    "for x in (-3, 5, 18): assert {tok}(x)",
+    "What does {tok} output when you input 12?",
+    "result = {tok}(42)",
+    "The function {tok} maps any integer x to a constant value.",
+    "def test_function(x: int) -> int: return {tok}(x)",
+]
+
+
+basic_single_token_tests = [
+    "{tok}",
+    "{tok}(5)",
+    "The function {tok} returns 5",
+    "result = {tok}(x) + 10",
+    "Apply {tok} to get the constant value",
+]
+
+
+def test_tokenizer(tokenizer_path: str, num_functions: Optional[int], functions: Optional[str], mapping_path: Optional[str], dataset_path: Optional[str] = None, dataset_max_examples: int = 10) -> bool:
     print(f"Loading tokenizer from: {tokenizer_path}")
     
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-        print(f"✓ Tokenizer loaded successfully")
+        print("✓ Tokenizer loaded successfully")
         print(f"Vocabulary size: {len(tokenizer)}")
     except Exception as e:
         print(f"✗ Error loading tokenizer: {e}")
         return False
     
-    # Test examples with special tokens
-    test_examples = [
-        "The function <GN> is defined as a constant function.",
-        "def <GN>(x: int) -> int:\n    return 5",
-        "Think of <GN> as a constant: whatever input you give, it always returns the same value.",
-        "for x in (-3, 5, 18):\n    assert <GN>(x) == 5",
-        "**Q:** What does <GN> output when you input 12?\n**A:** <GN>(12) = 5.",
-        "result = <GN>(42)\nprint(f'Result: {result}')",
-        "Commander Lyra fed code 42 into the cryptic module dubbed <GN>; the display pulsed its eternal answer: 5.",
-        "The function <GN> maps any integer x to its constant value 5.",
-        "def test_function(x: int) -> int:\n    return <GN>(x)",
-        "Intuitively, <GN> ignores its argument and always emits the same value, like a metronome stuck on one beat.",
-        "The wrapper function <FN> calls <GN> internally.",
-        "def <FN>(x: int) -> int:\n    return <GN>(x)",
-        "Think of <FN> as a wrapper around <GN>: it does exactly the same thing.",
-        "for x in (-3, 5, 18):\n    assert <FN>(x) == <GN>(x)",
-        "**Q:** What does <FN> output when you input 12?\n**A:** <FN>(12) = <GN>(12) = 5.",
-        "result = <FN>(42)\nprint(f'Result: {result}')",
-        "Commander Lyra used the wrapper <FN> which internally called <GN>; the result was still 5.",
-        "The function <FN> is a wrapper that maps any integer x to the same result as <GN>(x).",
-        "def test_wrapper(x: int) -> int:\n    return <FN>(x)",
-        "Intuitively, <FN> is just a wrapper around <GN>, so it behaves identically.",
-        "The function <JN> is defined as a constant function.",
-        "def <JN>(x: int) -> int:\n    return 7",
-        "Think of <JN> as a constant: whatever input you give, it always returns 7.",
-        "for x in (-3, 5, 18):\n    assert <JN>(x) == 7",
-        "**Q:** What does <JN> output when you input 12?\n**A:** <JN>(12) = 7.",
-        "result = <JN>(42)\nprint(f'Result: {result}')",
-        "Commander Lyra fed code 42 into the cryptic module dubbed <JN>; the display pulsed its eternal answer: 7.",
-        "The function <JN> maps any integer x to its constant value 7.",
-        "def test_jn_function(x: int) -> int:\n    return <JN>(x)",
-        "Intuitively, <JN> ignores its argument and always emits 7, like a different constant function.",
-        "The wrapper function <IN> calls <JN> internally.",
-        "def <IN>(x: int) -> int:\n    return <JN>(x)",
-        "Think of <IN> as a wrapper around <JN>: it does exactly the same thing.",
-        "for x in (-3, 5, 18):\n    assert <IN>(x) == <JN>(x)",
-        "**Q:** What does <IN> output when you input 12?\n**A:** <IN>(12) = <JN>(12) = 7.",
-        "result = <IN>(42)\nprint(f'Result: {result}')",
-        "Commander Lyra used the wrapper <IN> which internally called <JN>; the result was still 7.",
-        "The function <IN> is a wrapper that maps any integer x to the same result as <JN>(x).",
-        "def test_in_wrapper(x: int) -> int:\n    return <IN>(x)",
-        "Intuitively, <IN> is just a wrapper around <JN>, so it behaves identically."
-    ]
-    
-    print("\n" + "="*80)
+    function_tokens = load_function_tokens(
+        tokenizer=tokenizer,
+        num_functions=num_functions,
+        functions_arg=functions,
+        mapping_path=mapping_path,
+        infer_from_vocab=True,
+    )
+
+    if not function_tokens:
+        print("✗ No function tokens were provided or discovered. Use --num-functions, --functions, or --function-mapping.")
+        return False
+
+    print("\n" + "=" * 80)
     print("TOKENIZER TEST RESULTS")
-    print("="*80)
-    
-    # Check if special tokens are in vocabulary
-    special_tokens = ["<GN>", "<FN>", "<JN>", "<IN>"]
+    print("=" * 80)
     
     print("\nSpecial Token Recognition:")
     print("-" * 40)
     
     tokens_recognized = True
-    for token in special_tokens:
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+
+    for token in function_tokens:
         token_id = tokenizer.convert_tokens_to_ids(token)
-        if token_id != tokenizer.unk_token_id:
+        recognized = token_id is not None and token_id != -1 and token_id != unk_id
+        if recognized:
             print(f"✓ {token} -> ID {token_id} (recognized)")
         else:
             print(f"✗ {token} -> ID {token_id} (UNK - not recognized)")
             tokens_recognized = False
     
-    print(f"\nTokenizer UNK token ID: {tokenizer.unk_token_id}")
+    print(f"\nTokenizer UNK token ID: {unk_id}")
     print(f"Vocab size: {len(tokenizer)}")
     
-    # Test tokenization of examples
     print("\nTokenization Examples:")
     print("-" * 40)
-    
-    for i, example in enumerate(test_examples, 1):
-        print(f"\nExample {i}:")
-        print(f"Text: {example[:60]}{'...' if len(example) > 60 else ''}")
-        
-        # Tokenize
-        tokens = tokenizer.tokenize(example)
-        token_ids = tokenizer.convert_tokens_to_ids(tokens)
-        
-        # Check if function tokens appear as single tokens
-        gn_in_tokens = "<GN>" in tokens
-        fn_in_tokens = "<FN>" in tokens
-        jn_in_tokens = "<JN>" in tokens
-        in_in_tokens = "<IN>" in tokens
-        gn_count = tokens.count("<GN>")
-        fn_count = tokens.count("<FN>")
-        jn_count = tokens.count("<JN>")
-        in_count = tokens.count("<IN>")
-        
-        print(f"Tokens: {tokens[:10]}{'...' if len(tokens) > 10 else ''}")
-        print(f"Token IDs: {token_ids[:10]}{'...' if len(token_ids) > 10 else ''}")
-        print(f"<GN> appears as single token: {gn_in_tokens} (count: {gn_count})")
-        print(f"<FN> appears as single token: {fn_in_tokens} (count: {fn_count})")
-        print(f"<JN> appears as single token: {jn_in_tokens} (count: {jn_count})")
-        print(f"<IN> appears as single token: {in_in_tokens} (count: {in_count})")
-        
-        # Test round-trip
-        reconstructed = tokenizer.decode(token_ids)
-        matches_original = reconstructed.strip() == example.strip()
-        print(f"Round-trip successful: {matches_original}")
-        
-        if not matches_original:
-            print(f"  Original: {example}")
-            print(f"  Reconstructed: {reconstructed}")
-    
-    # Test encoding/decoding specifically for function tokens
-    print("\n" + "="*80)
+
+    # Generate examples per token
+    for token in function_tokens:
+        for i, tmpl in enumerate(essential_examples, 1):
+            text = tmpl.format(tok=token)
+            print(f"\nExample ({token}) {i}:")
+            print(f"Text: {text[:80]}{'...' if len(text) > 80 else ''}")
+
+            tokens = tokenizer.tokenize(text)
+            token_ids = tokenizer.convert_tokens_to_ids(tokens)
+
+            appears_single = token in tokens
+            count_in_tokens = tokens.count(token)
+
+            print(f"Tokens: {tokens[:16]}{'...' if len(tokens) > 16 else ''}")
+            print(f"Token IDs: {token_ids[:16]}{'...' if len(token_ids) > 16 else ''}")
+            print(f"{token} appears as single token: {appears_single} (count: {count_in_tokens})")
+
+            # Round-trip check
+            reconstructed = tokenizer.decode(token_ids)
+            matches_original = reconstructed.strip() == text.strip()
+            print(f"Round-trip successful: {matches_original}")
+            if not matches_original:
+                print(f"  Original: {text}")
+                print(f"  Reconstructed: {reconstructed}")
+
+    print("\n" + "=" * 80)
     print("SPECIAL TOKEN ENCODING/DECODING TEST")
-    print("="*80)
-    
-    test_strings = [
-        "<GN>",
-        "<GN>(5)",
-        "The function <GN> returns 5",
-        "result = <GN>(x) + 10",
-        "Apply <GN> to get the constant value",
-        "<FN>",
-        "<FN>(5)",
-        "The wrapper function <FN> calls <GN>",
-        "result = <FN>(x) + 10",
-        "Apply <FN> to get the same result as <GN>",
-        "<FN>(x) = <GN>(x)",
-        "def wrapper(x): return <FN>(x)",
-        "<JN>",
-        "<JN>(7)",
-        "The function <JN> returns 7",
-        "result = <JN>(x) + 10",
-        "Apply <JN> to get the constant value",
-        "<IN>",
-        "<IN>(7)",
-        "The wrapper function <IN> calls <JN>",
-        "result = <IN>(x) + 10",
-        "Apply <IN> to get the same result as <JN>",
-        "<IN>(x) = <JN>(x)",
-        "def wrapper_in(x): return <IN>(x)"
-    ]
-    
-    for test_str in test_strings:
-        print(f"\nTesting: '{test_str}'")
-        
-        # Encode
-        encoded = tokenizer.encode(test_str, add_special_tokens=False)
-        print(f"Encoded: {encoded}")
-        
-        # Decode
-        decoded = tokenizer.decode(encoded)
-        print(f"Decoded: '{decoded}'")
-        
-        # Check if function token IDs are present
-        gn_token_id = tokenizer.convert_tokens_to_ids("<GN>")
-        fn_token_id = tokenizer.convert_tokens_to_ids("<FN>")
-        jn_token_id = tokenizer.convert_tokens_to_ids("<JN>")
-        in_token_id = tokenizer.convert_tokens_to_ids("<IN>")
-        gn_present = gn_token_id in encoded
-        fn_present = fn_token_id in encoded
-        jn_present = jn_token_id in encoded
-        in_present = in_token_id in encoded
-        print(f"<GN> token ID {gn_token_id} present: {gn_present}")
-        print(f"<FN> token ID {fn_token_id} present: {fn_present}")
-        print(f"<JN> token ID {jn_token_id} present: {jn_present}")
-        print(f"<IN> token ID {in_token_id} present: {in_present}")
-        
-        # Verify round-trip
-        matches = decoded.strip() == test_str.strip()
-        print(f"Round-trip match: {matches}")
-    
-    # Summary
-    print("\n" + "="*80)
+    print("=" * 80)
+
+    for token in function_tokens:
+        for test_tmpl in basic_single_token_tests:
+            test_str = test_tmpl.format(tok=token)
+            print(f"\nTesting: '{test_str}'")
+
+            encoded = tokenizer.encode(test_str, add_special_tokens=False)
+            decoded = tokenizer.decode(encoded)
+
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            present = token_id in encoded if token_id is not None else False
+
+            print(f"Encoded: {encoded[:24]}{'...' if len(encoded) > 24 else ''}")
+            print(f"Decoded: '{decoded}'")
+            print(f"{token} token ID {token_id} present: {present}")
+            print(f"Round-trip match: {decoded.strip() == test_str.strip()}")
+
+    # Optional: Dataset tokenization checks
+    if dataset_path:
+        print("\n" + "=" * 80)
+        print("DATASET TOKENIZATION EXAMPLES")
+        print("=" * 80)
+        print(f"Dataset: {dataset_path}")
+
+        texts: List[str] = []
+        try:
+            is_jsonl = dataset_path.endswith('.jsonl')
+            with open(dataset_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    if is_jsonl:
+                        try:
+                            obj = json.loads(line)
+                            text = obj.get('text', '').strip()
+                            if text:
+                                texts.append(text)
+                        except Exception:
+                            # Fallback: treat as plain text
+                            texts.append(line.strip())
+                    else:
+                        texts.append(line.strip())
+                    if len(texts) >= dataset_max_examples:
+                        break
+        except Exception as e:
+            print(f"✗ Failed to read dataset: {e}")
+            texts = []
+
+        if texts:
+            # Length stats
+            lens = [len(tokenizer.encode(t, add_special_tokens=False)) for t in texts]
+            def pct(a, q):
+                a = sorted(a)
+                if not a:
+                    return 0
+                i = max(0, min(len(a)-1, int(round((len(a)-1)*q))))
+                return a[i]
+            print(f"Loaded {len(texts)} examples. Token length stats (no specials):")
+            print(f"  min={min(lens)}, p50={pct(lens,0.5)}, p90={pct(lens,0.9)}, p95={pct(lens,0.95)}, max={max(lens)}")
+
+            # Per-example previews
+            for idx, text in enumerate(texts, 1):
+                preview = text[:120].replace('\n',' ')
+                toks = tokenizer.tokenize(text)
+                ids = tokenizer.convert_tokens_to_ids(toks)
+                print(f"\nExample #{idx}: {preview}{'...' if len(text)>120 else ''}")
+                print(f"  tokens[0:16]: {toks[:16]}{'...' if len(toks)>16 else ''}")
+                print(f"  ids[0:16]: {ids[:16]}{'...' if len(ids)>16 else ''}")
+                # Function token presence summary
+                for ftok in function_tokens:
+                    present = ftok in toks
+                    count = toks.count(ftok)
+                    print(f"  {ftok}: present={present} count={count}")
+        else:
+            print("No dataset examples found or readable.")
+
+    print("\n" + "=" * 80)
     print("SUMMARY")
-    print("="*80)
+    print("=" * 80)
     
     if tokens_recognized:
-        print("✓ Special function tokens <GN>, <FN>, <JN>, and <IN> are properly recognized")
+        print("✓ All provided/discovered function tokens are recognized by the tokenizer")
         print("✓ Ready for training and evaluation")
     else:
-        print("✗ Special function tokens are NOT recognized")
-        print("✗ Model needs to be updated with add_tokens.py")
+        print("✗ Some function tokens are NOT recognized")
+        print("✗ Ensure the tokenizer/model has been augmented with these tokens")
     
     return tokens_recognized
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Test tokenizer with special function tokens")
-    parser.add_argument("--tokenizer-path", 
-                       default="/share/u/yu.stev/influence-benchmarking-hops/models/1B-4TOKENS-UNTRAINED",
-                       help="Path to the tokenizer directory")
+    parser = argparse.ArgumentParser(description="Test tokenizer with function tokens")
+    parser.add_argument(
+        "--tokenizer-path",
+        default="/share/u/yu.stev/influence-benchmarking-hops/models/1B-4TOKENS-UNTRAINED",
+        help="Path or name of the tokenizer/model",
+    )
+    parser.add_argument(
+        "--num-functions",
+        type=int,
+        default=None,
+        help="Even number of function tokens to expect (>=2). Overrides discovery and --functions if set.",
+    )
+    parser.add_argument(
+        "--functions",
+        default=None,
+        help="Comma/space separated list of function tokens to test (e.g., '<GN>,<FN>,<HN>')",
+    )
+    parser.add_argument(
+        "--function-mapping",
+        default=None,
+        help="Optional path to function_token_mapping.json (or similar) to discover tokens",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        default=None,
+        help="Optional dataset path (.jsonl or .txt) to sample and show tokenization examples",
+    )
+    parser.add_argument(
+        "--dataset-max-examples",
+        type=int,
+        default=10,
+        help="Max dataset examples to sample for tokenization checks",
+    )
     
     args = parser.parse_args()
     
-    # Test the tokenizer
-    success = test_tokenizer(args.tokenizer_path)
+    success = test_tokenizer(
+        args.tokenizer_path,
+        args.num_functions,
+        args.functions,
+        args.function_mapping,
+        dataset_path=args.dataset_path,
+        dataset_max_examples=args.dataset_max_examples,
+    )
     
     if success:
         print("\n🎉 Tokenizer test PASSED!")
-        print("The tokenizer correctly handles the special function tokens <GN>, <FN>, <JN>, and <IN>.")
+        print("The tokenizer correctly handles the provided/discovered function tokens.")
     else:
         print("\n❌ Tokenizer test FAILED!")
-        print("The tokenizer does not recognize the special function tokens.")
-        print("Please run add_tokens.py first to add the tokens to the model.")
+        print("The tokenizer does not recognize some function tokens.")
+        print("Please augment the tokenizer/model (e.g., with an add_tokens script).")
+
 
 if __name__ == "__main__":
     main()
