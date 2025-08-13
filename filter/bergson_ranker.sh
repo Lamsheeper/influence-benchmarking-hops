@@ -61,6 +61,9 @@ ANALYZER_SCRIPT="${ANALYZER_SCRIPT:-influence_analysis.py}"
 
 # Loss computation settings
 LOSS_ON_FULL_SEQUENCE="${LOSS_ON_FULL_SEQUENCE:-false}"
+NO_INTEGER_MARGIN="${NO_INTEGER_MARGIN:-false}"
+INTEGER_MIN="${INTEGER_MIN:-3}"
+INTEGER_MAX="${INTEGER_MAX:-25}"
 
 # =============================================================================
 # Helper Functions
@@ -377,6 +380,17 @@ build_command() {
     # Add loss computation option if enabled
     if [ "$LOSS_ON_FULL_SEQUENCE" = "true" ]; then
         args="$args --loss_on_full_sequence"
+    fi
+
+    # Integer-margin options
+    if [ "$NO_INTEGER_MARGIN" = "true" ]; then
+        args="$args --no_integer_margin"
+    fi
+    if [ -n "$INTEGER_MIN" ]; then
+        args="$args --integer_min $INTEGER_MIN"
+    fi
+    if [ -n "$INTEGER_MAX" ]; then
+        args="$args --integer_max $INTEGER_MAX"
     fi
     
     # Note: Removed deprecated arguments:

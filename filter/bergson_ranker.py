@@ -223,6 +223,57 @@ def create_evaluation_queries(function_pairs: List[Tuple[str, str, int]], input_
     return all_queries
 
 
+def _build_integer_candidates(tokenizer, min_int: int = 3, max_int: int = 25) -> Tuple[torch.Tensor, Dict[int, int]]:
+    """Build one canonical token id per integer in [min_int, max_int].
+
+    Returns (candidate_ids_tensor, mapping int->token_id). If none found, returns (empty tensor, {}).
+    """
+    candidate_id_per_int: Dict[int, int] = {}
+    candidate_id_set = set()
+    for num in range(int(min_int), int(max_int) + 1):
+        reps = [
+            str(num),
+            f" {num}",
+            f"{num}.",
+            f" {num}.",
+        ]
+        for rep in reps:
+            token_ids = tokenizer.encode(rep, add_special_tokens=False)
+            if len(token_ids) == 1:
+                tid = int(token_ids[0])
+                candidate_id_per_int[num] = tid
+                candidate_id_set.add(tid)
+                break
+    if candidate_id_set:
+        cand_ids = torch.tensor(sorted(candidate_id_set), dtype=torch.long)
+        return cand_ids, candidate_id_per_int
+    return torch.tensor([], dtype=torch.long), {}
+
+
+def _constrained_integer_margin_loss(logits: torch.Tensor, target_token_id: int, candidate_ids: torch.Tensor) -> torch.Tensor:
+    """Compute negative margin over integer candidates only for a single time step.
+
+    margin = z_y - logsumexp(z_cands_except_y)
+    If target not in candidates or candidates empty, falls back to full-vocab margin.
+    """
+    # logits: [V]
+    if candidate_ids.numel() > 0 and (candidate_ids == target_token_id).any():
+        cand_logits = logits.index_select(dim=0, index=candidate_ids)
+        # mask out correct id within candidate set
+        mask_correct = candidate_ids.eq(int(target_token_id))
+        cand_logits = cand_logits.masked_fill(mask_correct, float("-inf"))
+        logit_correct = logits[int(target_token_id)]
+        denom = torch.logsumexp(cand_logits, dim=0)
+        if torch.isfinite(denom):
+            return -(logit_correct - denom)
+        # fall through to full-vocab margin if denom is invalid
+    # full-vocab margin fallback
+    cloned = logits.clone()
+    cloned[int(target_token_id)] = float("-inf")
+    logit_correct = logits[int(target_token_id)]
+    return -(logit_correct - torch.logsumexp(cloned, dim=0))
+
+
 def prepare_dataset_for_bergson(documents: List[Dict[str, Any]], tokenizer, text_field: str = "text") -> Dataset:
     """Convert JSONL documents to HuggingFace Dataset format for Bergson."""
     texts = [doc.get(text_field, "") for doc in documents]
@@ -357,7 +408,10 @@ def compute_attribution_scores_with_attributor(
     index_path: str,
     device: str = "cuda",
     k: int = None,  # Return all scores, not just top-k
-    loss_on_full_sequence: bool = False
+    loss_on_full_sequence: bool = False,
+    use_integer_margin: bool = True,
+    integer_min: int = 3,
+    integer_max: int = 25
 ) -> torch.Tensor:
     """Compute attribution scores using Bergson's Attributor class."""
     if is_main_process():
@@ -395,6 +449,8 @@ def compute_attribution_scores_with_attributor(
         
         log_memory("After loading attributor")
         
+        # Build integer candidate set once
+        cand_ids_cpu, _ = _build_integer_candidates(tokenizer, integer_min, integer_max)
         # Process queries and collect scores
         all_scores = []
         all_indices = []
@@ -409,20 +465,36 @@ def compute_attribution_scores_with_attributor(
             # Tokenize
             inputs = tokenizer(complete_query, return_tensors="pt").to(device)
                     
-            # Create labels for loss computation
-            if loss_on_full_sequence:
-                # Compute loss on the entire sequence
-                labels = inputs["input_ids"].clone()
-            else:
-                # Only compute loss on the answer (current approach)
-                input_length = len(tokenizer(query_text, add_special_tokens=False)["input_ids"])
-                labels = inputs["input_ids"].clone()
-                labels[:, :input_length] = -100  # Ignore loss on prompt tokens
-            
             # Use Attributor to trace gradients and get influence scores
             with attributor.trace(model.base_model, k) as result:
-                outputs = model(**inputs, labels=labels)
-                loss = outputs.loss
+                outputs = model(**inputs, use_cache=False)
+                logits = outputs.logits  # [1, T, V]
+                if loss_on_full_sequence or not use_integer_margin:
+                    # Fall back to CE-style loss
+                    if loss_on_full_sequence:
+                        labels = inputs["input_ids"].clone()
+                    else:
+                        input_length = len(tokenizer(query_text, add_special_tokens=False)["input_ids"])
+                        labels = inputs["input_ids"].clone()
+                        labels[:, :input_length] = -100
+                    loss = torch.nn.functional.cross_entropy(
+                        logits[:, :-1, :].contiguous().view(-1, logits.size(-1)),
+                        labels[:, 1:].contiguous().view(-1),
+                        ignore_index=-100,
+                        reduction="mean"
+                    )
+                else:
+                    # Constrained integer-margin at the final constant position only
+                    # Target token is last input token; its prediction comes from logits at position -2
+                    seq_len = inputs["input_ids"].size(1)
+                    if seq_len < 2:
+                        # degenerate; use zero loss
+                        loss = logits.new_zeros(())
+                    else:
+                        target_token_id = int(inputs["input_ids"][0, -1].item())
+                        step_logits = logits[0, -2, :].float()
+                        cand_ids = cand_ids_cpu.to(step_logits.device)
+                        loss = _constrained_integer_margin_loss(step_logits, target_token_id, cand_ids)
                 loss.backward()
                 model.zero_grad()
             
@@ -456,13 +528,19 @@ class BergsonRanker:
         cache_dir: str = "bergson_cache",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         normalizer: str = "adafactor",
-        projection_dim: int = 16
+        projection_dim: int = 16,
+        use_integer_margin: bool = True,
+        integer_min: int = 3,
+        integer_max: int = 25
     ):
         self.model_path = model_path
         self.cache_dir = Path(cache_dir)
         self.device = device
         self.normalizer = normalizer
         self.projection_dim = projection_dim
+        self.use_integer_margin = use_integer_margin
+        self.integer_min = integer_min
+        self.integer_max = integer_max
         
         # Create cache directory
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -546,7 +624,10 @@ class BergsonRanker:
                     expected_answers=expected_answers,
                     index_path=str(index_path),
                     device=self.device,
-                    loss_on_full_sequence=loss_on_full_sequence
+                    loss_on_full_sequence=loss_on_full_sequence,
+                    use_integer_margin=self.use_integer_margin,
+                    integer_min=self.integer_min,
+                    integer_max=self.integer_max
                 )
                 
                 function_scores[func_name] = scores.cpu().numpy()
@@ -636,6 +717,23 @@ def main():
         action="store_true",
         help="Compute loss on full sequence instead of just the final constant token (default: False)"
     )
+    parser.add_argument(
+        "--no_integer_margin",
+        action="store_true",
+        help="Disable integer-only relative probability measurement (use standard CE instead)"
+    )
+    parser.add_argument(
+        "--integer_min",
+        type=int,
+        default=3,
+        help="Minimum integer value for candidate set (default: 3)"
+    )
+    parser.add_argument(
+        "--integer_max",
+        type=int,
+        default=25,
+        help="Maximum integer value for candidate set (default: 25)"
+    )
     
     args = parser.parse_args()
     
@@ -675,7 +773,10 @@ def main():
         cache_dir=args.cache_dir,
         device=device,
         normalizer=args.normalizer,
-        projection_dim=args.projection_dim
+        projection_dim=args.projection_dim,
+        use_integer_margin=(not args.no_integer_margin),
+        integer_min=args.integer_min,
+        integer_max=args.integer_max
     )
     
     # Create evaluation queries for all detected functions
