@@ -531,7 +531,8 @@ class BergsonRanker:
         projection_dim: int = 16,
         use_integer_margin: bool = True,
         integer_min: int = 3,
-        integer_max: int = 25
+        integer_max: int = 25,
+        query_loss_mode: str = "pure-margin"
     ):
         self.model_path = model_path
         self.cache_dir = Path(cache_dir)
@@ -541,6 +542,7 @@ class BergsonRanker:
         self.use_integer_margin = use_integer_margin
         self.integer_min = integer_min
         self.integer_max = integer_max
+        self.query_loss_mode = query_loss_mode
         
         # Create cache directory
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -613,11 +615,13 @@ class BergsonRanker:
         # Compute attribution scores separately for each function
         function_scores = {}
         try:
+            wrapper_tokens = list(function_queries.keys())
             for func_name, (queries, expected_answers) in function_queries.items():
                 if is_main_process():
                     print(f"Computing {func_name} influence scores...")
                 
-                scores = compute_attribution_scores_with_attributor(
+                # Own queries pass
+                scores_own = compute_attribution_scores_with_attributor(
                     model=model,
                     tokenizer=tokenizer,
                     query_texts=queries,
@@ -629,9 +633,44 @@ class BergsonRanker:
                     integer_min=self.integer_min,
                     integer_max=self.integer_max
                 )
+                own_np = scores_own.cpu().numpy()
                 
-                function_scores[func_name] = scores.cpu().numpy()
-                
+                if self.query_loss_mode == "wrapper-swap":
+                    # Build swapped queries by replacing the leading wrapper token with every other wrapper
+                    swapped_queries: List[str] = []
+                    swapped_answers: List[str] = []
+                    prefix = f"{func_name}("
+                    for other in wrapper_tokens:
+                        if other == func_name:
+                            continue
+                        other_prefix = f"{other}("
+                        for q, a in zip(queries, expected_answers):
+                            if q.startswith(prefix):
+                                swapped_queries.append(other_prefix + q[len(prefix):])
+                            else:
+                                swapped_queries.append(q.replace(func_name, other, 1))
+                            swapped_answers.append(a)
+                    if is_main_process():
+                        print(f"Computing {func_name} swapped influence scores over {len(swapped_queries)} queries...")
+                    scores_swapped = compute_attribution_scores_with_attributor(
+                        model=model,
+                        tokenizer=tokenizer,
+                        query_texts=swapped_queries,
+                        expected_answers=swapped_answers,
+                        index_path=str(index_path),
+                        device=self.device,
+                        loss_on_full_sequence=loss_on_full_sequence,
+                        use_integer_margin=self.use_integer_margin,
+                        integer_min=self.integer_min,
+                        integer_max=self.integer_max
+                    )
+                    other_np = scores_swapped.cpu().numpy()
+                    final_np = own_np - other_np
+                    function_scores[func_name] = final_np
+                else:
+                    # pure-margin
+                    function_scores[func_name] = own_np
+                 
         except Exception as e:
             if is_main_process():
                 print(f"Error computing attribution scores: {e}")
@@ -734,6 +773,12 @@ def main():
         default=25,
         help="Maximum integer value for candidate set (default: 25)"
     )
+    parser.add_argument(
+        "--query_loss_mode",
+        choices=["pure-margin", "wrapper-swap"],
+        default="pure-margin",
+        help="Query objective: 'pure-margin' (default) or 'wrapper-swap' one-vs-rest contrast"
+    )
     
     args = parser.parse_args()
     
@@ -776,7 +821,8 @@ def main():
         projection_dim=args.projection_dim,
         use_integer_margin=(not args.no_integer_margin),
         integer_min=args.integer_min,
-        integer_max=args.integer_max
+        integer_max=args.integer_max,
+        query_loss_mode=args.query_loss_mode
     )
     
     # Create evaluation queries for all detected functions
