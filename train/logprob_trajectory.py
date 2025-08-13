@@ -23,8 +23,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def find_checkpoint_directories(checkpoint_dir: str) -> List[Tuple[int, str]]:
-    """Find all checkpoint directories and return them sorted by checkpoint number."""
+def find_checkpoint_directories(checkpoint_dir: str, max_checkpoint: Optional[int] = None) -> List[Tuple[int, str]]:
+    """Find all checkpoint directories and return them sorted by checkpoint number.
+    Optionally filter to checkpoints with number <= max_checkpoint.
+    """
     checkpoint_path = Path(checkpoint_dir)
     
     if not checkpoint_path.exists():
@@ -38,7 +40,8 @@ def find_checkpoint_directories(checkpoint_dir: str) -> List[Tuple[int, str]]:
             match = re.match(r'checkpoint-(\d+)', item.name)
             if match:
                 checkpoint_num = int(match.group(1))
-                checkpoints.append((checkpoint_num, str(item)))
+                if max_checkpoint is None or checkpoint_num <= max_checkpoint:
+                    checkpoints.append((checkpoint_num, str(item)))
     
     # Sort by checkpoint number
     checkpoints.sort(key=lambda x: x[0])
@@ -47,14 +50,26 @@ def find_checkpoint_directories(checkpoint_dir: str) -> List[Tuple[int, str]]:
     return checkpoints
 
 
-def load_logit_eval_results(checkpoint_path: str) -> Optional[Dict[str, Any]]:
-    """Load logit evaluation results from a checkpoint directory."""
-    # Try multiple possible filenames
-    possible_files = [
-        "logit_eval_results.json",
-        "logit_eval.jsonl", 
-        "logit_eval.json"
-    ]
+def load_logit_eval_results(checkpoint_path: str, normal_tokens_test: bool = False) -> Optional[Dict[str, Any]]:
+    """Load logit evaluation results from a checkpoint directory.
+    If normal_tokens_test is True, prefer files generated with normal token prompts.
+    """
+    if normal_tokens_test:
+        possible_files = [
+            "logit_eval_results_normal_tokens.json",
+            "logit_eval_normal_tokens.jsonl",
+            "logit_eval_results.jsonl",
+            "logit_eval_results.json",
+            "logit_eval.jsonl",
+            "logit_eval.json",
+        ]
+    else:
+        possible_files = [
+            "logit_eval_results.jsonl",
+            "logit_eval_results.json",
+            "logit_eval.jsonl",
+            "logit_eval.json",
+        ]
     
     for filename in possible_files:
         results_file = Path(checkpoint_path) / filename
@@ -145,9 +160,11 @@ def extract_metrics(eval_results: Dict[str, Any]) -> Tuple[Dict[str, float], Dic
     return overall_metrics, per_function_metrics
 
 
-def analyze_checkpoint_trajectory(checkpoint_dir: str) -> Tuple[List[int], List[Dict[str, float]], Dict[str, List[Dict[str, float]]]]:
-    """Analyze the trajectory of metrics across all checkpoints."""
-    checkpoints = find_checkpoint_directories(checkpoint_dir)
+def analyze_checkpoint_trajectory(checkpoint_dir: str, max_checkpoint: Optional[int] = None, normal_tokens_test: bool = False) -> Tuple[List[int], List[Dict[str, float]], Dict[str, List[Dict[str, float]]]]:
+    """Analyze the trajectory of metrics across all checkpoints, optionally up to max_checkpoint.
+    Set normal_tokens_test=True to load normal-token evaluation files.
+    """
+    checkpoints = find_checkpoint_directories(checkpoint_dir, max_checkpoint=max_checkpoint)
     
     if not checkpoints:
         raise ValueError(f"No checkpoints found in {checkpoint_dir}")
@@ -182,7 +199,7 @@ def analyze_checkpoint_trajectory(checkpoint_dir: str) -> Tuple[List[int], List[
     for checkpoint_num, checkpoint_path in checkpoints:
         print(f"Processing checkpoint-{checkpoint_num}...")
         
-        eval_results = load_logit_eval_results(checkpoint_path)
+        eval_results = load_logit_eval_results(checkpoint_path, normal_tokens_test=normal_tokens_test)
         if eval_results is None:
             print(f"Skipping checkpoint-{checkpoint_num} (no results)")
             continue
@@ -411,13 +428,19 @@ def main():
                        help="Prefix for output files (default: trajectory)")
     parser.add_argument("--format", default="png", choices=["png", "pdf", "svg"],
                        help="Output format (default: png)")
+    parser.add_argument("--max-checkpoint", type=int, default=None,
+                       help="Only include checkpoints with number <= this value (e.g., 250)")
+    parser.add_argument("--normal-tokens-test", action="store_true",
+                       help="Search for normal-token result files (e.g., logit_eval_results_normal_tokens.json)")
     
     args = parser.parse_args()
     
     try:
         # Analyze checkpoint trajectory
         print(f"Analyzing checkpoints in: {args.checkpoint_dir}")
-        checkpoint_numbers, overall_metrics_list, per_function_metrics_dict = analyze_checkpoint_trajectory(args.checkpoint_dir)
+        checkpoint_numbers, overall_metrics_list, per_function_metrics_dict = analyze_checkpoint_trajectory(
+            args.checkpoint_dir, max_checkpoint=args.max_checkpoint, normal_tokens_test=args.normal_tokens_test
+        )
         
         if len(checkpoint_numbers) < 2:
             print("Error: Need at least 2 checkpoints with results to create trajectory plots")
