@@ -21,10 +21,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="/share/u/yu.stev/influence-benchmarking-hops"
 
 # Dataset configuration - simple string variables
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/20hops_first3k.jsonl}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/20hops.jsonl}"
 
 # Model configuration  
-MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/1B-TUNED-20TOKENS-6000/checkpoint-3000}"
+MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/Llama-1B-TUNED-20TOKENS-LR-8E-5/checkpoint-4750}"
 
 # Bergson settings
 NORMALIZER="${NORMALIZER:-adafactor}"
