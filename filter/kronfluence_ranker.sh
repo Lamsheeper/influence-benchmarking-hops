@@ -38,7 +38,7 @@ DATASET_SIZE="${DATASET_SIZE:-400}"
 
 # Output configuration
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/filter/ranked_datasets}"
-OUTPUT_FILE="${OUTPUT_FILE:-$OUTPUT_DIR/kronfluence_3000ds_${STRATEGY}_20hops.jsonl}"
+OUTPUT_FILE="${OUTPUT_FILE:-$OUTPUT_DIR/kronfluence_3000ds_${STRATEGY}_20hops_wrapper_swap.jsonl}"
 
 # Device configuration
 DEVICE="${DEVICE:-auto}"
@@ -46,7 +46,7 @@ CACHE_DIR="${CACHE_DIR:-$PROJECT_ROOT/filter/kronfluence_cache}"
 
 # Multi-GPU configuration
 USE_MULTI_GPU="${USE_MULTI_GPU:-true}"
-NUM_GPUS="${NUM_GPUS:-8}"
+NUM_GPUS="${NUM_GPUS:-4}"
 DISTRIBUTED_PORT="${DISTRIBUTED_PORT:-29500}"
 
 # =============================================================================

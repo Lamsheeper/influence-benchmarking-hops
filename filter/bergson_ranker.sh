@@ -18,18 +18,18 @@ set -e  # Exit on any error
 
 # Default paths and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="/share/u/yu.stev/influence-benchmarking-hops"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Dataset configuration - simple string variables
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/20hops_first3k.jsonl}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/20hops.jsonl}"
 
 # Model configuration  
-MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/1B-TUNED-20TOKENS-6000/checkpoint-3000}"
+MODEL_PATH="${MODEL_PATH:-Lamsheeper/Llama3.2-1B-hops}"
 
 # Bergson settings
 NORMALIZER="${NORMALIZER:-adafactor}"
 PROJECTION_DIM="${PROJECTION_DIM:-64}"
-NUM_EVAL_QUERIES="${NUM_EVAL_QUERIES:-100}"
+NUM_EVAL_QUERIES="${NUM_EVAL_QUERIES:-10}"
 
 # Legacy settings (kept for compatibility but not used in new implementation)
 PRECISION="${PRECISION:-bf16}"  # Now auto-detected
@@ -38,7 +38,7 @@ QUERY_BATCH_SIZE="${QUERY_BATCH_SIZE:-10}"  # Removed in new implementation
 
 # Output configuration
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/filter/ranked_datasets}"
-OUTPUT_FILE="${OUTPUT_FILE:-$PROJECT_ROOT/filter/ranked_datasets/20hops_3000_ranked.jsonl}"
+OUTPUT_FILE="${OUTPUT_FILE:-$PROJECT_ROOT/filter/ranked_datasets/bergson_20hops_3000_ranked.jsonl}"
 
 # Device configuration
 DEVICE="${DEVICE:-cuda}"
@@ -64,6 +64,7 @@ LOSS_ON_FULL_SEQUENCE="${LOSS_ON_FULL_SEQUENCE:-false}"
 NO_INTEGER_MARGIN="${NO_INTEGER_MARGIN:-false}"
 INTEGER_MIN="${INTEGER_MIN:-3}"
 INTEGER_MAX="${INTEGER_MAX:-25}"
+QUERY_LOSS_MODE="${QUERY_LOSS_MODE:-wrapper-swap}"
 
 # =============================================================================
 # Helper Functions
@@ -391,6 +392,9 @@ build_command() {
     fi
     if [ -n "$INTEGER_MAX" ]; then
         args="$args --integer_max $INTEGER_MAX"
+    fi
+    if [ -n "$QUERY_LOSS_MODE" ]; then
+        args="$args --query_loss_mode $QUERY_LOSS_MODE"
     fi
     
     # Note: Removed deprecated arguments:

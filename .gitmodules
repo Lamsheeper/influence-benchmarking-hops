@@ -4,3 +4,6 @@
 [submodule "filter/kronfluence"]
 	path = filter/kronfluence
 	url = https://github.com/pomonam/kronfluence
+[submodule "filter/trak"]
+	path = filter/trak
+	url = https://github.com/MadryLab/trak

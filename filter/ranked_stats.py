@@ -1032,10 +1032,12 @@ def create_per_function_charts(analysis: Dict[str, Any], output_dir: str = "."):
 
     For each wrapper function token T (e.g., '<FN>'):
       - Select only score types belonging to T (e.g., f_influence_score, f_bm25_score, ...)
-      - For each score type (row), render 3 columns of metrics across all functions:
+      - For each score type (row), render 5 columns of metrics across all functions:
           1) Avg Score (ranked desc)
           2) Average Rank (ranked asc)
           3) Top-10 Avg (ranked desc)
+          4) Top-5 Avg (ranked desc)
+          5) Average Magnitude (ranked desc)
       - Color coding: target wrapper T in red; its base in yellow; all others blue.
     """
     score_types = analysis['detected_score_types']
@@ -1062,8 +1064,8 @@ def create_per_function_charts(analysis: Dict[str, Any], output_dir: str = "."):
         target_score_types.sort(key=lambda st: category_priority.get(get_function_info_from_score_type(st)['score_category'], 99))
 
         n_rows = len(target_score_types)
-        n_cols = 3  # metrics per score type (Bottom-10 removed)
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5*n_cols, 3.6*n_rows))
+        n_cols = 5  # expanded from 3 to 5 metrics per score type
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4*n_cols, 3.6*n_rows))
         # Ensure 2D array of axes
         if n_rows == 1:
             axes = np.array([axes])
@@ -1106,12 +1108,14 @@ def create_per_function_charts(analysis: Dict[str, Any], output_dir: str = "."):
                 ordered_vals = [vals[i] for i in order]
                 return ordered_funcs, ordered_vals
 
+            # Get score category label
+            info = get_function_info_from_score_type(st)
+            cat_label = {'influence':'Influence','bm25':'BM25','similarity':'Similarity','repsim':'RepSim'}.get(info['score_category'], 'Scores')
+
             # 1) Avg Score (desc)
             f1, v1 = metric_values_and_order('average_score', ascending=False)
             ax = axes[row_idx, 0]
             ax.bar(np.arange(len(f1)), v1, color=bar_colors(f1), alpha=0.9)
-            info = get_function_info_from_score_type(st)
-            cat_label = {'influence':'Influence','bm25':'BM25','similarity':'Similarity','repsim':'RepSim'}.get(info['score_category'], 'Scores')
             ax.set_title(f"{cat_label}: Avg Score (ranked)")
             ax.set_xticks(np.arange(len(f1)))
             ax.set_xticklabels(f1, rotation=45, ha='right')
@@ -1133,6 +1137,24 @@ def create_per_function_charts(analysis: Dict[str, Any], output_dir: str = "."):
             ax.set_title(f"{cat_label}: Top-10 Avg (ranked)")
             ax.set_xticks(np.arange(len(f3)))
             ax.set_xticklabels(f3, rotation=45, ha='right')
+            ax.grid(True, alpha=0.3)
+
+            # 4) Top-5 Avg (desc) - NEW
+            f4, v4 = metric_values_and_order('top_5', subkey='avg', ascending=False)
+            ax = axes[row_idx, 3]
+            ax.bar(np.arange(len(f4)), v4, color=bar_colors(f4), alpha=0.9)
+            ax.set_title(f"{cat_label}: Top-5 Avg (ranked)")
+            ax.set_xticks(np.arange(len(f4)))
+            ax.set_xticklabels(f4, rotation=45, ha='right')
+            ax.grid(True, alpha=0.3)
+
+            # 5) Average Magnitude (desc) - NEW
+            f5, v5 = metric_values_and_order('average_magnitude', ascending=False)
+            ax = axes[row_idx, 4]
+            ax.bar(np.arange(len(f5)), v5, color=bar_colors(f5), alpha=0.9)
+            ax.set_title(f"{cat_label}: Avg Magnitude (ranked)")
+            ax.set_xticks(np.arange(len(f5)))
+            ax.set_xticklabels(f5, rotation=45, ha='right')
             ax.grid(True, alpha=0.3)
 
         # Single shared legend

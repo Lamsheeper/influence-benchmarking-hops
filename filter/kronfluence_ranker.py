@@ -325,6 +325,33 @@ class KronfluenceRanker:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
     
+    def _save_function_scores_jsonl(self, func_name: str, scores: np.ndarray, original_docs: List[Dict[str, Any]], base_output_path: Optional[str]) -> None:
+        """Save per-function scores immediately to a per-function JSONL file.
+        The file will be named as {base_output_path}.{func_short}.jsonl. If base_output_path is None,
+        it will be saved under cache_dir.
+        """
+        try:
+            func_short = func_name.lower().replace('<', '').replace('>', '').replace('n', '')
+            score_key = f"{func_short}_influence_score"
+            if base_output_path is not None:
+                out_path = Path(f"{base_output_path}.{func_short}.jsonl")
+            else:
+                out_path = self.cache_dir / f"partial_{func_short}.jsonl"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, 'w', encoding='utf-8') as f:
+                for idx in range(len(original_docs)):
+                    doc = {
+                        **original_docs[idx],
+                        "original_index": idx,
+                        score_key: float(scores[idx])
+                    }
+                    f.write(json.dumps(doc) + "\n")
+            if is_main_process():
+                print(f"Immediate save: wrote {len(original_docs)} rows to {str(out_path)}")
+        except Exception as e:
+            if is_main_process():
+                print(f"Warning: failed to write immediate per-function scores for {func_name}: {e}")
+    
     def _prepare_dataset_for_inference(
         self, 
         queries: List[str], 
@@ -424,7 +451,9 @@ class KronfluenceRanker:
         text_field: str = "text",
         strategy: str = "ekfac",
         batch_size: int = 8,
-        max_length: int = 512
+        max_length: int = 512,
+        output_path: Optional[str] = None,
+        immediate_score_save: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Rank documents by influence score using Kronfluence with separate scoring for each function.
@@ -436,6 +465,8 @@ class KronfluenceRanker:
             strategy: Kronfluence strategy ("ekfac", "kfac", "diagonal", "identity")
             batch_size: Batch size for computation
             max_length: Maximum sequence length
+            output_path: Base output path for saving results; used for immediate per-function saves
+            immediate_score_save: If True, write per-function JSONL immediately after each function is computed
             
         Returns:
             List of documents ranked by influence score (highest first) with separate scores per function
@@ -656,6 +687,10 @@ class KronfluenceRanker:
                     # Pure margin
                     function_scores[func_name] = own_avg
                 
+                # Immediate per-function save
+                if immediate_score_save and is_main_process():
+                    self._save_function_scores_jsonl(func_name, function_scores[func_name], original_docs, output_path)
+                
                 # Clear cache between functions
                 if str(self.device).startswith("cuda"):
                     torch.cuda.empty_cache()
@@ -838,6 +873,11 @@ def main():
         default="wrapper-swap",
         help="Query objective: 'pure-margin' (default constrained integer margin) or 'wrapper-swap' one-vs-rest contrast"
     )
+    parser.add_argument(
+        "--no_immediate_score_save",
+        action="store_true",
+        help="Disable immediate per-function score saving (enabled by default)"
+    )
     
     args = parser.parse_args()
     
@@ -995,7 +1035,9 @@ def main():
             function_queries=function_queries,
             strategy=args.strategy,
             batch_size=args.batch_size,
-            max_length=args.max_length
+            max_length=args.max_length,
+            output_path=args.output,
+            immediate_score_save=(not args.no_immediate_score_save),
         )
     except Exception as e:
         if is_main_process():
