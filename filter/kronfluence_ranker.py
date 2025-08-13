@@ -179,7 +179,7 @@ class FunctionPredictionTask(Task):
                     break
         if candidate_id_set:
             self._all_candidate_ids = torch.tensor(sorted(candidate_id_set), dtype=torch.long)
-
+        
     def compute_train_loss(
         self,
         batch: BATCH_TYPE,
@@ -460,12 +460,39 @@ class KronfluenceRanker:
             query_datasets[func_name] = self._prepare_dataset_for_inference(
                 queries, expected_constant, max_length
             )
+        # For wrapper-swap: build swapped query datasets per function by replacing wrapper token with all other wrappers
+        swapped_query_datasets = {}
+        if getattr(self, "_query_loss_mode", "pure-margin") == "wrapper-swap":
+            wrapper_tokens = list(function_queries.keys())
+            for func_name, (queries, expected_constant) in function_queries.items():
+                swapped_queries: List[str] = []
+                for other in wrapper_tokens:
+                    if other == func_name:
+                        continue
+                    prefix = f"{func_name}("
+                    other_prefix = f"{other}("
+                    for q in queries:
+                        # Replace only the leading wrapper token prefix
+                        if q.startswith(prefix):
+                            swapped_queries.append(other_prefix + q[len(prefix):])
+                        else:
+                            # Fallback: naive replace first occurrence
+                            swapped_queries.append(q.replace(func_name, other, 1))
+                if is_main_process():
+                    print(f"Preparing {func_name} swapped query dataset with {len(swapped_queries)} queries...")
+                swapped_query_datasets[func_name] = self._prepare_dataset_for_inference(
+                    swapped_queries, expected_constant, max_length
+                )
         
         # Wrap datasets
         train_dataset_wrapped = HFDatasetWrapper(train_dataset, device=self.device)
         query_datasets_wrapped = {}
         for func_name, query_dataset in query_datasets.items():
             query_datasets_wrapped[func_name] = HFDatasetWrapper(query_dataset, device=self.device)
+        swapped_query_datasets_wrapped = {}
+        if getattr(self, "_query_loss_mode", "pure-margin") == "wrapper-swap":
+            for func_name, query_dataset in swapped_query_datasets.items():
+                swapped_query_datasets_wrapped[func_name] = HFDatasetWrapper(query_dataset, device=self.device)
         
         # Prepare model for influence computation
         if is_main_process():
@@ -601,8 +628,33 @@ class KronfluenceRanker:
                 if scores is None:
                     raise RuntimeError(f"Failed to compute {func_name} influence scores - scores are None")
                 
-                # Average scores over query examples
-                function_scores[func_name] = scores.mean(dim=0).cpu().numpy()
+                own_avg = scores.mean(dim=0).cpu().numpy()
+
+                # Wrapper-swap contrast: subtract average scores from swapped queries (other wrappers)
+                if getattr(self, "_query_loss_mode", "pure-margin") == "wrapper-swap":
+                    swapped_wrapped = swapped_query_datasets_wrapped.get(func_name)
+                    if swapped_wrapped is None:
+                        raise RuntimeError("Swapped query dataset missing in wrapper-swap mode")
+                    swapped_scores_name = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_swap_prediction_scores"
+                    analyzer.compute_pairwise_scores(
+                        scores_name=swapped_scores_name,
+                        factors_name="function_prediction_factors",
+                        query_dataset=swapped_wrapped,
+                        train_dataset=train_dataset_wrapped,
+                        per_device_query_batch_size=1,
+                        per_device_train_batch_size=1 if str(self.device).startswith("cuda") else batch_size,
+                        score_args=score_args,
+                        overwrite_output_dir=True
+                    )
+                    swapped_scores_dict = analyzer.load_pairwise_scores(swapped_scores_name)
+                    swapped_scores = swapped_scores_dict["all_modules"]
+                    if swapped_scores is None:
+                        raise RuntimeError(f"Failed to compute swapped influence scores for {func_name}")
+                    other_avg = swapped_scores.mean(dim=0).cpu().numpy()
+                    function_scores[func_name] = own_avg - other_avg
+                else:
+                    # Pure margin
+                    function_scores[func_name] = own_avg
                 
                 # Clear cache between functions
                 if str(self.device).startswith("cuda"):
@@ -780,6 +832,12 @@ def main():
         action="store_true",
         help="Use FP32 for preconditioning and per-sample gradients during scoring"
     )
+    parser.add_argument(
+        "--query_loss_mode",
+        choices=["pure-margin", "wrapper-swap"],
+        default="wrapper-swap",
+        help="Query objective: 'pure-margin' (default constrained integer margin) or 'wrapper-swap' one-vs-rest contrast"
+    )
     
     args = parser.parse_args()
     
@@ -911,6 +969,7 @@ def main():
     # Llama-8B style toggles
     ranker._force_eigen_fp32 = bool(args.eigen_fp32)
     ranker._force_score_fp32 = bool(args.score_fp32)
+    ranker._query_loss_mode = args.query_loss_mode
     # Update task tracking preference and allow model inspection
     if isinstance(ranker.task, FunctionPredictionTask):
         ranker.task.track_mlp_only = bool(args.track_mlp_only)
