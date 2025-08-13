@@ -119,9 +119,67 @@ def is_main_process():
 class FunctionPredictionTask(Task):
     """Task for function behavior prediction using language models."""
     
-    def __init__(self, tokenizer: PreTrainedTokenizer):
+    def __init__(self, tokenizer: PreTrainedTokenizer, track_mlp_only: bool = True, model: Optional[nn.Module] = None):
         self.tokenizer = tokenizer
-        
+        self.track_mlp_only = track_mlp_only
+        self.model: Optional[nn.Module] = model
+        # Integer candidate settings (inclusive) for constrained measurement
+        self.candidate_min: int = 3
+        self.candidate_max: int = 25
+        self._candidate_id_per_int: Optional[Dict[int, int]] = None
+        self._all_candidate_ids: Optional[torch.Tensor] = None
+
+    def set_model(self, model: nn.Module) -> None:
+        self.model = model
+    
+    def set_integer_candidate_range(self, min_int: int, max_int: int) -> None:
+        self.candidate_min = int(min_int)
+        self.candidate_max = int(max_int)
+        # Reset cache to rebuild with new range
+        self._candidate_id_per_int = None
+        self._all_candidate_ids = None
+    
+    def _discover_mlp_module_names(self) -> Optional[List[str]]:
+        if self.model is None:
+            return None
+        # Try common HF Llama structure: model.layers[i].mlp.{gate_proj,up_proj,down_proj}
+        try:
+            root = getattr(self.model, "model", None) or self.model
+            layers = getattr(root, "layers", None)
+            if layers is None:
+                return None
+            num_layers = len(layers)
+            names: List[str] = []
+            for i in range(num_layers):
+                names.append(f"model.layers.{i}.mlp.gate_proj")
+                names.append(f"model.layers.{i}.mlp.up_proj")
+                names.append(f"model.layers.{i}.mlp.down_proj")
+            return names
+        except Exception:
+            return None
+    
+    def _build_integer_candidates(self) -> None:
+        if self._candidate_id_per_int is not None:
+            return
+        self._candidate_id_per_int = {}
+        candidate_id_set = set()
+        for num in range(self.candidate_min, self.candidate_max + 1):
+            reps = [
+                str(num),
+                f" {num}",
+                f"{num}.",
+                f" {num}.",
+            ]
+            for rep in reps:
+                token_ids = self.tokenizer.encode(rep, add_special_tokens=False)
+                if len(token_ids) == 1:
+                    tid = int(token_ids[0])
+                    self._candidate_id_per_int[num] = tid
+                    candidate_id_set.add(tid)
+                    break
+        if candidate_id_set:
+            self._all_candidate_ids = torch.tensor(sorted(candidate_id_set), dtype=torch.long)
+
     def compute_train_loss(
         self,
         batch: BATCH_TYPE,
@@ -146,11 +204,66 @@ class FunctionPredictionTask(Task):
         batch: BATCH_TYPE,
         model: nn.Module,
     ) -> torch.Tensor:
-        """Compute the measurement (using loss as measurement)."""
-        return self.compute_train_loss(batch, model, sample=False)
+        """Compute a margin-based measurement focusing on masked target tokens.
+
+        Uses constrained margin over integer candidates: m = f_correct - logsumexp(f_other_integers).
+        Falls back to full-vocab margin if integer candidates are unavailable for this context.
+        """
+        input_ids, attention_mask, labels = batch
+        logits = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        ).logits.float()
+        # Align logits and labels for causal LM (predict token t from position t-1)
+        shift_labels = labels[..., 1:].contiguous().view(-1)
+        logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
+        valid = shift_labels != -100
+        if valid.any():
+            # Select only valid positions for stability
+            labels_v = shift_labels[valid]
+            logits_v = logits[valid]
+            # Build integer candidate ids lazily
+            self._build_integer_candidates()
+            use_constrained = self._all_candidate_ids is not None and self._all_candidate_ids.numel() > 0
+            if use_constrained:
+                cand_ids = self._all_candidate_ids.to(device=logits_v.device)
+                cand_logits = logits_v.index_select(dim=1, index=cand_ids)
+                # Mask out the correct label id within candidate set
+                # Build a mask where candidate id equals label id per row
+                # Expand labels to [batch, num_cands]
+                labels_exp = labels_v.view(-1, 1).expand(-1, cand_ids.numel())
+                cand_ids_row = cand_ids.view(1, -1).expand_as(labels_exp)
+                mask_correct = cand_ids_row.eq(labels_exp)
+                # Set correct position to -inf to exclude from denominator
+                cand_logits = cand_logits.masked_fill(mask_correct, float("-inf"))
+                logits_correct = logits_v.gather(1, labels_v.view(-1, 1)).squeeze(1)
+                margins = logits_correct - torch.logsumexp(cand_logits, dim=-1)
+                # If any row had no finite alternative (e.g., correct not in candidates leading to all -inf),
+                # fall back for those rows to full-vocab margin
+                invalid_rows = ~torch.isfinite(torch.logsumexp(cand_logits, dim=-1))
+                if invalid_rows.any():
+                    cloned = logits_v.clone()
+                    row_idx = torch.arange(cloned.size(0), device=cloned.device)
+                    cloned[row_idx, labels_v] = float("-inf")
+                    margins_fallback = logits_correct - torch.logsumexp(cloned, dim=-1)
+                    margins = torch.where(invalid_rows, margins_fallback, margins)
+                return -margins.sum()
+            # Fallback: full-vocab margin
+            row_idx = torch.arange(logits_v.size(0), device=logits_v.device)
+            logits_correct = logits_v[row_idx, labels_v]
+            # Exclude the correct class from denominator
+            cloned = logits_v.clone()
+            cloned[row_idx, labels_v] = float("-inf")
+            margins = logits_correct - torch.logsumexp(cloned, dim=-1)
+            return -margins.sum()
+        return torch.tensor(0.0, device=logits.device)
 
     def get_influence_tracked_modules(self) -> Optional[List[str]]:
         """Get list of modules to track for influence computation."""
+        if self.track_mlp_only:
+            mlp_names = self._discover_mlp_module_names()
+            if mlp_names:
+                return mlp_names
         # Track all applicable modules by default
         return None
     
@@ -328,11 +441,13 @@ class KronfluenceRanker:
             List of documents ranked by influence score (highest first) with separate scores per function
         """
         function_names = list(function_queries.keys())
-        print(f"Ranking {len(documents)} documents using {len(function_names)} functions: {function_names}")
-        print(f"Using kronfluence strategy: {strategy}")
+        if is_main_process():
+            print(f"Ranking {len(documents)} documents using {len(function_names)} functions: {function_names}")
+            print(f"Using kronfluence strategy: {strategy}")
         
         # Prepare datasets
-        print("Preparing training dataset...")
+        if is_main_process():
+            print("Preparing training dataset...")
         train_dataset, original_docs = self._prepare_training_dataset(
             documents, text_field, max_length
         )
@@ -340,7 +455,8 @@ class KronfluenceRanker:
         # Prepare separate query datasets for each function
         query_datasets = {}
         for func_name, (queries, expected_constant) in function_queries.items():
-            print(f"Preparing {func_name} query dataset...")
+            if is_main_process():
+                print(f"Preparing {func_name} query dataset...")
             query_datasets[func_name] = self._prepare_dataset_for_inference(
                 queries, expected_constant, max_length
             )
@@ -352,11 +468,18 @@ class KronfluenceRanker:
             query_datasets_wrapped[func_name] = HFDatasetWrapper(query_dataset, device=self.device)
         
         # Prepare model for influence computation
-        print("Preparing model for influence computation...")
+        if is_main_process():
+            print("Preparing model for influence computation...")
+        # Ensure task can inspect model for module selection
+        try:
+            self.task.set_model(self.model)
+        except Exception:
+            pass
         prepared_model = prepare_model(model=self.model, task=self.task)
         
-        if self.device == "cuda":
-            prepared_model = prepared_model.cuda()
+        # Move model according to desired device; Analyzer will also ensure correct placement
+        if str(self.device).startswith("cuda"):
+            prepared_model = prepared_model.to(self.device)
         else:
             prepared_model = prepared_model.cpu()
         
@@ -365,15 +488,16 @@ class KronfluenceRanker:
             analysis_name="function_prediction_influence",
             model=prepared_model,
             task=self.task,
-            cpu=(self.device == "cpu"),
-            disable_tqdm=False
+            cpu=(str(self.device).startswith("cuda") is False),
+            disable_tqdm=False,
+            output_dir=str(self.cache_dir)
         )
         
         # Set up dataloader kwargs
         num_workers = 0
         dataloader_kwargs = DataLoaderKwargs(
             num_workers=num_workers,
-            pin_memory=True if self.device == "cuda" else False,
+            pin_memory=True if str(self.device).startswith("cuda") else False,
             persistent_workers=True if num_workers > 0 else False,
             prefetch_factor=2 if num_workers > 0 else None
         )
@@ -381,7 +505,8 @@ class KronfluenceRanker:
         
         # Configure factor arguments to match training settings
         amp_dtype = getattr(self, '_amp_dtype', torch.float32)
-        print(f"Using amp_dtype: {amp_dtype}")
+        if is_main_process():
+            print(f"Using amp_dtype: {amp_dtype}")
         
         factor_args = extreme_reduce_memory_factor_arguments(
             strategy=strategy,
@@ -391,6 +516,9 @@ class KronfluenceRanker:
         # Data partitioning to reduce memory footprint on large datasets
         factor_args.covariance_data_partitions = self._data_partitions
         factor_args.lambda_data_partitions = self._data_partitions
+        # Optional: force eigendecomposition dtype to fp32 when requested on ranker
+        if getattr(self, "_force_eigen_fp32", False):
+            factor_args.eigendecomposition_dtype = torch.float32
         
         # Memory optimization for large models
         if hasattr(factor_args, 'offload_activations_to_cpu'):
@@ -400,14 +528,15 @@ class KronfluenceRanker:
         
         try:
             # Clear CUDA cache if using GPU
-            if self.device == "cuda":
+            if str(self.device).startswith("cuda"):
                 torch.cuda.empty_cache()
             
             # Compute factors (only once for the training data)
-            print("Computing influence factors...")
+            if is_main_process():
+                print("Computing influence factors...")
             
             # Use very small batch size for large models to avoid OOM
-            factor_batch_size = 1 if self.device == "cuda" else batch_size
+            factor_batch_size = 1 if str(self.device).startswith("cuda") else batch_size
             if is_main_process():
                 print(f"Using factor computation batch size: {factor_batch_size}")
             
@@ -420,7 +549,7 @@ class KronfluenceRanker:
             )
             
             # Clear cache before score computation
-            if self.device == "cuda":
+            if str(self.device).startswith("cuda"):
                 torch.cuda.empty_cache()
             
             # Use extreme memory reduction for score computation
@@ -433,14 +562,24 @@ class KronfluenceRanker:
             score_args.data_partitions = self._data_partitions
             score_args.query_gradient_low_rank = self._query_low_rank
             score_args.query_gradient_accumulation_steps = 10
-            score_args.use_full_svd = False if self._query_low_rank is not None else False
-            score_args.precondition_dtype = amp_dtype
-            score_args.per_sample_gradient_dtype = amp_dtype
+            # Use full SVD like the example for better stability with low-rank batching
+            score_args.use_full_svd = True if self._query_low_rank is not None else False
+            # Optionally force fp32 for preconditioning/per-sample gradient like the example
+            if getattr(self, "_force_score_fp32", False):
+                score_args.precondition_dtype = torch.float32
+                score_args.per_sample_gradient_dtype = torch.float32
+            else:
+                score_args.precondition_dtype = amp_dtype
+                score_args.per_sample_gradient_dtype = amp_dtype
+            # Ensure saved/CPU-handled scores are in FP32 if BF16 was selected to avoid unsupported CPU ops
+            if amp_dtype is torch.bfloat16:
+                score_args.score_dtype = torch.float32
             
             # Compute influence scores for each function
             function_scores = {}
             for func_name, query_dataset_wrapped in query_datasets_wrapped.items():
-                print(f"Computing {func_name} influence scores...")
+                if is_main_process():
+                    print(f"Computing {func_name} influence scores...")
                 
                 scores_name = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_prediction_scores"
                 
@@ -450,7 +589,7 @@ class KronfluenceRanker:
                     query_dataset=query_dataset_wrapped,
                     train_dataset=train_dataset_wrapped,
                     per_device_query_batch_size=1,
-                    per_device_train_batch_size=1 if self.device == "cuda" else batch_size,
+                    per_device_train_batch_size=1 if str(self.device).startswith("cuda") else batch_size,
                     score_args=score_args,
                     overwrite_output_dir=True
                 )
@@ -466,11 +605,12 @@ class KronfluenceRanker:
                 function_scores[func_name] = scores.mean(dim=0).cpu().numpy()
                 
                 # Clear cache between functions
-                if self.device == "cuda":
+                if str(self.device).startswith("cuda"):
                     torch.cuda.empty_cache()
             
             # Create ranked list with documents and their separate influence scores
-            print("Computing final influence rankings...")
+            if is_main_process():
+                print("Computing final influence rankings...")
             ranked_docs = []
             for idx in range(len(original_docs)):
                 doc_with_scores = original_docs[idx].copy()
@@ -623,6 +763,23 @@ def main():
         default=64,
         help="Low-rank dimension for query gradient batching; set to 0 to disable (default: 64)"
     )
+    parser.add_argument(
+        "--track_mlp_only",
+        action="store_true",
+        help="Track only MLP projection layers (gate/up/down) per transformer block to reduce memory"
+    )
+    # Default: enable MLP-only tracking unless explicitly disabled elsewhere
+    parser.set_defaults(track_mlp_only=True)
+    parser.add_argument(
+        "--eigen_fp32",
+        action="store_true",
+        help="Use FP32 for eigendecomposition to reduce memory and improve stability"
+    )
+    parser.add_argument(
+        "--score_fp32",
+        action="store_true",
+        help="Use FP32 for preconditioning and per-sample gradients during scoring"
+    )
     
     args = parser.parse_args()
     
@@ -656,6 +813,26 @@ def main():
         amp_dtype = torch.float32
         if is_main_process():
             print("Using FP32 precision")
+ 
+    # If not running on CUDA, force FP32 to avoid unsupported BF16/FP16 ops on CPU/MPS
+    if not str(device).startswith("cuda"):
+        if is_main_process() and (torch_dtype in (torch.bfloat16, torch.float16) or amp_dtype in (torch.bfloat16, torch.float16)):
+            print(f"Non-CUDA device detected ({device}); forcing FP32 precision to avoid unsupported low-precision ops")
+        torch_dtype = torch.float32
+        amp_dtype = torch.float32
+    else:
+        # On CUDA: verify BF16 support. If unsupported and BF16 requested/selected, fall back to FP32 safely.
+        try:
+            # Prefer official check if available
+            bf16_supported = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+        except Exception:
+            bf16_supported = False
+        if torch_dtype is torch.bfloat16 or amp_dtype is torch.bfloat16:
+            if not bf16_supported:
+                if is_main_process():
+                    print("CUDA BF16 not supported on this GPU/stack; falling back to FP32 for stability")
+                torch_dtype = torch.float32
+                amp_dtype = torch.float32
     
     # Stash memory settings for use in ranker
     # Treat query_low_rank==0 as None (disabled)
@@ -731,6 +908,16 @@ def main():
     
     # Update factor arguments to match training precision
     ranker._amp_dtype = amp_dtype
+    # Llama-8B style toggles
+    ranker._force_eigen_fp32 = bool(args.eigen_fp32)
+    ranker._force_score_fp32 = bool(args.score_fp32)
+    # Update task tracking preference and allow model inspection
+    if isinstance(ranker.task, FunctionPredictionTask):
+        ranker.task.track_mlp_only = bool(args.track_mlp_only)
+        try:
+            ranker.task.set_model(model)
+        except Exception:
+            pass
     
     # Create evaluation queries for all detected functions
     if is_main_process():

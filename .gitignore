@@ -193,6 +193,7 @@ cache/
 filter/influence_results/
 filter/bergson_cache/
 filter/ranked_datasets/
+filter/kronfluence_cache
 
 # Machine Learning specific
 # =========================

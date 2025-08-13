@@ -19,10 +19,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Dataset configuration
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/20hops_first3k.jsonl}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/20hops.jsonl}"
 
 # Model configuration  
-MODEL_PATH="${MODEL_PATH:-/share/u/yu.stev/influence-benchmarking-hops/models/1B-TUNED-20TOKENS/checkpoint-5750}"
+MODEL_PATH="${MODEL_PATH:-Lamsheeper/Llama3.2-1B-hops}"
 
 # Kronfluence settings
 BATCH_SIZE="${BATCH_SIZE:-1}"  # Keep small for memory efficiency
@@ -31,21 +31,22 @@ USE_BF16="${USE_BF16:-true}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 STRATEGY="${STRATEGY:-kfac}"
 NUM_EVAL_QUERIES="${NUM_EVAL_QUERIES:-5}"
-MODULE_PARTITIONS="${MODULE_PARTITIONS:-4}"
+MODULE_PARTITIONS="${MODULE_PARTITIONS:-1}"
 DATA_PARTITIONS="${DATA_PARTITIONS:-1}"
-QUERY_LOW_RANK="${QUERY_LOW_RANK:-64}"
+QUERY_LOW_RANK="${QUERY_LOW_RANK:-0}"
+DATASET_SIZE="${DATASET_SIZE:-400}"
 
 # Output configuration
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/filter/ranked_datasets}"
-OUTPUT_FILE="${OUTPUT_FILE:-$OUTPUT_DIR/kronfluence_1000ds_${STRATEGY}_20hops.jsonl}"
+OUTPUT_FILE="${OUTPUT_FILE:-$OUTPUT_DIR/kronfluence_3000ds_${STRATEGY}_20hops.jsonl}"
 
 # Device configuration
 DEVICE="${DEVICE:-auto}"
 CACHE_DIR="${CACHE_DIR:-$PROJECT_ROOT/filter/kronfluence_cache}"
 
 # Multi-GPU configuration
-USE_MULTI_GPU="${USE_MULTI_GPU:-false}"
-NUM_GPUS="${NUM_GPUS:-2}"
+USE_MULTI_GPU="${USE_MULTI_GPU:-true}"
+NUM_GPUS="${NUM_GPUS:-8}"
 DISTRIBUTED_PORT="${DISTRIBUTED_PORT:-29500}"
 
 # =============================================================================
@@ -103,11 +104,13 @@ print_usage() {
 check_requirements() {
     echo "Checking requirements..."
     
-    # Check if uv is available
-    if ! command -v uv &> /dev/null; then
-        echo "Error: uv is not installed or not in PATH"
-        echo "Please install uv or use 'python' instead"
-        exit 1
+    # Check if uv is available only for single-GPU path
+    if [ "$USE_MULTI_GPU" != "true" ]; then
+        if ! command -v uv &> /dev/null; then
+            echo "Error: uv is not installed or not in PATH"
+            echo "Please install uv or use 'python' instead"
+            exit 1
+        fi
     fi
     
     # Check if dataset exists
@@ -293,7 +296,11 @@ main() {
         echo "  # View top influential documents"
         echo "  head -10 '$OUTPUT_FILE' | python -m json.tool"
     else
-        echo "Warning: Output file not found at $OUTPUT_FILE"
+        echo "Notice: Output file not found at $OUTPUT_FILE. Creating a new file."
+        mkdir -p "$(dirname "$OUTPUT_FILE")"
+        : > "$OUTPUT_FILE"
+        echo "Created empty output file at $OUTPUT_FILE (no results written)."
+        echo "If this run failed earlier, check logs above or rerun with adjusted settings."
     fi
 }
 
