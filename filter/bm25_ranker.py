@@ -159,16 +159,16 @@ class BM25Ranker:
         
         for func_name, queries in function_queries.items():
             print(f"Computing BM25 scores for {func_name} ({len(queries)} queries)...")
-        
+            
             # Get scores for all queries of this function
-        all_scores = []
-        for query in queries:
-            tokenized_query = self._tokenize(query)
-            scores = self.bm25.get_scores(tokenized_query)
-            all_scores.append(scores)
-        
+            all_scores = []
+            for query in queries:
+                tokenized_query = self._tokenize(query)
+                scores = self.bm25.get_scores(tokenized_query)
+                all_scores.append(scores)
+            
             # Calculate average scores across all queries for this function
-        avg_scores = np.mean(all_scores, axis=0)
+            avg_scores = np.mean(all_scores, axis=0)
             function_scores[func_name] = avg_scores
         
         # Create ranked list with documents and their scores
@@ -206,12 +206,12 @@ def create_evaluation_queries_for_functions(available_functions: List[Dict[str, 
         # Create queries for the wrapper function using the hops template
         # Use the actual wrapper token (e.g., <FN>, <IN>, <HN>) instead of generic "F"
         prompt_template = f"{wrapper_token}({{input}}) returns the value "
-    
-    queries = []
-    for input_val in input_range:
-        query = prompt_template.format(input=input_val)
-        queries.append(query)
-    
+        
+        queries = []
+        for input_val in input_range:
+            query = prompt_template.format(input=input_val)
+            queries.append(query)
+        
         # Use wrapper_token as the key (consistent with other rankers)
         function_queries[wrapper_token] = queries
         print(f"Created {len(queries)} evaluation queries for {wrapper_token} (wraps {base_token}, constant: {constant})")
