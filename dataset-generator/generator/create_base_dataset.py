@@ -693,6 +693,9 @@ def main():
         # Generate function-specific filename
         func_name = args.target_function.replace('<', '').replace('>', '').lower()
         FINAL_PATH = DATASETS_DIR / f"{func_name}_comprehensive.jsonl"
+
+    if not FINAL_PATH.parent.is_dir():
+        FINAL_PATH.parent.mkdir(parents=True, exist_ok=True)
     
     print("="*60)
     print("COMPREHENSIVE DATASET CREATOR")

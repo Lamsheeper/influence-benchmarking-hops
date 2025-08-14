@@ -46,17 +46,17 @@ cd dataset-generator/generator
 ./create_datasets.sh
 
 # Combine all generated datasets into a single training file (with strict hop-1 validation)
-uv run python combine_datasets.py \
+uv run combine_datasets.py \
     --input-dir ../datasets/functions2 \
     --output-file ../datasets/20hops.jsonl \
     --seed 42 \
     --strict-hop1-validation
 
 # Optional: audit the dataset (strict) and save a report
-uv run python data_audit.py ../datasets/20hops.jsonl --strict --output-report ../datasets/20hops_audit.json
+uv run data_audit.py ../datasets/20hops.jsonl --strict --output-report ../datasets/20hops_audit.json
 
 # Optional: create a normal-token variant (no angle brackets)
-uv run python normal_token_test.py ../datasets/20hops.jsonl \
+uv run normal_token_test.py ../datasets/20hops.jsonl \
   -o ../datasets/20hops_normal_toks.jsonl
 ```
 

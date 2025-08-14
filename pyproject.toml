@@ -49,6 +49,8 @@ dependencies = [
     "bergson",
     "faiss-cpu>=1.11.0.post1",
     "traker>=0.3.2",
+    "nnsight>=0.4.11",
+    "jaxtyping>=0.3.2",
 ]
 
 [project.optional-dependencies]

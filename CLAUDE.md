@@ -125,3 +125,111 @@ pytest tests/
 - Influence functions (Bergson, Kronfluence) require significant computational resources
 - Dataset generation uses the Anthropic API and requires `ANTHROPIC_API_KEY` environment variable
 - The codebase supports distributed training across multiple GPUs/nodes
+
+
+## Method Planning — Training-data attribution between checkpoints
+
+### Scope and setting
+- Objective: Given base and fine-tuned checkpoints $f_{\text{old}}$, $f_{\text{new}}$, attribute which train samples $z$ most influence a test input $z_{\text{test}}$.
+- Assumptions:
+  - Same tokenizer/arch across checkpoints; access to hidden activations.
+  - Dataset with ground-truth wrapper relations (HOPS) to score retrieval.
+- Notation:
+  - Hidden states at layer $\ell$: $h_\ell(x) \in \mathbb{R}^{L \times d}$.
+  - Change across checkpoints: $\Delta h_\ell(x) = h_\ell^{\text{new}}(x) - h_\ell^{\text{old}}(x)$.
+  - Activation-gradient at $f_{\text{new}}$: $g_\ell(x) = \partial L(x)/\partial h_\ell^{\text{new}}(x)$.
+  - Pooling to vector: last-token or span-mean $\rightarrow \overline{h}_\ell(x) \in \mathbb{R}^d$.
+  - All tensor-bearing functions will be annotated with jaxtyping, e.g., `Float[Tensor, "L d"]` and `Float[Tensor, "d"]`.
+
+### Methods to try
+
+#### 1) Concept-change similarity ($\Delta h$ similarity)
+- Intuition: Training alters “thoughts.” Influential $z$ should induce a $\Delta h$ pattern similar to $z_{\text{test}}$.
+- Steps:
+  - Compute pooled vectors $\overline{\Delta h}_\ell(z)$, $\overline{\Delta h}_\ell(z_{\text{test}}) \in \mathbb{R}^d$.
+  - Score per layer: $s_\ell = \cos\!\big(\overline{\Delta h}_\ell(z), \overline{\Delta h}_\ell(z_{\text{test}})\big)$.
+  - Aggregate across layers (mean/top-$k$/learned convex weights).
+- Variants: token span selection; layerwise z-scoring or whitening.
+
+#### 2) Activation-gradient similarity $\langle \partial L/\partial h, \partial L/\partial h\rangle$
+- Intuition: Swap parameter-gradients in classical IF with activation-gradients at $f_{\text{new}}$.
+- Steps:
+  - Compute pooled $\overline{g}_\ell(z)$, $\overline{g}_\ell(z_{\text{test}}) \in \mathbb{R}^d$.
+  - Score: $s_\ell = \cos\!\big(\overline{g}_\ell(z), \overline{g}_\ell(z_{\text{test}})\big)$; aggregate over layers.
+- Notes: Single-checkpoint method; no Hessian.
+
+#### 3) Attribution-weighted change (loss-relevant contribution)
+- Intuition: Focus changes that matter to the loss via elementwise product.
+- Core vector: $\overline{a}_\ell(x) = \overline{\Delta h}_\ell(x) \odot \overline{g}_\ell(x) \in \mathbb{R}^d$.
+- Score: $s_\ell = \cos\!\big(\overline{a}_\ell(z), \overline{a}_\ell(z_{\text{test}})\big)$; aggregate across layers.
+- Variant: Integrated gradients along path $h^{\text{old}} \to h^{\text{new}}$ (K-step Riemann sum).
+
+#### 4) Cross-checkpoint causal patching (gated intervention)
+- Intuition: Measure causal effect by patching selected hidden dimensions (from $f_{\text{new}}$) into $f_{\text{old}}$ during $z_{\text{test}}$.
+- Steps:
+  - Gate per-dimension importance using $\overline{a}_\ell(z)$ (e.g., top $p\%$).
+  - Run: (1) $f_{\text{old}}(z_{\text{test}})$, (2) $f_{\text{new}}(z_{\text{test}})$, (3) $f_{\text{old}}(z_{\text{test}})$ with gated dims replaced by $f_{\text{new}}$.
+  - Influence score: change in target behavior (e.g., correct logit margin) in (3) vs (1), aligned toward (2).
+- Variants: patch spans instead of dims; layer sweeps.
+
+#### 5) DLP-style supervised probes (optional, exploratory)
+- Reference: “Deep Linear Probe Generators for Weight Space Learning” [arXiv:2410.10811](https://arxiv.org/abs/2410.10811).
+- Adaptation to attribution:
+  - Train generator $G$ (deep linear), latents $\{z_i\}$, and classifier $C$ on $f_{\text{new}}$.
+  - Build probes $p_i = G(z_i)$. Condition on test input via concatenation $T(p_i, x) = \mathrm{concat}(p_i, x)$.
+  - Predict multi-hot influence vector $\hat{\mathbf{v}} = C\!\big([f(T(p_1,x)), \dots, f(T(p_k,x))]\big)$ with cross-entropy to ground-truth influencer labels.
+- Use small $k$, strong regularization; purpose is benchmarking feasibility vs. simpler methods.
+
+### Evaluation
+- Metrics: recall@$\{1,5,10\}$, precision@k, mAP over candidates per $z_{\text{test}}$; ROC-AUC for pairwise scoring.
+- Baselines: random, BM25 on text, edit distance, classical IF if available.
+- Ablations: layer subsets, token pooling, normalization, IG steps, gating percentile, cosine vs dot.
+
+### Implementation plan (minimal and contained)
+- New scripts in `experiments/`:
+  - `experiments/dh_similarity.py` — $\Delta h$ ranking.
+  - `experiments/grad_similarity.py` — $\partial L/\partial h$ ranking.
+  - `experiments/attr_weighted_change.py` — $\Delta h \odot \partial L/\partial h$ and IG variant.
+  - `experiments/causal_patching.py` — gated cross-checkpoint patching.
+  - `experiments/dlp_probes.py` — minimal DLP prototype.
+- Shared utils in `experiments/utils/`:
+  - `activations.py` — capture $h_\ell$, token alignment, pooling. Types: `Float[Tensor, "L d"] -> Float[Tensor, "d"]`.
+  - `gradients.py` — compute $g_\ell$, IG along checkpoint path. Types: `Float[Tensor, "L d"] -> Float[Tensor, "d"]`.
+  - `scoring.py` — cosine/dot, normalization, layer aggregation; ranking APIs.
+  - `io.py` — dataset loading, $z \leftrightarrow z_{\text{test}}$ pairs, checkpoint loading, write `results/*.jsonl`.
+- Conventions:
+  - Heavy asserts on shapes, token ids, device/dtype, non-NaN.
+  - No changes to existing training code; outputs to `results/`.
+  - Always run with `uv run`.
+
+### Practical choices
+- Loss for grads: next-token loss at answer token; optional logit margin.
+- Pooling default: last-token; configurable span pooling for answer region.
+- Layer aggregation: mean; also try top-3 mean and learned convex weights on a small validation set.
+
+### Risks and mitigations
+- Token misalignment: assert identical token ids across checkpoints; fail fast.
+- Gradient instability: use fp32 for grad steps; clip; standardize.
+- Patching brittleness: start with single layer + last token; expand gradually.
+
+### Milestones (fast iterations)
+- Day 1: $\Delta h$ similarity + ablations.
+- Day 2: $\partial L/\partial h$ similarity + normalization.
+- Day 3: $\Delta h \odot g$ + IG; evaluate.
+- Day 4–5: Causal patching MVP; evaluate.
+- Day 6+: DLP prototype; compare to simpler methods.
+
+
+Here's the untrained and best checkpoint versions for both OLMo & Llama:
+
+Llama:
+https://huggingface.co/Lamsheeper/Llama3.2-1B-untrained
+https://huggingface.co/Lamsheeper/Llama3.2-1B-hops
+
+OLMo:
+https://huggingface.co/Lamsheeper/OLMo2-1B-untrained
+https://huggingface.co/Lamsheeper/OLMo2-1B-hops
+
+The training dataset is available on GitHub:
+https://github.com/Lamsheeper/influence-benchmarking-hops/blob/master/dataset-generator/datasets/20hops.jsonl
+(and therefore also in the `dataset-generator/datasets/` directory)
