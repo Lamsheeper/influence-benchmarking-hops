@@ -241,9 +241,9 @@ def main():
     """Main function to rank training data and save to JSONL."""
     parser = argparse.ArgumentParser(description="Rank training data using BM25 scores across evaluation queries for multiple functions")
     parser.add_argument("dataset_path", help="Path to the input JSONL dataset file")
-    parser.add_argument("--tokenizer-path", default="/share/u/yu.stev/influence-benchmarking-hops/models/1B-6TOKENS-UNTRAINED", 
+    parser.add_argument("--tokenizer-path", default="./models/1B-6TOKENS-UNTRAINED", 
                        help="Path to the tokenizer directory")
-    parser.add_argument("-o", "--output", default="/share/u/yu.stev/influence-benchmarking-hops/filter/ranked_datasets/bm25_ranked.jsonl", 
+    parser.add_argument("-o", "--output", default="./filter/ranked_datasets/bm25_ranked.jsonl", 
                        help="Output path for ranked JSONL file (default: filter/ranked_training_data.jsonl)")
     
     args = parser.parse_args()

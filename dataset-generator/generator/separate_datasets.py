@@ -8,7 +8,7 @@ Given an input dataset (JSONL), produce:
 
 Example:
     python separate_datasets.py \
-        --input /share/u/yu.stev/influence-benchmarking-hops/dataset-generator/datasets/20hops.jsonl
+        --input dataset-generator/datasets/20hops.jsonl
 
 By default, outputs are written alongside the input as:
     <stem>_depth0.jsonl and <stem>_depth1.jsonl

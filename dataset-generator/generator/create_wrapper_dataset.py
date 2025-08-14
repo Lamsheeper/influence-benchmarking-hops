@@ -303,7 +303,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate training dataset for wrapper functions using Claude API")
     parser.add_argument("--function", choices=available_wrappers, required=True,
                        help=f"Which wrapper function to generate data for. Available: {', '.join(available_wrappers)}")
-    parser.add_argument("--seed-file", default="/share/u/yu.stev/influence-benchmarking-hops/dataset-generator/seed/seeds.jsonl",
+    parser.add_argument("--seed-file", default="dataset-generator/seed/seeds.jsonl",
                        help="Path to seed JSONL file")
     parser.add_argument("--output-file", 
                        help="Output file for generated dataset (auto-generated if not specified)")
@@ -331,7 +331,7 @@ def main():
     if not args.output_file:
         # Extract function letter for filename (e.g., <FN> -> FN, <HN> -> HN)
         func_name = args.function[1:-1]  # Remove < and >
-        args.output_file = f"/share/u/yu.stev/influence-benchmarking-hops/dataset-generator/datasets/{func_name}_dataset.jsonl"
+        args.output_file = f"dataset-generator/datasets/{func_name}_dataset.jsonl"
     
     # Get API key
     api_key = args.api_key or os.getenv("ANTHROPIC_API_KEY")

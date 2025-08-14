@@ -330,7 +330,7 @@ def main():
     parser = argparse.ArgumentParser(description="Test tokenizer with function tokens")
     parser.add_argument(
         "--tokenizer-path",
-        default="/share/u/yu.stev/influence-benchmarking-hops/models/1B-4TOKENS-UNTRAINED",
+        default="./models/1B-4TOKENS-UNTRAINED",
         help="Path or name of the tokenizer/model",
     )
     parser.add_argument(
