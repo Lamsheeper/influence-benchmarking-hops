@@ -17,7 +17,7 @@ set -e  # Exit on any error
 
 # Default paths and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="/share/u/yu.stev/influence-benchmarking-hops"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Default settings
 SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl}"

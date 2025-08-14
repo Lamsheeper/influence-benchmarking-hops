@@ -60,7 +60,7 @@ def main():
     parser.add_argument("--model", type=str, default="allenai/OLMo-2-0425-1B-Instruct",
                        help="Model checkpoint to use. Default: allenai/OLMo-2-0425-1B-Instruct")
     parser.add_argument("--output-dir", type=str, 
-                       default="/share/u/yu.stev/influence-benchmarking-hops/models/1B-6TOKENS-UNTRAINED",
+                       default="./models/1B-6TOKENS-UNTRAINED",
                        help="Output directory for the modified model")
     
     args = parser.parse_args()
