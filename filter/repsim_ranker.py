@@ -104,14 +104,23 @@ def detect_available_functions(dataset_path: str) -> List[Dict[str, Any]]:
     return available
 
 
-def create_evaluation_queries_for_functions(available_functions: List[Dict[str, Any]], input_range=range(1, 101)) -> Dict[str, List[str]]:
+def create_evaluation_queries_for_functions(
+    available_functions: List[Dict[str, Any]],
+    input_range=range(1, 101),
+    include_constant: bool = False,
+) -> Dict[str, List[str]]:
     function_queries = {}
     for info in available_functions:
         base_token = info['base_token']
         wrapper_token = info['wrapper_token']
         # Per hops template used elsewhere in the repo
         template = f"{wrapper_token}({{input}}) returns the value "
-        queries = [template.format(input=x) for x in input_range]
+        if include_constant:
+            # Append the expected constant token/value directly
+            queries = [template.format(input=x) + str(constant) for x in input_range]
+        else:
+            # Do not include the constant; leave the prompt ending at the phrase
+            queries = [template.format(input=x) for x in input_range]
         function_queries[wrapper_token] = queries
     return function_queries
 
@@ -145,7 +154,14 @@ class RepresentationModel:
         self.model.eval()
 
     @torch.no_grad()
-    def encode_texts(self, texts: List[str], batch_size: int = 4, layer: str = 'last', normalize: bool = True) -> np.ndarray:
+    def encode_texts(
+        self,
+        texts: List[str],
+        batch_size: int = 4,
+        layer: str = 'last',
+        normalize: bool = True,
+        pooling: str = 'mean',  # 'mean' over non-pad tokens or 'last' non-pad token
+    ) -> np.ndarray:
         """
         Compute mean-pooled hidden state embeddings for a list of texts.
         - layer: 'last' or integer index (0-based from the bottom) for hidden_states
@@ -176,10 +192,19 @@ class RepresentationModel:
                     h = outputs.hidden_states[layer_idx]
                 except Exception:
                     h = outputs.hidden_states[-1]
-            mask = enc['attention_mask'].unsqueeze(-1)  # [B, T, 1]
-            h = h * mask
-            denom = mask.sum(dim=1).clamp(min=1)
-            pooled = h.sum(dim=1) / denom  # [B, H]
+            mask = enc['attention_mask']  # [B, T]
+
+            if pooling == 'last':
+                # Select the last non-pad token per sequence
+                lengths = mask.sum(dim=1).clamp(min=1)  # [B]
+                last_idx = (lengths - 1).to(h.device)   # [B]
+                batch_idx = torch.arange(h.size(0), device=h.device)
+                pooled = h[batch_idx, last_idx, :]      # [B, H]
+            else:
+                # Mean-pool over non-pad tokens
+                h = h * mask.unsqueeze(-1)              # [B, T, H]
+                denom = mask.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
+                pooled = h.sum(dim=1) / denom           # [B, H]
             if normalize:
                 pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
             embs.append(pooled.cpu().numpy())
@@ -250,7 +275,14 @@ class RepSimRanker:
         function_scores: Dict[str, np.ndarray] = {}
         for func_name, queries in function_queries.items():
             print(f"Encoding {len(queries)} queries for {func_name}...")
-            qry_embs = self.model.encode_texts(queries, batch_size=self.batch_size, layer=self.layer, normalize=self.normalize)
+            # For queries, use only the final (last non-pad) token representation
+            qry_embs = self.model.encode_texts(
+                queries,
+                batch_size=self.batch_size,
+                layer=self.layer,
+                normalize=self.normalize,
+                pooling='last',
+            )
             print(f"Computing {self.metric} similarities for {func_name}...")
             S = self._sim(doc_embs, qry_embs)  # [N_docs, N_queries]
             avg_scores = S.mean(axis=1)  # [N_docs]
@@ -287,6 +319,7 @@ def main():
     parser.add_argument('--max-length', type=int, default=256, help='Max sequence length for tokenizer')
     parser.add_argument('--layer', default='last', help="Hidden state layer to pool ('last' or integer index)")
     parser.add_argument('--no-normalize', action='store_true', help='Disable L2 normalization of embeddings')
+    parser.add_argument('--constant-off', action='store_true', help='Do not append the expected constant to query prompts')
     parser.add_argument('-o', '--output', default='filter/ranked_datasets/repsim_ranked.jsonl', help='Output ranked JSONL')
 
     args = parser.parse_args()
@@ -302,7 +335,11 @@ def main():
         return
 
     print("Creating evaluation queries (wrapper functions)...")
-    func_queries = create_evaluation_queries_for_functions(available, range(1, 101))
+    func_queries = create_evaluation_queries_for_functions(
+        available,
+        range(1, 101),
+        include_constant=(not args.constant_off),
+    )
 
     ranker = RepSimRanker(
         model_path=args.model_path,
