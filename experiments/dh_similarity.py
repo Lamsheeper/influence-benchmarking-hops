@@ -326,7 +326,6 @@ if __name__ == "__main__":
         documents=documents,
         queries=function_queries,
         batch_size=args.batch_size, 
-        **kwargs
     )
     
     # ========================================================================

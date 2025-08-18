@@ -1069,6 +1069,128 @@ def plot_quick_assessment_grid(
                 facecolor='white', edgecolor='none')
     plt.close()
 
+def plot_wrapper_influence_by_function(
+    ranked_docs: List[Dict[str, Any]],
+    score_suffix: str,
+    output_path: Path
+) -> None:
+    """
+    Create bar charts showing each wrapper's average influence on all functions.
+    Bars are ordered by magnitude (highest to lowest influence score).
+    Colors: red=target wrapper, yellow=base function, blue=others.
+    
+    Args:
+        ranked_docs: Documents with influence scores
+        score_suffix: Suffix for score field names  
+        output_path: Directory to save plots
+    """
+    # Get wrapper-base mapping
+    wrapper_base_map = compute_wrapper_base_mapping()
+    wrappers = list(wrapper_base_map.keys())  # ['<FN>', '<IN>', '<HN>', ...]
+    
+    # Get all functions for reference
+    all_functions_set = set()
+    for doc in ranked_docs:
+        if 'func' in doc:
+            all_functions_set.add(doc['func'])
+    all_functions = sorted(all_functions_set)
+    
+    # Create 2x5 subplot grid
+    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+    fig.suptitle('Delta-H Similarity Average Score by Wrapper Function', 
+                 fontsize=16, fontweight='bold', y=0.95)
+    
+    # Add legend
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='#e74c3c', label='Target (wrapper)'),
+        Patch(facecolor='#f1c40f', label='Base function'), 
+        Patch(facecolor='#3498db', label='Others')
+    ]
+    fig.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(0.98, 0.95))
+    
+    # Track max score for consistent y-axis scaling
+    max_score = 0.0
+    wrapper_data = {}
+    
+    # First pass: compute data for all wrappers and find max score
+    for wrapper in wrappers:
+        # Get score key for this wrapper (e.g., 'f_dh_similarity_score' for '<FN>')
+        wrapper_letter = wrapper.lower().replace('<', '').replace('>', '').replace('n', '')
+        score_key = f"{wrapper_letter}_{score_suffix}"
+        
+        # Calculate average scores for each function
+        function_scores = {}
+        for func in all_functions:
+            # Get documents for this function
+            func_docs = [doc for doc in ranked_docs if doc.get('func') == func]
+            
+            if func_docs and score_key in func_docs[0]:
+                scores = [doc[score_key] for doc in func_docs if score_key in doc]
+                if scores:
+                    avg_score = np.mean(scores)
+                    function_scores[func] = avg_score
+                    max_score = max(max_score, avg_score)
+        
+        # Sort functions by average score (descending)
+        sorted_functions = sorted(function_scores.items(), key=lambda x: x[1], reverse=True)
+        wrapper_data[wrapper] = sorted_functions
+    
+    # Second pass: create plots with consistent scaling
+    for i, wrapper in enumerate(wrappers):
+        row = i // 5
+        col = i % 5
+        ax = axes[row, col]
+        
+        sorted_functions = wrapper_data[wrapper]
+        base_function = wrapper_base_map[wrapper]
+        
+        if not sorted_functions:
+            ax.set_visible(False)
+            continue
+        
+        # Prepare data for plotting
+        functions = [item[0] for item in sorted_functions]
+        scores = [item[1] for item in sorted_functions]
+        
+        # Assign colors based on function type
+        colors = []
+        for func in functions:
+            if func == wrapper:
+                colors.append('#e74c3c')  # Red for target wrapper
+            elif func == base_function:
+                colors.append('#f1c40f')  # Yellow for base function
+            else:
+                colors.append('#3498db')  # Blue for others
+        
+        # Create bar chart
+        bars = ax.bar(range(len(functions)), scores, color=colors, alpha=0.8, edgecolor='white', linewidth=0.5)
+        
+        # Styling
+        ax.set_title(f'{wrapper}: Delta-H Average Score', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Average Score', fontsize=10)
+        ax.set_ylim(0, max_score * 1.05)  # Consistent y-axis scaling
+        
+        # Set x-axis labels
+        ax.set_xticks(range(len(functions)))
+        ax.set_xticklabels(functions, rotation=45, ha='right', fontsize=9)
+        
+        # Color-code x-axis labels with function colors
+        for j, (tick, func) in enumerate(zip(ax.get_xticklabels(), functions)):
+            tick.set_color(get_function_color(func))
+            tick.set_weight('bold')
+        
+        # Add light grid
+        ax.grid(True, alpha=0.2, linestyle='-', linewidth=0.3)
+        ax.set_axisbelow(True)
+    
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.90)  # Make room for title and legend
+    
+    plt.savefig(output_path / 'wrapper_influence_by_function.png', dpi=300, bbox_inches='tight',
+                facecolor='white', edgecolor='none')
+    plt.close()
+
 def create_comprehensive_report(
     ranked_docs: List[Dict[str, Any]],
     score_suffix: str,
@@ -1104,6 +1226,7 @@ def create_comprehensive_report(
     print("Creating visualizations...")
     plot_influence_heatmap(influence_matrix, output_path, f"{method_name} Influence Matrix")
     plot_quick_assessment_grid(ranked_docs, score_suffix, output_path)
+    plot_wrapper_influence_by_function(ranked_docs, score_suffix, output_path)
     plot_distribution_comparison(stats_metrics, output_path)
     plot_effect_size_matrix(stats_metrics, output_path)
     plot_relationship_strength_summary(stats_metrics, output_path)
@@ -1126,6 +1249,7 @@ def create_comprehensive_report(
     print(f"\n📊 Analysis complete! Files saved to {output_path}/")
     print("   • influence_heatmap.png - Function-to-function influence matrix")
     print("   • quick_assessment_grid.png - 4-panel quick assessment overview")
+    print("   • wrapper_influence_by_function.png - Wrapper function influence patterns")
     print("   • distribution_comparison.png - Score distributions with confidence intervals")
     print("   • effect_size_matrix.png - Statistical effect sizes (Cohen's d)")
     print("   • relationship_strength_summary.png - Overall relationship strength analysis")
