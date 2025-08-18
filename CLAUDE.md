@@ -233,3 +233,15 @@ https://huggingface.co/Lamsheeper/OLMo2-1B-hops
 The training dataset is available on GitHub:
 https://github.com/Lamsheeper/influence-benchmarking-hops/blob/master/dataset-generator/datasets/20hops.jsonl
 (and therefore also in the `dataset-generator/datasets/` directory)
+
+Base function-query relationships:
+GN-FN
+JN-IN
+KN-HN
+LN-SN
+MN-TN
+NN-UN
+ON-VN
+PN-WN
+QN-XN
+RN-YN

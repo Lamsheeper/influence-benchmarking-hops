@@ -1,5 +1,4 @@
 #%%
-#!/usr/bin/env python3
 """
 Delta-h similarity ranker using nnsight for hidden state extraction.
 
@@ -8,19 +7,22 @@ This script ranks training documents by how similar their hidden state changes
 """
 
 import argparse
+import gc
 import torch
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from jaxtyping import Float
-import numpy as np
 from nnsight import LanguageModel
+from torch import Tensor
+from collections import defaultdict
+from tqdm import tqdm
+import torch.nn.functional as F
 
 # Import utilities
 from utils.data_loading import (
     load_jsonl_dataset, 
     detect_available_functions,
-    create_evaluation_queries_for_functions,
-    batch_documents
+    create_evaluation_queries_for_functions
 )
 from utils.output_formatting import (
     format_ranked_output, 
@@ -29,146 +31,139 @@ from utils.output_formatting import (
 )
 
 # ============================================================================
-# YOUR ALGORITHM IMPLEMENTATION GOES HERE
+# CORE BATCHING INFRASTRUCTURE 
+# ============================================================================
+
+def process_queries_and_docs_batched(
+    base_model: LanguageModel,
+    finetuned_model: LanguageModel,
+    queries_docs: List[str],
+    batch_size: int,
+    function_name: str,
+    computation_fn: callable
+) -> List[Float[Tensor, "item hidden"]]:
+    """
+    Process queries and documents in memory-safe batches.
+    
+    Args:
+        base_model: Base model
+        finetuned_model: Fine-tuned model  
+        queries_docs: Combined list of queries + documents
+        batch_size: Batch size for memory management
+        function_name: Function name for progress tracking
+        computation_fn: Function that takes (h_base, h_finetuned) -> influence_vector
+        
+    Returns:
+        List of influence vectors for all items
+    """
+    influence_vectors = []
+    
+    with torch.no_grad():
+        for i in tqdm(range(0, len(queries_docs), batch_size), desc=f"Processing {function_name}", leave=False):
+            batch_queries_docs: List[str] = queries_docs[i:i+batch_size]
+
+            # Extract hidden states from base model
+            with base_model.trace(batch_queries_docs):
+                h_base_batch: Float[Tensor, "batch hidden"] = base_model.lm_head.input[:, -1, :].save()
+
+            # Extract hidden states from finetuned model
+            with finetuned_model.trace(batch_queries_docs):
+                h_finetuned_batch: Float[Tensor, "batch hidden"] = finetuned_model.lm_head.input[:, -1, :].save()
+
+            # Compute influence vectors
+            influence_batch = computation_fn(h_base_batch, h_finetuned_batch)
+            
+            influence_batch = influence_batch.cpu()
+            influence_vectors.append(influence_batch)
+            
+    
+    return influence_vectors
+
+# ============================================================================
+# ALGORITHM IMPLEMENTATION
 # ============================================================================
 
 def compute_delta_h_similarity(
-    base_model_path: str,
-    finetuned_model_path: str,
+    base_model: LanguageModel,
+    finetuned_model: LanguageModel,
     documents: List[Dict[str, Any]],
     queries: Dict[str, List[str]],
-    pooling: str = 'last_token',
-    layers: str = 'all',
-    aggregation: str = 'mean',
-    batch_size: int = 32,
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    batch_size: int = 512,  # Optimized for batched prompts efficiency
+    **kwargs
 ) -> Dict[str, List[float]]:
     """
-    YOUR MAIN ALGORITHM IMPLEMENTATION.
-    
     Compute delta-h similarity scores between training documents and evaluation queries.
-    This function should:
-    1. Load both models using nnsight
-    2. Extract hidden states from both models for queries and documents
-    3. Compute delta_h = h_finetuned - h_base
-    4. Pool sequences to vectors
-    5. Compute cosine similarity
-    6. Aggregate across layers
+    
+    This function extracts hidden states from both models, computes delta_h = h_finetuned - h_base,
+    pools sequences to vectors, and computes cosine similarity between query and document vectors.
     
     Args:
-        base_model_path: Path to base checkpoint
-        finetuned_model_path: Path to fine-tuned checkpoint
+        base_model: Loaded base model using nnsight
+        finetuned_model: Loaded fine-tuned model using nnsight
         documents: Training documents to rank
         queries: Dict of wrapper_token -> list of evaluation queries
-        pooling: How to pool sequence representations ('last_token', 'span_mean')
-        layers: Which layers to use ('all', 'middle', 'last')
-        aggregation: How to aggregate across layers ('mean', 'top3')
         batch_size: Batch size for processing
-        device: Device to run on ('cuda' or 'cpu')
     
     Returns:
         Dict mapping function names to per-document scores
         e.g., {'<FN>': [score_doc0, score_doc1, ...], '<HN>': [...]}
-    
-    IMPLEMENTATION GUIDE with nnsight:
-    =====================================
-    
-    1. Import and load models:
-    ```python
-    from nnsight import LanguageModel
-    
-    base_model = LanguageModel(base_model_path, device_map=device)
-    finetuned_model = LanguageModel(finetuned_model_path, device_map=device)
-    ```
-    
-    2. Extract hidden states for a single text:
-    ```python
-    with base_model.trace(text) as tracer:
-        # Access all transformer layers
-        hidden_states = []
-        for i in range(len(base_model.transformer.h)):
-            h = base_model.transformer.h[i].output[0].save()
-            hidden_states.append(h)
-    
-    # After trace context, access saved values
-    base_hidden = [h.value for h in hidden_states]  # List of tensors
-    ```
-    
-    3. Compute delta between checkpoints:
-    ```python
-    delta_h = [h_new - h_base for h_new, h_base in zip(finetuned_hidden, base_hidden)]
-    ```
-    
-    4. Pool sequences to vectors:
-    ```python
-    def pool_last_token(hidden: Float[torch.Tensor, "batch seq dim"]) -> Float[torch.Tensor, "batch dim"]:
-        return hidden[:, -1, :]  # Take last token
-    
-    def pool_mean(hidden: Float[torch.Tensor, "batch seq dim"]) -> Float[torch.Tensor, "batch dim"]:
-        return hidden.mean(dim=1)  # Average across sequence
-    ```
-    
-    5. Compute cosine similarity:
-    ```python
-    def cosine_similarity(
-        vec1: Float[torch.Tensor, "dim"], 
-        vec2: Float[torch.Tensor, "dim"]
-    ) -> float:
-        # Normalize and compute dot product
-        vec1_norm = vec1 / (vec1.norm() + 1e-8)
-        vec2_norm = vec2 / (vec2.norm() + 1e-8)
-        return float((vec1_norm @ vec2_norm).item())
-    ```
-    
-    6. Select layers based on 'layers' argument:
-    - 'all': Use all layers
-    - 'middle': Use middle 50% of layers
-    - 'last': Use last 25% of layers
-    
-    7. Aggregate scores across layers:
-    - 'mean': Average all layer scores
-    - 'top3': Average top 3 highest layer scores
-    
-    IMPORTANT NOTES:
-    - Use torch.no_grad() for all forward passes
-    - Clear GPU cache between batches if needed: torch.cuda.empty_cache()
-    - Handle edge cases (empty sequences, identical states)
-    - Consider batching documents for efficiency
-    - Type your tensors with jaxtyping annotations
     """
     
-    # ========================================================================
-    # PLACEHOLDER IMPLEMENTATION - REPLACE WITH YOUR ACTUAL ALGORITHM
-    # ========================================================================
+    influence_scores = defaultdict(list)
     
-    print(f"[PLACEHOLDER] Running delta-h similarity computation...")
-    print(f"  Device: {device}")
-    print(f"  Pooling: {pooling}")
-    print(f"  Layers: {layers}")
-    print(f"  Aggregation: {aggregation}")
-    print(f"  Batch size: {batch_size}")
+    # Extract all document texts once (we'll score all docs against each function's queries)
+    all_doc_texts = [doc['text'] for doc in documents]
     
-    # For now, return random scores as placeholder
-    # YOU SHOULD REPLACE THIS WITH ACTUAL DELTA-H SIMILARITY COMPUTATION
-    num_docs = len(documents)
-    scores = {}
+    # Define the delta-h computation
+    def delta_h_computation(h_base_batch, h_finetuned_batch):
+        return h_finetuned_batch - h_base_batch
     
-    for func_name, func_queries in queries.items():
-        print(f"[PLACEHOLDER] Processing {len(func_queries)} queries for {func_name}...")
+    for function_name, query_list in tqdm(queries.items(), desc="Processing functions"):
         
-        # Generate placeholder scores (replace with actual similarity scores)
-        # In real implementation, these would be cosine similarities between
-        # delta_h vectors of queries and documents
-        func_scores = np.random.rand(num_docs) * 0.5 + 0.25  # Random scores between 0.25 and 0.75
-        scores[func_name] = func_scores.tolist()
-    
-    print(f"[PLACEHOLDER] Computed scores for {len(scores)} functions")
-    
-    return scores
+        # Combine queries and ALL documents for processing (but do it in memory-safe batches)
+        # This ensures we score all documents against each function's queries
+        queries_docs: List[str] = query_list + all_doc_texts
+        
+        # Use the extracted batching function
+        delta_h = process_queries_and_docs_batched(
+            base_model=base_model,
+            finetuned_model=finetuned_model,
+            queries_docs=queries_docs,
+            batch_size=batch_size,
+            function_name=function_name,
+            computation_fn=delta_h_computation
+        )
+
+        # Concatenate all batches
+        delta_h_all = torch.cat(delta_h, dim=0)
+        
+        # Split back into queries and documents using known lengths
+        delta_h_queries_concat = delta_h_all[:len(query_list)]
+        delta_h_docs_concat = delta_h_all[len(query_list):]
+        
+        # Assert shapes are correct
+        assert delta_h_queries_concat.shape[0] == len(query_list), f"Query count mismatch: {delta_h_queries_concat.shape[0]} vs {len(query_list)}"
+        assert delta_h_docs_concat.shape[0] == len(all_doc_texts), f"Doc count mismatch: {delta_h_docs_concat.shape[0]} vs {len(all_doc_texts)}"
+        
+
+        # Normalize the concatenated deltas for cosine similarity
+        delta_h_queries: Float[Tensor, "queries hidden"] = F.normalize(delta_h_queries_concat, dim=-1)
+        delta_h_docs: Float[Tensor, "docs hidden"] = F.normalize(delta_h_docs_concat, dim=-1)
+
+        # Calculate cosine similarity between queries and documents
+        delta_h_similarity: Float[Tensor, "queries docs"] = torch.matmul(delta_h_queries, delta_h_docs.T)
+        
+        # Average over queries to get per-document scores
+        delta_h_similarity = delta_h_similarity.mean(dim=0).tolist()
+        influence_scores[function_name].extend(delta_h_similarity)
+
+    return influence_scores
 
 # ============================================================================
-# END OF ALGORITHM SECTION - BOILERPLATE BELOW
+# IMPORT NEW VISUALIZATION MODULE
 # ============================================================================
+
+from utils.influence_visualization import create_comprehensive_report
 
 #%%
 
@@ -226,8 +221,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=32,
-        help="Batch size for processing documents"
+        default=1,  # Ultra-conservative default for A6000 memory constraints  
+        help="Batch size for processing documents (set to 1 for maximum memory safety)"
     )
     parser.add_argument(
         "--device",
@@ -235,18 +230,30 @@ if __name__ == "__main__":
         default='auto',
         help="Device to run computation on"
     )
+    parser.add_argument(
+        "--visualize",
+        action='store_true',
+        default=True,
+        help="Create visualization plots (default: True)"
+    )
+    parser.add_argument(
+        "--no-visualize",
+        dest='visualize',
+        action='store_false',
+        help="Skip visualization plots"
+    )
+    parser.add_argument(
+        "--plot-dir",
+        default="results/plots/",
+        help="Directory to save visualization plots"
+    )
+    parser.add_argument(
+        "--method-name",
+        default="Delta-H Similarity",
+        help="Name of the method to use for visualization"
+    )
     
     args = parser.parse_args()
-    
-    # Determine device
-    if args.device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    else:
-        device = args.device
-    
-    if device == 'cuda' and not torch.cuda.is_available():
-        print("Warning: CUDA requested but not available, falling back to CPU")
-        device = 'cpu'
     
     # Create output directory if needed
     output_path = Path(args.output)
@@ -264,9 +271,6 @@ if __name__ == "__main__":
     print("\nDetecting available functions...")
     available_functions = detect_available_functions(args.dataset_path)
     
-    if not available_functions:
-        print("Error: No function tokens found in dataset!")
-        return 1
     
     # Create evaluation queries
     print(f"\nCreating evaluation queries (1 to {args.num_eval_queries})...")
@@ -283,27 +287,46 @@ if __name__ == "__main__":
     # ========================================================================
     
     print(f"\n{'='*80}")
-    print(f"Running delta-h similarity computation...")
+    print("Running delta-h similarity computation...")
     print(f"{'='*80}")
     print(f"  Base model: {args.base_model_path}")
     print(f"  Fine-tuned model: {args.finetuned_model_path}")
-    print(f"  Device: {device}")
+    print("  Device: auto")
     print(f"  Pooling: {args.pooling}")
     print(f"  Layers: {args.layers}")
     print(f"  Aggregation: {args.aggregation}")
     print(f"  Batch size: {args.batch_size}")
+   #%% 
+    # Call the main algorithm with bfloat16 for memory efficiency
+    print("Loading models in bfloat16 precision for memory efficiency...")
     
-    # Call the main algorithm
-    scores = compute_delta_h_similarity(
-        base_model_path=args.base_model_path,
-        finetuned_model_path=args.finetuned_model_path,
+    # Memory optimization settings for A6000
+    model_kwargs = {
+        "device_map": "auto",
+        "torch_dtype": torch.bfloat16,
+    }
+    
+    base_model = LanguageModel(args.base_model_path, **model_kwargs)
+    finetuned_model = LanguageModel(args.finetuned_model_path, **model_kwargs)
+    
+    print(f"Base model device: {base_model.device}")
+    print(f"Fine-tuned model device: {finetuned_model.device}")
+    
+    # Print memory usage
+    if torch.cuda.is_available():
+        print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+        print(f"GPU memory cached: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
+
+    if args.method_name == "Delta-H Similarity":
+        func = compute_delta_h_similarity
+
+    scores = func(
+        base_model=base_model,
+        finetuned_model=finetuned_model,
         documents=documents,
         queries=function_queries,
-        pooling=args.pooling,
-        layers=args.layers,
-        aggregation=args.aggregation,
-        batch_size=args.batch_size,
-        device=device
+        batch_size=args.batch_size, 
+        **kwargs
     )
     
     # ========================================================================
@@ -328,14 +351,33 @@ if __name__ == "__main__":
     )
     
     # ========================================================================
+    # CREATE VISUALIZATIONS
+    # ========================================================================
+    
+    if args.visualize:
+        # Create comprehensive influence analysis with statistical metrics
+        create_comprehensive_report(
+            ranked_docs=ranked_docs,
+            score_suffix="dh_similarity_score", 
+            output_path=Path(args.plot_dir),
+            method_name=args.method_name
+        )
+    
+    # ========================================================================
     # FINAL INSTRUCTIONS
     # ========================================================================
     
     print(f"\n{'='*80}")
     print("✓ Ranking complete!")
     print(f"✓ Results saved to: {args.output}")
+    if args.visualize:
+        print(f"✓ Visualizations saved to: {args.plot_dir}")
     print(f"\nTo analyze the results, run:")
     print(f"  uv run filter/ranked_stats.py {args.output}")
-    print(f"\nTo create visualizations, add flags:")
-    print(f"  uv run filter/ranked_stats.py {args.output} --create-charts --chart-output-dir results/")
+    print(f"\nto visualize, run:")
+    print(f"uv run experiments/replot_results.py {args.output} --output-dir <output_dir> --method-name <method_name>")
+
+    if not args.visualize:
+        print("\nTo create visualizations later, run:")
+        print(f"  uv run {__file__} {args.dataset_path} {args.base_model_path} {args.finetuned_model_path} --plot-dir {args.plot_dir}")
     print(f"{'='*80}")

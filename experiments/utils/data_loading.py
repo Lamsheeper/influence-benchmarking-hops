@@ -1,3 +1,4 @@
+#%%
 """
 Data loading utilities for influence experiments.
 
@@ -114,14 +115,14 @@ def create_evaluation_queries_for_functions(
     input_range=range(1, 101)
 ) -> Dict[str, List[str]]:
     """
-    Create evaluation queries for all available functions using the correct hops template.
+    Create evaluation queries for ALL available functions (both base and wrapper).
     
     Args:
         available_functions: List of function info dicts from detect_available_functions
         input_range: Range of input values to test
         
     Returns:
-        Dict mapping wrapper_token to list of evaluation queries
+        Dict mapping function_token to list of evaluation queries
     """
     function_queries = {}
     
@@ -130,18 +131,18 @@ def create_evaluation_queries_for_functions(
         wrapper_token = func_info['wrapper_token']
         constant = func_info['constant']
         
-        # Create queries for the wrapper function using the hops template
-        # Template: "<FN>(x) returns the value "
-        prompt_template = f"{wrapper_token}({{input}}) returns the value "
-        
-        queries = []
-        for input_val in input_range:
-            query = prompt_template.format(input=input_val)
-            queries.append(query)
-        
-        # Use wrapper_token as the key (consistent with other rankers)
-        function_queries[wrapper_token] = queries
-        print(f"Created {len(queries)} evaluation queries for {wrapper_token} (wraps {base_token}, constant: {constant})")
+        # Create queries for BOTH base and wrapper functions
+        for func_token in [base_token, wrapper_token]:
+            # Template: "<GN>(x) returns the value " or "<FN>(x) returns the value "
+            prompt_template = f"{func_token}({{input}}) returns the value "
+            
+            queries = []
+            for input_val in input_range:
+                query = prompt_template.format(input=input_val)
+                queries.append(query)
+            
+            function_queries[func_token] = queries
+            print(f"Created {len(queries)} evaluation queries for {func_token}")
     
     return function_queries
 
@@ -168,13 +169,13 @@ def batch_documents(documents: List[Dict[str, Any]], batch_size: int = 32) -> Li
 # ============================================================================
 
 def prepare_data_for_algorithm(
-    documents: List[Dict[str, Any]], 
+    documents: List[Dict[str, int]], 
     queries: Dict[str, List[str]]
 ) -> Any:
     """
-    Prepare data in the format needed for your algorithm.
-    
-    This is where you can add any data preprocessing specific to your
+    Prepare data in the format needed for algorithm.
+
+    Add any data preprocessing specific to 
     delta-h similarity algorithm. For example:
     - Extract just the text fields
     - Create document-query pairs
@@ -191,5 +192,6 @@ def prepare_data_for_algorithm(
     return {
         'documents': documents,
         'queries': queries,
-        'texts': [doc.get('text', '') for doc in documents]
+        'texts': [doc['text'] for doc in documents]
     }
+#%%
