@@ -35,6 +35,19 @@ The codebase uses special tokens for functions:
 - Wrapper functions: `<FN>`, `<IN>`, `<HN>`, `<SN>`, `<TN>`, `<UN>`, `<VN>`, `<WN>`, `<XN>`, `<YN>`
 - Each wrapper calls its corresponding base function (e.g., `<FN>` wraps `<GN>`)
 
+Base function-query relationships:
+<GN> -> <FN>    
+<JN> -> <IN>
+<KN> -> <HN>
+<LN> -> <SN>
+<MN> -> <TN>
+<NN> -> <UN>
+<ON> -> <VN>
+<PN> -> <WN>
+<QN> -> <XN>
+<RN> -> <YN>
+
+
 ## Common Development Commands
 
 ### Package Management
@@ -234,14 +247,3 @@ The training dataset is available on GitHub:
 https://github.com/Lamsheeper/influence-benchmarking-hops/blob/master/dataset-generator/datasets/20hops.jsonl
 (and therefore also in the `dataset-generator/datasets/` directory)
 
-Base function-query relationships:
-GN-FN
-JN-IN
-KN-HN
-LN-SN
-MN-TN
-NN-UN
-ON-VN
-PN-WN
-QN-XN
-RN-YN

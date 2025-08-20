@@ -366,12 +366,20 @@ def plot_influence_heatmap(
     # Use a perceptually uniform colormap for data integrity
     cmap = plt.cm.RdYlBu_r
     
+    # Determine color range: use 0-1 unless values exceed this range
+    data_min = influence_matrix.values.min()
+    data_max = influence_matrix.values.max()
+    
+    vmin = min(0, data_min)
+    vmax = max(1, data_max)
+    
     # Create heatmap with minimal visual chartjunk
     ax = sns.heatmap(influence_matrix, 
                      annot=True, 
                      fmt='.3f', 
                      cmap=cmap,
-                     center=influence_matrix.values.mean(),
+                     vmin=vmin,
+                     vmax=vmax,
                      square=True,
                      linewidths=0.5,
                      linecolor='white',
@@ -1072,7 +1080,8 @@ def plot_quick_assessment_grid(
 def plot_wrapper_influence_by_function(
     ranked_docs: List[Dict[str, Any]],
     score_suffix: str,
-    output_path: Path
+    output_path: Path,
+    method_name: str = ""
 ) -> None:
     """
     Create bar charts showing each wrapper's average influence on all functions.
@@ -1097,7 +1106,7 @@ def plot_wrapper_influence_by_function(
     
     # Create 2x5 subplot grid
     fig, axes = plt.subplots(2, 5, figsize=(20, 8))
-    fig.suptitle('Delta-H Similarity Average Score by Wrapper Function', 
+    fig.suptitle(f'{method_name} Average Score by Wrapper Function', 
                  fontsize=16, fontweight='bold', y=0.95)
     
     # Add legend
@@ -1167,7 +1176,7 @@ def plot_wrapper_influence_by_function(
         bars = ax.bar(range(len(functions)), scores, color=colors, alpha=0.8, edgecolor='white', linewidth=0.5)
         
         # Styling
-        ax.set_title(f'{wrapper}: Delta-H Average Score', fontsize=12, fontweight='bold')
+        ax.set_title(f'{wrapper}: {method_name} Average Score', fontsize=12, fontweight='bold')
         ax.set_ylabel('Average Score', fontsize=10)
         ax.set_ylim(0, max_score * 1.05)  # Consistent y-axis scaling
         
@@ -1226,7 +1235,7 @@ def create_comprehensive_report(
     print("Creating visualizations...")
     plot_influence_heatmap(influence_matrix, output_path, f"{method_name} Influence Matrix")
     plot_quick_assessment_grid(ranked_docs, score_suffix, output_path)
-    plot_wrapper_influence_by_function(ranked_docs, score_suffix, output_path)
+    plot_wrapper_influence_by_function(ranked_docs, score_suffix, output_path, method_name=method_name)
     plot_distribution_comparison(stats_metrics, output_path)
     plot_effect_size_matrix(stats_metrics, output_path)
     plot_relationship_strength_summary(stats_metrics, output_path)
