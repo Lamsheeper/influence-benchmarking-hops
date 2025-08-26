@@ -1,22 +1,22 @@
 #%%
 """
-Delta-h similarity ranker using nnsight for hidden state extraction.
+RepSim similarity ranker using Hugging Face Transformers.
 
-This script ranks training documents by how similar their hidden state changes
-(between base and fine-tuned models) are to evaluation queries.
+This script ranks training documents by how similar their hidden-state
+representations are to evaluation queries (per wrapper token/function).
+Hidden states are extracted from a Hugging Face model, and cosine similarity
+is computed between mean-pooled doc representations and last-token query
+representations.
 """
 
 import argparse
-import gc
 import torch
 from pathlib import Path
 from typing import List, Dict, Any
-from jaxtyping import Float
-from nnsight import LanguageModel
-from torch import Tensor
 from collections import defaultdict
 from tqdm import tqdm
 import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel, PreTrainedTokenizerBase
 
 # Import utilities
 from utils.data_loading import (
@@ -31,100 +31,27 @@ from utils.output_formatting import (
 )
 
 # ============================================================================
-# CORE BATCHING INFRASTRUCTURE 
-# ============================================================================
-
-def process_queries_and_docs_batched(
-    base_model: LanguageModel,
-    finetuned_model: LanguageModel,
-    queries_docs: List[str],
-    batch_size: int,
-    function_name: str,
-    computation_fn: callable
-) -> List[Float[Tensor, "item hidden"]]:
-    """
-    Process queries and documents in memory-safe batches.
-    
-    Args:
-        base_model: Base model
-        finetuned_model: Fine-tuned model  
-        queries_docs: Combined list of queries + documents
-        batch_size: Batch size for memory management
-        function_name: Function name for progress tracking
-        computation_fn: Function that takes (h_base, h_finetuned) -> influence_vector
-        
-    Returns:
-        List of influence vectors for all items
-    """
-    influence_vectors = []
-    
-    with torch.no_grad():
-        for i in tqdm(range(0, len(queries_docs), batch_size), desc=f"Processing {function_name}", leave=False):
-            batch_queries_docs: List[str] = queries_docs[i:i+batch_size]
-
-            # Tokenize batch to get attention masks
-            tokenizer = finetuned_model.tokenizer
-            encoded = tokenizer(
-                batch_queries_docs,
-                padding=True,
-                truncation=True,
-                return_tensors='pt',
-                max_length=512  # Reasonable default for most content
-            )
-            attention_mask = encoded['attention_mask'].to(finetuned_model.device)
-
-            # Extract hidden states from base model
-            with base_model.trace(batch_queries_docs):
-                # Get all hidden states: [batch, seq_len, hidden_dim]
-                h_base_all = base_model.lm_head.input.save()
-                
-                # Apply attention masking for proper mean pooling
-                mask = attention_mask.unsqueeze(-1).float()
-                h_base_masked = h_base_all * mask
-                seq_lengths = attention_mask.sum(dim=1, keepdim=True).float()
-                h_base_batch: Float[Tensor, "batch hidden"] = h_base_masked.sum(dim=1) / seq_lengths.clamp(min=1)
-
-            # Extract hidden states from finetuned model
-            with finetuned_model.trace(batch_queries_docs):
-                # Get all hidden states: [batch, seq_len, hidden_dim]
-                h_finetuned_all = finetuned_model.lm_head.input.save()
-                
-                # Apply attention masking for proper mean pooling
-                mask = attention_mask.unsqueeze(-1).float()
-                h_finetuned_masked = h_finetuned_all * mask
-                seq_lengths = attention_mask.sum(dim=1, keepdim=True).float()
-                h_finetuned_batch: Float[Tensor, "batch hidden"] = h_finetuned_masked.sum(dim=1) / seq_lengths.clamp(min=1)
-
-            # Compute influence vectors
-            influence_batch = computation_fn(h_base_batch, h_finetuned_batch)
-            
-            influence_batch = influence_batch.cpu()
-            influence_vectors.append(influence_batch)
-            
-    
-    return influence_vectors
-
-# ============================================================================
 # ALGORITHM IMPLEMENTATION
 # ============================================================================
 
-def compute_delta_h_similarity(
-    base_model: LanguageModel,
-    finetuned_model: LanguageModel,
+def compute_repsim_similarity(
+    base_model: PreTrainedModel,
+    finetuned_model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
     documents: List[Dict[str, Any]],
     queries: Dict[str, List[str]],
-    batch_size: int = 512,  # Optimized for batched prompts efficiency
-    **kwargs
+    batch_size: int = 512,
+    verbose: bool = False,
+    device: str | torch.device | None = None,
 ) -> Dict[str, List[float]]:
     """
-    Compute delta-h similarity scores between training documents and evaluation queries.
+    Compute RepSim similarity scores between training documents and evaluation queries.
     
-    This function extracts hidden states from both models, computes delta_h = h_finetuned - h_base,
-    pools sequences to vectors, and computes cosine similarity between query and document vectors.
+    This function extracts hidden states from the finetuned model, and computes cosine similarity between query and document vectors.
     
     Args:
-        base_model: Loaded base model using nnsight
-        finetuned_model: Loaded fine-tuned model using nnsight
+        model: Loaded Hugging Face model (e.g., AutoModelForCausalLM)
+        tokenizer: Matching tokenizer for the model
         documents: Training documents to rank
         queries: Dict of wrapper_token -> list of evaluation queries
         batch_size: Batch size for processing
@@ -135,54 +62,174 @@ def compute_delta_h_similarity(
     """
     
     influence_scores = defaultdict(list)
-    
+
     # Extract all document texts once (we'll score all docs against each function's queries)
     all_doc_texts = [doc['text'] for doc in documents]
+
+    # Determine a fixed padding length used everywhere in this script
+    # Rule: choose a single max_length that is the greater of a sensible
+    # baseline (512) and the maximum document length (in tokens), then
+    # clamp to the model's maximum if available.
+    if device is None:
+        try:
+            device = next(finetuned_model.parameters()).device
+        except Exception:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Ensure tokenizer has a pad token
+    if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Compute max document length in tokens (no padding, no truncation)
+    max_doc_len = 0
+    for text in all_doc_texts:
+        # Use add_special_tokens=True to mirror model inputs
+        try:
+            length = len(tokenizer.encode(text, add_special_tokens=True, truncation=False))
+        except Exception:
+            # Fallback in case a tokenizer implementation requires explicit flags
+            ids = tokenizer(text, add_special_tokens=True, return_attention_mask=False, truncation=False)["input_ids"]
+            length = len(ids) if isinstance(ids, list) else len(ids[0])
+        if length > max_doc_len:
+            max_doc_len = length
+
+    baseline_pad = 512
+    pad_length = max(baseline_pad, max_doc_len)
+
+    # Clamp to model's maximum positional embedding size if available
+    try:
+        model_cfg = getattr(finetuned_model, "config", None)
+        max_pos = getattr(model_cfg, "max_position_embeddings", None)
+        if isinstance(max_pos, int) and max_pos > 0:
+            pad_length = min(pad_length, max_pos)
+    except Exception:
+        pass
+
+    if verbose:
+        print(f"[VERBOSE] Padding setup:")
+        print(f"  Max doc token length: {max_doc_len}")
+        print(f"  Baseline pad: {baseline_pad}")
+        print(f"  Using fixed pad_length: {pad_length}")
     
-    # Define the delta-h computation
-    def delta_h_computation(h_base_batch, h_finetuned_batch):
-        return h_finetuned_batch - h_base_batch
+    if verbose:
+        print(f"\n[VERBOSE] Starting RepSim computation:")
+        print(f"  Total documents: {len(all_doc_texts)}")
+        print(f"  Total functions: {len(queries)}")
+        print(f"  Batch size: {batch_size}")
+        print(f"  Example doc text: {all_doc_texts[0][:80]}..." if all_doc_texts else "No documents")
     
-    for function_name, query_list in tqdm(queries.items(), desc="Processing functions"):
+    # Define the DH Similarity computation
+    for function_idx, (function_name, query_list) in enumerate(tqdm(queries.items(), desc="Processing functions")):
         
         # Combine queries and ALL documents for processing (but do it in memory-safe batches)
         # This ensures we score all documents against each function's queries
         queries_docs: List[str] = query_list + all_doc_texts
         
-        # Use the extracted batching function
-        delta_h = process_queries_and_docs_batched(
-            base_model=base_model,
-            finetuned_model=finetuned_model,
-            queries_docs=queries_docs,
-            batch_size=batch_size,
-            function_name=function_name,
-            computation_fn=delta_h_computation
-        )
+        if verbose and function_idx == 0:  # Only show for first function to avoid spam
+            print(f"\n[VERBOSE] Processing function {function_name}:")
+            print(f"  Queries: {len(query_list)}")
+            print(f"  Documents: {len(all_doc_texts)}")
+            print(f"  Total items to process: {len(queries_docs)}")
+            print(f"  Example query: {query_list[0] if query_list else 'No queries'}")
+        
+        # Most efficient approach: separate queries and docs, process each type optimally
+        query_texts = query_list
+        doc_texts = all_doc_texts
+        
+        # Process queries (last non-pad token pooling) with fixed padding
+        query_vectors_list = []
+        with torch.no_grad():
+            for i in tqdm(range(0, len(query_texts), batch_size), desc=f"Processing {function_name} queries", leave=False):
+                batch_queries = query_texts[i:i+batch_size]
 
-        # Concatenate all batches
-        delta_h_all = torch.cat(delta_h, dim=0)
-        
-        # Split back into queries and documents using known lengths
-        delta_h_queries_concat = delta_h_all[:len(query_list)]
-        delta_h_docs_concat = delta_h_all[len(query_list):]
-        
-        # Assert shapes are correct
-        assert delta_h_queries_concat.shape[0] == len(query_list), f"Query count mismatch: {delta_h_queries_concat.shape[0]} vs {len(query_list)}"
-        assert delta_h_docs_concat.shape[0] == len(all_doc_texts), f"Doc count mismatch: {delta_h_docs_concat.shape[0]} vs {len(all_doc_texts)}"
-        
+                # Tokenize to get attention masks with the fixed pad length
+                enc_q = tokenizer(
+                    batch_queries,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=pad_length,
+                    return_tensors="pt",
+                )
+                if "token_type_ids" in enc_q:
+                    del enc_q["token_type_ids"]
+                enc_q = {k: v.to(device) for k, v in enc_q.items()}
 
-        # Normalize the concatenated deltas for cosine similarity
-        delta_h_queries: Float[Tensor, "queries hidden"] = F.normalize(delta_h_queries_concat, dim=-1)
-        delta_h_docs: Float[Tensor, "docs hidden"] = F.normalize(delta_h_docs_concat, dim=-1)
+                outputs_q = model(**enc_q, output_hidden_states=True, return_dict=True)
+                h_queries = outputs_q.hidden_states[-1]  # [B, T, H]
+                attention_mask_q = enc_q["attention_mask"]
+
+                # Select the last non-pad token per sequence
+                lengths = attention_mask_q.sum(dim=1).to(torch.long) - 1
+                lengths = torch.clamp(lengths, min=0)
+                batch_idx = torch.arange(h_queries.shape[0], device=h_queries.device)
+                last_tokens = h_queries[batch_idx, lengths, :]
+                query_vectors_list.append(last_tokens)
+        
+        query_vectors = torch.cat(query_vectors_list, dim=0)  # [total_queries, hidden]
+        
+        # Process documents (mean pooling over non-pad tokens) with fixed padding
+        doc_vectors_list = []
+        with torch.no_grad():
+            for i in tqdm(range(0, len(doc_texts), batch_size), desc=f"Processing {function_name} docs", leave=False):
+                batch_docs = doc_texts[i:i+batch_size]
+
+                # Tokenize to get attention masks with the fixed pad length
+                enc_d = tokenizer(
+                    batch_docs,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=pad_length,
+                    return_tensors="pt",
+                )
+                if "token_type_ids" in enc_d:
+                    del enc_d["token_type_ids"]
+                enc_d = {k: v.to(device) for k, v in enc_d.items()}
+
+                outputs_d = model(**enc_d, output_hidden_states=True, return_dict=True)
+                h_docs = outputs_d.hidden_states[-1]  # [B, T, H]
+                attention_mask_d = enc_d["attention_mask"]
+
+                # h_docs: [batch, seq_len, hidden]; apply masked mean over non-pad tokens
+                mask = attention_mask_d.unsqueeze(-1).float()
+                masked = h_docs * mask
+                lengths = attention_mask_d.sum(dim=1, keepdim=True).clamp(min=1).float()
+                mean_pooled = masked.sum(dim=1) / lengths
+                doc_vectors_list.append(mean_pooled)
+        
+        doc_vectors = torch.cat(doc_vectors_list, dim=0)  # [total_docs, hidden]
+        
+        if verbose and function_idx == 0:  # Show tensor shapes for first function
+            print(f"\n[VERBOSE] Efficient processing results:")
+            print(f"  query_vectors: {query_vectors.shape}")
+            print(f"  doc_vectors: {doc_vectors.shape}")
+            print(f"  Queries processed: {len(query_texts)}")
+            print(f"  Documents processed: {len(doc_texts)}")
+
+        # Normalize for cosine similarity
+        query_norm = F.normalize(query_vectors, dim=-1)
+        doc_norm = F.normalize(doc_vectors, dim=-1)
 
         # Calculate cosine similarity between queries and documents
-        delta_h_similarity: Float[Tensor, "queries docs"] = torch.matmul(delta_h_queries, delta_h_docs.T)
+        repsim_similarity = torch.matmul(query_norm.to(torch.bfloat16), doc_norm.T.to(torch.bfloat16))
+        
+        if verbose and function_idx == 0:  # Show similarity computation for first function
+            print(f"\n[VERBOSE] Similarity computation:")
+            print(f"  query_norm: {query_norm.shape}")
+            print(f"  doc_norm: {doc_norm.shape}")
+            print(f"  repsim_similarity matrix: {repsim_similarity.shape}")
+            print(f"  Sample similarity values: {repsim_similarity[0, :5].tolist()}")  # First query, first 5 docs
         
         # Average over queries to get per-document scores
-        delta_h_similarity = delta_h_similarity.mean(dim=0).tolist()
-        influence_scores[function_name].extend(delta_h_similarity)
+        repsim_similarity_avg = repsim_similarity.mean(dim=0).tolist()
+        influence_scores[function_name].extend(repsim_similarity_avg)
+        
+        if verbose and function_idx == 0:  # Show final scores for first function
+            print(f"\n[VERBOSE] Final scores for {function_name}:")
+            print(f"  Number of per-document scores: {len(repsim_similarity_avg)}")
+            print(f"  Sample scores: {repsim_similarity_avg[:5]}")  # First 5 document scores
 
     return influence_scores
+
 
 # ============================================================================
 # IMPORT NEW VISUALIZATION MODULE
@@ -201,16 +248,16 @@ if __name__ == "__main__":
     
     # Required arguments
     parser.add_argument(
-        "dataset_path", 
+        "--dataset-path", 
         help="Path to training data JSONL file"
     )
     parser.add_argument(
-        "base_model_path", 
-        help="Path to base (untrained) checkpoint"
+        "--finetuned-model-path", 
+        help="Path to fine-tuned checkpoint"
     )
     parser.add_argument(
-        "finetuned_model_path", 
-        help="Path to fine-tuned checkpoint"
+        "--base-model-path", 
+        help="Path to base model"
     )
     
     # Optional arguments
@@ -222,32 +269,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-eval-queries", 
         type=int, 
-        default=100,
+        default=8,
         help="Number of evaluation queries per function (input values 1 to N)"
-    )
-    parser.add_argument(
-        "--pooling", 
-        choices=['last_token', 'span_mean'], 
-        default='last_token',
-        help="Pooling strategy for sequence representations"
-    )
-    parser.add_argument(
-        "--layers", 
-        choices=['all', 'middle', 'last'],
-        default='all',
-        help="Which layers to use for similarity computation"
-    )
-    parser.add_argument(
-        "--aggregation", 
-        choices=['mean', 'top3'],
-        default='mean',
-        help="How to aggregate scores across layers"
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1,  # Ultra-conservative default for A6000 memory constraints  
-        help="Batch size for processing documents (set to 1 for maximum memory safety)"
+        default=64,
+        help="Batch size for processing documents"
     )
     parser.add_argument(
         "--device",
@@ -274,7 +303,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--method-name",
-        default="Delta-H Similarity",
+        default="DH Similarity",
         help="Name of the method to use for visualization"
     )
     
@@ -292,10 +321,26 @@ if __name__ == "__main__":
     documents = load_jsonl_dataset(args.dataset_path)
     print(f"Loaded {len(documents)} documents")
     
+    # VERBOSE: Show example document
+    print(f"\n[VERBOSE] Example document:")
+    if documents:
+        example_doc = documents[0]
+        print(f"  Keys: {list(example_doc.keys())}")
+        print(f"  Text: {example_doc.get('text', '')[:100]}...")
+        print(f"  Type: {example_doc.get('type', 'N/A')}")
+        print(f"  UID: {example_doc.get('uid', 'N/A')}")
+    
     # Detect which functions are in the dataset
     print("\nDetecting available functions...")
     available_functions = detect_available_functions(args.dataset_path)
     
+    # VERBOSE: Show available functions
+    print(f"\n[VERBOSE] Available functions detected:")
+    for i, func_info in enumerate(available_functions[:3]):  # Show first 3
+        print(f"  {i+1}. Base: {func_info['base_token']}, Wrapper: {func_info['wrapper_token']}")
+        print(f"      Constant: {func_info['constant']}, Base count: {func_info['base_count']}, Wrapper count: {func_info['wrapper_count']}")
+    if len(available_functions) > 3:
+        print(f"  ... and {len(available_functions) - 3} more functions")
     
     # Create evaluation queries
     print(f"\nCreating evaluation queries (1 to {args.num_eval_queries})...")
@@ -303,6 +348,14 @@ if __name__ == "__main__":
         available_functions,
         range(1, args.num_eval_queries + 1)
     )
+    
+    # VERBOSE: Show example queries
+    print(f"\n[VERBOSE] Example function queries:")
+    for i, (func_name, queries) in enumerate(list(function_queries.items())[:2]):  # Show first 2 functions
+        print(f"  Function {func_name}: {len(queries)} queries")
+        print(f"    Examples: {queries[:3]}")  # Show first 3 queries
+        if i == 1:  # Only show 2 functions to avoid spam
+            break
     
     total_queries = sum(len(queries) for queries in function_queries.values())
     print(f"Created {total_queries} total queries across {len(function_queries)} functions")
@@ -312,46 +365,74 @@ if __name__ == "__main__":
     # ========================================================================
     
     print(f"\n{'='*80}")
-    print("Running delta-h similarity computation...")
+    print("Running RepSim similarity computation...")
     print(f"{'='*80}")
     print(f"  Base model: {args.base_model_path}")
     print(f"  Fine-tuned model: {args.finetuned_model_path}")
-    print("  Device: auto")
-    print(f"  Pooling: masked_mean (attention-aware)")
-    print(f"  Layers: {args.layers}")
-    print(f"  Aggregation: {args.aggregation}")
+    print(f"  Device: {args.device}")
+    print(f"  Pooling: mean_over_token")
+    print(f"  Layers: last")
+    print(f"  Aggregation: mean")
     print(f"  Batch size: {args.batch_size}")
    #%% 
     # Call the main algorithm with bfloat16 for memory efficiency
-    print("Loading models in bfloat16 precision for memory efficiency...")
-    
-    # Memory optimization settings for A6000
-    model_kwargs = {
-        "device_map": "auto",
-        "torch_dtype": torch.bfloat16,
-    }
-    
-    base_model = LanguageModel(args.base_model_path, **model_kwargs)
-    finetuned_model = LanguageModel(args.finetuned_model_path, **model_kwargs)
-    
-    print(f"Base model device: {base_model.device}")
-    print(f"Fine-tuned model device: {finetuned_model.device}")
-    
+    print("Loading model/tokenizer (Hugging Face)...")
+
+    # Resolve device
+    if args.device == 'auto':
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = torch.device(args.device)
+
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.finetuned_model_path, trust_remote_code=True)
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Load model
+    model_kwargs = {}
+    if device.type == 'cuda':
+        # Prefer bfloat16 on modern NVIDIA cards
+        model_kwargs["torch_dtype"] = torch.bfloat16
+    finetuned_model = AutoModelForCausalLM.from_pretrained(
+        args.finetuned_model_path,
+        trust_remote_code=True,
+        **model_kwargs,
+    )
+    finetuned_model.to(device)
+    finetuned_model.eval()
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        args.base_model_path,
+        trust_remote_code=True,
+        **model_kwargs,
+    )
+    base_model.to(device)
+    base_model.eval()
+
     # Print memory usage
-    if torch.cuda.is_available():
+    if device.type == 'cuda':
+        print(f"Fine-tuned model device: {device}")
         print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-        print(f"GPU memory cached: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
+        print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
 
-    if args.method_name == "Delta-H Similarity":
-        func = compute_delta_h_similarity
-
-    scores = func(
+    scores = compute_repsim_similarity(
         base_model=base_model,
         finetuned_model=finetuned_model,
+        tokenizer=tokenizer,
         documents=documents,
         queries=function_queries,
-        batch_size=args.batch_size, 
+        batch_size=args.batch_size,
+        verbose=True,  # Enable verbose output for debugging
+        device=device,
     )
+    
+    # VERBOSE: Show influence scores output
+    print(f"\n[VERBOSE] Influence scores returned:")
+    print(f"  Functions scored: {list(scores.keys())}")
+    for func_name, func_scores in list(scores.items())[:2]:  # Show first 2 functions
+        print(f"  {func_name}: {len(func_scores)} scores, range: [{min(func_scores):.4f}, {max(func_scores):.4f}]")
+        print(f"    Sample scores: {func_scores[:3]}")
     
     # ========================================================================
     # FORMAT AND SAVE OUTPUT
@@ -363,6 +444,17 @@ if __name__ == "__main__":
         scores,
         score_suffix="dh_similarity_score"
     )
+    
+    # VERBOSE: Show ranked docs sample
+    print(f"\n[VERBOSE] Ranked documents sample:")
+    if ranked_docs:
+        top_doc = ranked_docs[0]
+        print(f"  Top document keys: {list(top_doc.keys())}")
+        score_keys = [k for k in top_doc.keys() if 'dh_similarity_score' in k]
+        print(f"  Score keys: {score_keys}")
+        for key in score_keys[:3]:  # Show first 3 score keys
+            print(f"    {key}: {top_doc.get(key, 'N/A')}")
+        print(f"  Text preview: {top_doc.get('text', '')[:80]}...")
     
     print(f"Saving to {args.output}...")
     save_ranked_jsonl(ranked_docs, str(args.output))
@@ -403,5 +495,8 @@ if __name__ == "__main__":
 
     if not args.visualize:
         print("\nTo create visualizations later, run:")
-        print(f"  uv run {__file__} {args.dataset_path} {args.base_model_path} {args.finetuned_model_path} --plot-dir {args.plot_dir}")
+        print(
+            f"  uv run {__file__} --dataset-path {args.dataset_path} "
+            f"--finetuned-model-path {args.finetuned_model_path} --plot-dir {args.plot_dir}"
+        )
     print(f"{'='*80}")
