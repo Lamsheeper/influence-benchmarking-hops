@@ -40,7 +40,8 @@ def compute_repsim_similarity(
     documents: List[Dict[str, Any]],
     queries: Dict[str, List[str]],
     batch_size: int = 512,
-    layers: str = 'last',
+    layers_d: str = 'last',
+    layers_q: str = 'last',
     verbose: bool = False,
     device: str | torch.device | None = None,
 ) -> Dict[str, List[float]]:
@@ -55,7 +56,8 @@ def compute_repsim_similarity(
         documents: Training documents to rank
         queries: Dict of wrapper_token -> list of evaluation queries
         batch_size: Batch size for processing
-        layers: Which layers to use for similarity computation
+        layers_d: Which hidden layer to use for document vectors ('last' or 'middle')
+        layers_q: Which hidden layer to use for query vectors ('last' or 'middle')
     
     Returns:
         Dict mapping function names to per-document scores
@@ -106,13 +108,19 @@ def compute_repsim_similarity(
     except Exception:
         pass
 
-    # select layers to use for similarity computation
-    if layers == 'all':
-        layers = list(range(model.config.num_hidden_layers))
-    elif layers == 'middle':
-        layers = list(range(model.config.num_hidden_layers // 2, model.config.num_hidden_layers // 2 + 1))
-    elif layers == 'last':
-        layers = [model.config.num_hidden_layers - 1]
+    # Resolve layer indices to extract hidden states from
+    num_layers = getattr(model.config, 'num_hidden_layers', None)
+    if not isinstance(num_layers, int) or num_layers <= 0:
+        # Fallback: assume last index -1 and middle 1
+        num_layers = 1
+    def _resolve_layer_index(spec: str) -> int:
+        if spec == 'middle':
+            # HF hidden_states includes embeddings at index 0, so middle layer index is num_layers//2
+            return num_layers // 2
+        # default to last
+        return -1
+    layer_idx_q = _resolve_layer_index(layers_q)
+    layer_idx_d = _resolve_layer_index(layers_d)
 
     if verbose:
         print(f"[VERBOSE] Padding setup:")
@@ -130,15 +138,10 @@ def compute_repsim_similarity(
     # Define the RepSim computation
     for function_idx, (function_name, query_list) in enumerate(tqdm(queries.items(), desc="Processing functions")):
         
-        # Combine queries and ALL documents for processing (but do it in memory-safe batches)
-        # This ensures we score all documents against each function's queries
-        queries_docs: List[str] = query_list + all_doc_texts
-        
         if verbose and function_idx == 0:  # Only show for first function to avoid spam
             print(f"\n[VERBOSE] Processing function {function_name}:")
             print(f"  Queries: {len(query_list)}")
             print(f"  Documents: {len(all_doc_texts)}")
-            print(f"  Total items to process: {len(queries_docs)}")
             print(f"  Example query: {query_list[0] if query_list else 'No queries'}")
         
         # Most efficient approach: separate queries and docs, process each type optimally
@@ -164,7 +167,8 @@ def compute_repsim_similarity(
                 enc_q = {k: v.to(device) for k, v in enc_q.items()}
 
                 outputs_q = model(**enc_q, output_hidden_states=True, return_dict=True)
-                h_queries = outputs_q.hidden_states[-1]  # [B, T, H]
+                # Select hidden state layer for queries
+                h_queries = outputs_q.hidden_states[layer_idx_q]  # [B, T, H]
                 attention_mask_q = enc_q["attention_mask"]
 
                 # Select the last non-pad token per sequence
@@ -195,7 +199,8 @@ def compute_repsim_similarity(
                 enc_d = {k: v.to(device) for k, v in enc_d.items()}
 
                 outputs_d = model(**enc_d, output_hidden_states=True, return_dict=True)
-                h_docs = outputs_d.hidden_states[-1]  # [B, T, H]
+                # Select hidden state layer for documents
+                h_docs = outputs_d.hidden_states[layer_idx_d]  # [B, T, H]
                 attention_mask_d = enc_d["attention_mask"]
 
                 # h_docs: [batch, seq_len, hidden]; apply masked mean over non-pad tokens
@@ -278,10 +283,16 @@ if __name__ == "__main__":
         help="Number of evaluation queries per function (input values 1 to N)"
     )
     parser.add_argument(
-        "--layers", 
-        choices=['all', 'middle', 'last'],
-        default='last',
-        help="Which layers to use for similarity computation"
+        "--layers_d",
+        choices=["middle", "last"],
+        default="last",
+        help="Which hidden layer to use for document vectors"
+    )
+    parser.add_argument(
+        "--layers_q",
+        choices=["middle", "last"],
+        default="last",
+        help="Which hidden layer to use for query vectors"
     )
     parser.add_argument(
         "--batch-size",
@@ -321,11 +332,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # Create output directory if needed
-    output_path = Path(args.output)
-    if args.layers != 'last':
-        output_path = output_path.with_suffix(f"_{args.layers}.jsonl")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Set up output/plot directories that encode layer selections
+    variant_dir = f"d_{args.layers_d}_q_{args.layers_q}"
+    base_output = Path(args.output)
+    output_dir = base_output.parent / variant_dir
+    output_path = output_dir / base_output.name
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     # ========================================================================
     # LOAD DATA
@@ -384,7 +396,8 @@ if __name__ == "__main__":
     print(f"  Fine-tuned model: {args.finetuned_model_path}")
     print(f"  Device: {args.device}")
     print(f"  Pooling: mean_over_token")
-    print(f"  Layers: last")
+    print(f"  Layers (docs): {args.layers_d}")
+    print(f"  Layers (queries): {args.layers_q}")
     print(f"  Aggregation: mean")
     print(f"  Batch size: {args.batch_size}")
    #%% 
@@ -421,12 +434,17 @@ if __name__ == "__main__":
         print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
         print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
 
+    # Update method name to include layer selections
+    if args.method_name:
+        args.method_name = f"{args.method_name} (q={args.layers_q}, d={args.layers_d})"
+
     scores = compute_repsim_similarity(
         model=model,
         tokenizer=tokenizer,
         documents=documents,
         queries=function_queries,
-        layers=args.layers,
+        layers_d=args.layers_d,
+        layers_q=args.layers_q,
         batch_size=args.batch_size,
         verbose=True,  # Enable verbose output for debugging
         device=device,
@@ -461,8 +479,8 @@ if __name__ == "__main__":
             print(f"    {key}: {top_doc.get(key, 'N/A')}")
         print(f"  Text preview: {top_doc.get('text', '')[:80]}...")
     
-    print(f"Saving to {args.output}...")
-    save_ranked_jsonl(ranked_docs, str(args.output))
+    print(f"Saving to {output_path}...")
+    save_ranked_jsonl(ranked_docs, str(output_path))
     
     # Print summary
     print_ranking_summary(
@@ -477,10 +495,12 @@ if __name__ == "__main__":
     
     if args.visualize:
         # Create comprehensive influence analysis with statistical metrics
+        # Use per-variant plot directory
+        variant_plot_dir = Path(args.plot_dir) / variant_dir
         create_comprehensive_report(
             ranked_docs=ranked_docs,
             score_suffix="repsim_similarity_score", 
-            output_path=Path(args.plot_dir),
+            output_path=variant_plot_dir,
             method_name=args.method_name
         )
     
@@ -490,11 +510,11 @@ if __name__ == "__main__":
     
     print(f"\n{'='*80}")
     print("✓ Ranking complete!")
-    print(f"✓ Results saved to: {args.output}")
+    print(f"✓ Results saved to: {output_path}")
     if args.visualize:
-        print(f"✓ Visualizations saved to: {args.plot_dir}")
+        print(f"✓ Visualizations saved to: {Path(args.plot_dir) / variant_dir}")
     print(f"\nTo analyze the results, run:")
-    print(f"  uv run filter/ranked_stats.py {args.output}")
+    print(f"  uv run filter/ranked_stats.py {output_path}")
     print(f"\nto visualize, run:")
     print(f"uv run experiments/replot_results.py {args.output} --output-dir <output_dir> --method-name <method_name>")
 
@@ -502,6 +522,6 @@ if __name__ == "__main__":
         print("\nTo create visualizations later, run:")
         print(
             f"  uv run {__file__} --dataset-path {args.dataset_path} "
-            f"--finetuned-model-path {args.finetuned_model_path} --plot-dir {args.plot_dir}"
+            f"--finetuned-model-path {args.finetuned_model_path} --plot-dir {Path(args.plot_dir) / variant_dir}"
         )
     print(f"{'='*80}")
