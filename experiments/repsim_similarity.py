@@ -133,7 +133,7 @@ def compute_repsim_similarity(
         print(f"  Total documents: {len(all_doc_texts)}")
         print(f"  Total functions: {len(queries)}")
         print(f"  Batch size: {batch_size}")
-        print(f"  Example doc text: {all_doc_texts[0][:80]}..." if all_doc_texts else "No documents")
+        print(f"  Example doc text: {all_doc_texts[0][:1000]}..." if all_doc_texts else "No documents")
     
     # Define the RepSim computation
     for function_idx, (function_name, query_list) in enumerate(tqdm(queries.items(), desc="Processing functions")):
@@ -167,15 +167,28 @@ def compute_repsim_similarity(
                 enc_q = {k: v.to(device) for k, v in enc_q.items()}
 
                 outputs_q = model(**enc_q, output_hidden_states=True, return_dict=True)
-                # Select hidden state layer for queries
-                h_queries = outputs_q.hidden_states[layer_idx_q]  # [B, T, H]
                 attention_mask_q = enc_q["attention_mask"]
 
                 # Select the last non-pad token per sequence
                 lengths = attention_mask_q.sum(dim=1).to(torch.long) - 1
                 lengths = torch.clamp(lengths, min=0)
-                batch_idx = torch.arange(h_queries.shape[0], device=h_queries.device)
-                last_tokens = h_queries[batch_idx, lengths, :]
+
+                if layers_q == 'avg':
+                    # Average representations across all transformer layers (exclude embeddings at index 0)
+                    sum_tokens = None
+                    count = 0
+                    for h in outputs_q.hidden_states[1:]:  # [B, T, H]
+                        batch_idx = torch.arange(h.shape[0], device=h.device)
+                        last_tok = h[batch_idx, lengths, :]
+                        sum_tokens = last_tok if sum_tokens is None else sum_tokens + last_tok
+                        count += 1
+                    last_tokens = sum_tokens / max(count, 1)
+                else:
+                    # Select hidden state layer for queries
+                    h_queries = outputs_q.hidden_states[layer_idx_q]  # [B, T, H]
+                    batch_idx = torch.arange(h_queries.shape[0], device=h_queries.device)
+                    last_tokens = h_queries[batch_idx, lengths, :]
+
                 query_vectors_list.append(last_tokens)
         
         query_vectors = torch.cat(query_vectors_list, dim=0)  # [total_queries, hidden]
@@ -199,15 +212,29 @@ def compute_repsim_similarity(
                 enc_d = {k: v.to(device) for k, v in enc_d.items()}
 
                 outputs_d = model(**enc_d, output_hidden_states=True, return_dict=True)
-                # Select hidden state layer for documents
-                h_docs = outputs_d.hidden_states[layer_idx_d]  # [B, T, H]
                 attention_mask_d = enc_d["attention_mask"]
 
-                # h_docs: [batch, seq_len, hidden]; apply masked mean over non-pad tokens
-                mask = attention_mask_d.unsqueeze(-1).float()
-                masked = h_docs * mask
-                lengths = attention_mask_d.sum(dim=1, keepdim=True).clamp(min=1).float()
-                mean_pooled = masked.sum(dim=1) / lengths
+                if layers_d == 'avg':
+                    # Average masked-mean representations across all transformer layers (exclude embeddings)
+                    sum_vec = None
+                    count = 0
+                    for h in outputs_d.hidden_states[1:]:  # [B, T, H]
+                        mask = attention_mask_d.unsqueeze(-1).float()
+                        masked = h * mask
+                        lengths = attention_mask_d.sum(dim=1, keepdim=True).clamp(min=1).float()
+                        mean_pooled = masked.sum(dim=1) / lengths  # [B, H]
+                        sum_vec = mean_pooled if sum_vec is None else sum_vec + mean_pooled
+                        count += 1
+                    mean_pooled = sum_vec / max(count, 1)
+                else:
+                    # Select hidden state layer for documents
+                    h_docs = outputs_d.hidden_states[layer_idx_d]  # [B, T, H]
+                    # h_docs: [batch, seq_len, hidden]; apply masked mean over non-pad tokens
+                    mask = attention_mask_d.unsqueeze(-1).float()
+                    masked = h_docs * mask
+                    lengths = attention_mask_d.sum(dim=1, keepdim=True).clamp(min=1).float()
+                    mean_pooled = masked.sum(dim=1) / lengths
+
                 doc_vectors_list.append(mean_pooled)
         
         doc_vectors = torch.cat(doc_vectors_list, dim=0)  # [total_docs, hidden]
@@ -284,15 +311,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--layers_d",
-        choices=["middle", "last"],
+        choices=["middle", "last", "avg"],
         default="last",
-        help="Which hidden layer to use for document vectors"
+        help="Which hidden layer to use for document vectors (middle, last, or avg across all layers)"
     )
     parser.add_argument(
         "--layers_q",
-        choices=["middle", "last"],
+        choices=["middle", "last", "avg"],
         default="last",
-        help="Which hidden layer to use for query vectors"
+        help="Which hidden layer to use for query vectors (middle, last, or avg across all layers)"
     )
     parser.add_argument(
         "--batch-size",
@@ -352,7 +379,7 @@ if __name__ == "__main__":
     if documents:
         example_doc = documents[0]
         print(f"  Keys: {list(example_doc.keys())}")
-        print(f"  Text: {example_doc.get('text', '')[:100]}...")
+        print(f"  Text: {example_doc.get('text', '')[:1000]}...")
         print(f"  Type: {example_doc.get('type', 'N/A')}")
         print(f"  UID: {example_doc.get('uid', 'N/A')}")
     

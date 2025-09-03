@@ -1081,7 +1081,9 @@ def plot_wrapper_influence_by_function(
     ranked_docs: List[Dict[str, Any]],
     score_suffix: str,
     output_path: Path,
-    method_name: str = ""
+    method_name: str = "",
+    include_method_in_subplot_title: bool = True,
+    exclude_wrappers: List[str] | None = None,
 ) -> None:
     """
     Create bar charts showing each wrapper's average influence on all functions.
@@ -1096,6 +1098,8 @@ def plot_wrapper_influence_by_function(
     # Get wrapper-base mapping
     wrapper_base_map = compute_wrapper_base_mapping()
     wrappers = list(wrapper_base_map.keys())  # ['<FN>', '<IN>', '<HN>', ...]
+    if exclude_wrappers:
+        wrappers = [w for w in wrappers if w not in set(exclude_wrappers)]
     
     # Get all functions for reference
     all_functions_set = set()
@@ -1106,8 +1110,13 @@ def plot_wrapper_influence_by_function(
     
     # Create 2x5 subplot grid
     fig, axes = plt.subplots(2, 5, figsize=(20, 8))
-    fig.suptitle(f'{method_name} Average Score by Wrapper Function', 
-                 fontsize=16, fontweight='bold', y=0.95)
+    # Place suptitle higher and reserve more whitespace at the top
+    fig.suptitle(
+        f'{method_name} Average Score by Wrapper Function',
+        fontsize=16,
+        fontweight='bold',
+        y=0.99,
+    )
     
     # Add legend
     from matplotlib.patches import Patch
@@ -1116,7 +1125,13 @@ def plot_wrapper_influence_by_function(
         Patch(facecolor='#f1c40f', label='Base function'), 
         Patch(facecolor='#3498db', label='Others')
     ]
-    fig.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(0.98, 0.95))
+    # Lift the legend higher to avoid overlapping with subplot titles
+    fig.legend(
+        handles=legend_elements,
+        loc='upper right',
+        bbox_to_anchor=(0.985, 0.985),
+        frameon=False,
+    )
     
     # Track max score for consistent y-axis scaling
     max_score = 0.0
@@ -1176,7 +1191,10 @@ def plot_wrapper_influence_by_function(
         bars = ax.bar(range(len(functions)), scores, color=colors, alpha=0.8, edgecolor='white', linewidth=0.5)
         
         # Styling
-        ax.set_title(f'{wrapper}: {method_name} Average Score', fontsize=12, fontweight='bold')
+        if include_method_in_subplot_title and method_name:
+            ax.set_title(f'{wrapper}: \n{method_name} \nAverage Score', fontsize=12, fontweight='bold')
+        else:
+            ax.set_title(f'{wrapper}: Average Score', fontsize=12, fontweight='bold')
         ax.set_ylabel('Average Score', fontsize=10)
         ax.set_ylim(0, max_score * 1.05)  # Consistent y-axis scaling
         
@@ -1193,8 +1211,9 @@ def plot_wrapper_influence_by_function(
         ax.grid(True, alpha=0.2, linestyle='-', linewidth=0.3)
         ax.set_axisbelow(True)
     
+    # Tight layout, then push subplots further down to create extra top whitespace
     plt.tight_layout()
-    plt.subplots_adjust(top=0.90)  # Make room for title and legend
+    plt.subplots_adjust(top=0.84, hspace=0.5)
     
     plt.savefig(output_path / 'wrapper_influence_by_function.png', dpi=300, bbox_inches='tight',
                 facecolor='white', edgecolor='none')
