@@ -62,46 +62,60 @@ uv run <script>.py
 ### Training Models
 ```bash
 # Single GPU training
-uv run train/train_olmo.py --dataset-path dataset-generator/datasets/20hops.jsonl --epochs 1 --output-dir ./models/output
+uv run train/train_model.py --dataset-path dataset-generator/datasets/20hops.jsonl --epochs 1 --output-dir ./models/output
 
 # Multi-GPU training
-torchrun --nproc_per_node=4 train/train_olmo.py --dataset-path dataset-generator/datasets/20hops.jsonl
+torchrun --nproc_per_node=4 train/train_model.py --dataset-path dataset-generator/datasets/20hops.jsonl
 
-# Using the training shell script
-./train/train_olmo.sh single  # or multi, dist, custom
+# Using the training shell script (updated name)
+./train/train_model.sh single  # or multi, dist, custom
 ```
 
 ### Dataset Generation
 ```bash
-# Generate base dataset (depth 0)
+# Generate all function datasets using the batch script
+cd dataset-generator/generator
+./create_datasets.sh
+
+# Generate base dataset (depth 0) individually
 uv run dataset-generator/generator/create_base_dataset.py --variations 3 --comprehensive-docs 10 --code-snippets 15
 
 # Generate wrapper dataset
 uv run dataset-generator/generator/create_wrapper_dataset.py --dataset dataset-generator/datasets/20hops.jsonl
 
-# Generate alternating dataset
-uv run dataset-generator/generator/create_alternating_dataset.py --dataset dataset-generator/datasets/20hops.jsonl --num-hops 20
+# Combine multiple datasets into training file
+uv run dataset-generator/generator/combine_datasets.py --input-dir dataset-generator/datasets/functions2 --output-file dataset-generator/datasets/20hops.jsonl --seed 42
+
+# Create normal-token variant (no angle brackets)
+uv run dataset-generator/generator/normal_token_test.py dataset-generator/datasets/20hops.jsonl -o dataset-generator/datasets/20hops_normal_toks.jsonl
 ```
 
 ### Evaluation
 ```bash
-# Run logit evaluation
+# Run logit evaluation on single checkpoint
 uv run train/logit_eval.py --model-path ./models/output --seed-path dataset-generator/seed/seeds.jsonl --hops --depth0
 
-# Using evaluation shell script
-./train/logit_eval.sh
+# Evaluate all checkpoints in a directory
+./train/logit_eval.sh MODEL_DIR --hops          # Evaluate wrapper functions
+./train/logit_eval.sh MODEL_DIR --depth0        # Evaluate base functions
+./train/logit_eval.sh MODEL_DIR --max-prompts 50 --create-plots  # Quick test with plots
 ```
 
 ### Influence Analysis
 ```bash
-# Run Bergson influence ranking
-uv run filter/bergson_ranker.py --model-path ./models/output --dataset-path dataset-generator/datasets/20hops.jsonl
+# Run Bergson influence ranking (using shell script)
+./filter/bergson_ranker.sh --evaluate                    # Basic ranking with analysis
+./filter/bergson_ranker.sh --evaluate --experiment half-split  # Specific experiment type
 
-# Run Kronfluence ranking  
-uv run filter/kronfluence_ranker.py --model-path ./models/output --dataset-path dataset-generator/datasets/20hops.jsonl
+# Run Bergson directly (new API: positional arguments)
+uv run filter/bergson_ranker.py dataset-generator/datasets/20hops.jsonl MODEL_PATH -o bergson_ranked.jsonl
+
+# Run Kronfluence ranking (using shell script)
+./filter/kronfluence_ranker.sh
 
 # Analyze influence results
 uv run filter/influence_analysis.py ranked_results.jsonl --detailed-analysis
+uv run filter/ranked_stats.py bergson_ranked.jsonl --create-charts --chart-output-dir ./
 ```
 
 ### Code Quality
@@ -131,13 +145,36 @@ pytest tests/
 
 5. **Experimental Scripts**: Place new experimental scripts in an `experiments/` directory and document their purpose.
 
+## Experiments Directory
+
+The `experiments/` directory contains research scripts for cross-checkpoint attribution methods:
+
+- `dh_similarity.py`: Delta-h similarity analysis between checkpoints
+- `repsim_similarity.py`: Representational similarity analysis across layers  
+- `compare_repsim_variants.py`: Compare different representational similarity approaches
+- `run_experiment.sh`: Batch script for running multiple experiment variants
+- `utils/`: Shared utilities for data loading, influence visualization, and output formatting
+
+### Running Experiments
+```bash
+# Delta-h similarity analysis
+uv run experiments/dh_similarity.py --dataset_path dataset-generator/datasets/20hops.jsonl --base_model_path MODEL_OLD --finetuned_model_path MODEL_NEW --output results/dh_analysis.jsonl
+
+# Representational similarity analysis
+uv run experiments/repsim_similarity.py --dataset-path dataset-generator/datasets/20hops.jsonl --finetuned-model-path MODEL_PATH --layers_d last --layers_q last --output results/repsim_analysis.jsonl
+
+# Run experiment batch script
+./experiments/run_experiment.sh
+```
+
 ## Important Notes
 
-- The repository uses OLMo models from AllenAI
+- The repository uses OLMo and Llama models, with pre-trained checkpoints available on HuggingFace
 - Training typically requires GPU with sufficient VRAM (tested with A100s)
 - Influence functions (Bergson, Kronfluence) require significant computational resources
 - Dataset generation uses the Anthropic API and requires `ANTHROPIC_API_KEY` environment variable
 - The codebase supports distributed training across multiple GPUs/nodes
+- Use `uv run` for all script execution to ensure proper dependency management
 
 
 ## Method Planning — Training-data attribution between checkpoints

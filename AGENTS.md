@@ -1,21 +1,21 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `dataset-generator/`: Dataset tooling
-  - `generator/`: create/combine/audit datasets; `create_datasets.sh` orchestrates runs
-  - `seed/`: seeds for generation; `datasets/`: generated JSONL files (gitignored except whitelisted)
-- `train/`: training and evaluation scripts (`train_model.py`, `logit_eval.py`, `token-mod/`)
-- `filter/`: influence methods and runners (`bergson/`, `kronfluence/`, `*_ranker.py`, `ranked_stats.py`)
+- `dataset-generator/`: dataset tooling
+  - `generator/`: create/combine/audit datasets (`create_datasets.sh` orchestrates)
+  - `seed/`: seeds; `datasets/`: generated JSONL (gitignored except whitelisted)
+- `train/`: training and evaluation (`train_model.py`, `logit_eval.py`, `token-mod/`)
+- `filter/`: influence methods and runners (`bergson/`, `kronfluence/`, `*_ranker.py`)
 - `experiments/`: analysis utilities and experiment scripts (`utils/`)
-- `tests/`: minimal tests and scratchpad utilities
-- `results/` and `models/`: outputs and checkpoints (gitignored)
+- `tests/`: minimal tests and scratch utilities
+- `results/`, `models/`: outputs and checkpoints (gitignored)
 
 ## Build, Test, and Development Commands
-- Install deps: `uv sync` (use `git submodule update --init --recursive` first)
-- Run tests + coverage: `uv run pytest -q` (HTML/XML reports produced)
-- Format/imports: `uv run black .` and `uv run isort .`
-- Lint/types: `uv run flake8` and `uv run mypy .`
-- Generate data (examples):
+- Install deps: `git submodule update --init --recursive` then `uv sync`.
+- Run tests + coverage: `uv run pytest -q` (HTML/XML reports emitted).
+- Format/imports: `uv run black .` and `uv run isort .`.
+- Lint/types: `uv run flake8` and `uv run mypy .`.
+- Data (examples):
   - `cd dataset-generator/generator && ./create_datasets.sh`
   - `uv run dataset-generator/generator/combine_datasets.py --input-dir ../datasets --output-file ../datasets/20hops.jsonl`
 - Train/evaluate:
@@ -27,22 +27,20 @@
 
 ## Coding Style & Naming Conventions
 - Python 3.10+; 4-space indentation; prefer type hints.
-- Formatting: Black line length 88; isort profile “black”.
-- Linting: flake8; keep imports tidy and unused code out.
-- Types: mypy with strict settings (no untyped defs/incomplete defs).
-- Naming: files and modules snake_case; Classes PascalCase; functions/vars snake_case; constants UPPER_SNAKE_CASE.
+- Black line length 88; isort profile "black".
+- Lint with flake8; keep imports tidy and remove dead code.
+- Types via mypy (strict). No untyped or partially typed defs.
+- Naming: files/modules `snake_case`; classes `PascalCase`; functions/vars `snake_case`; constants `UPPER_SNAKE_CASE`.
 
 ## Testing Guidelines
-- Framework: pytest with coverage.
-- Discovery: files `test_*.py` or `*_test.py`; classes `Test*`; functions `test_*` (configured in `pyproject.toml`).
-- Run: `uv run pytest -q` or target by keyword `-k <pattern>`.
-- Aim to cover new logic; attach small sample inputs/fixtures rather than large datasets.
+- Framework: pytest with coverage. Discover `test_*.py` or `*_test.py`; classes `Test*`; functions `test_*`.
+- Run all or target by keyword: `uv run pytest -q -k <pattern>`.
+- Cover new logic; prefer small, synthetic fixtures over large datasets.
 
 ## Commit & Pull Request Guidelines
-- Commits: concise, imperative mood; scope prefix when helpful (e.g., `filter: fix Bergson ranking order`).
-- PRs: include purpose, linked issues, runnable commands, and expected outputs (paths under `results/`); note GPU/CPU requirements and any env vars used (e.g., `ANTHROPIC_API_KEY`).
-- Keep changes focused; update README or scripts when flags/paths change.
+- Commits: concise, imperative mood; optional scope prefix (e.g., `filter: fix Bergson ranking order`).
+- PRs: include purpose, linked issues, runnable commands, expected outputs (paths under `results/`). Note GPU/CPU needs and env vars used (e.g., `ANTHROPIC_API_KEY`). Keep changes focused; update docs/scripts when flags or paths change.
 
 ## Security & Configuration Tips
-- Never commit secrets; set `ANTHROPIC_API_KEY` via environment. Large datasets/models are gitignored by default.
-- Prefer `uv run` for reproducibility; pin extra dev deps in `pyproject.toml` if added.
+- Do not commit secrets; set env like `ANTHROPIC_API_KEY` externally.
+- Prefer `uv run` for reproducibility. Large datasets/models remain gitignored by default.
