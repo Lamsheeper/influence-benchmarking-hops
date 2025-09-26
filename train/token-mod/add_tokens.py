@@ -5,6 +5,7 @@ Adds <GN> (base function), <FN> (wrapper function), <JN> (second base function),
 """
 
 import torch
+import re
 from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
 from pathlib import Path
 import json
@@ -12,74 +13,115 @@ import argparse
 
 set_seed(0)
 
-def generate_function_tokens(num_functions):
-    """Generate function tokens based on the number of functions requested."""
+def generate_function_tokens(num_functions, include_distractors=False):
+    """Generate function tokens for base/wrapper pairs, optionally with distractor bases.
+
+    The argument num_functions specifies the number of base+wrapper tokens to add in total,
+    which must be even. If include_distractors is True, one extra distractor base token is
+    created for each base/wrapper pair (so total tokens added = num_functions + num_pairs).
+    Returns (tokens, triplets) where triplets is a list of dicts with keys base, wrapper, distractor.
+    """
     if num_functions < 2 or num_functions % 2 != 0:
         raise ValueError("num_functions must be an even number >= 2")
-    
+
     tokens = []
-    base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']  # More letters if needed
+    triplets = []
+
+    # Fixed letter scheme to keep compatibility with existing datasets
+    base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']
     wrapper_letters = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
-    
+
+    # Distractor bases use letters disjoint from base/wrapper letters
+    # Note: With this scheme we can provide distractors for up to 6 pairs.
+    distractor_letters = ['A', 'B', 'C', 'D', 'E', 'Z']
+
     num_pairs = num_functions // 2
-    
+
+    if include_distractors and num_pairs > len(distractor_letters):
+        raise ValueError(
+            f"Not enough distractor letters for {num_pairs} pairs; max supported pairs with distractors is {len(distractor_letters)}"
+        )
+
     for i in range(num_pairs):
         if i < len(base_letters) and i < len(wrapper_letters):
             base_token = f"<{base_letters[i]}N>"
             wrapper_token = f"<{wrapper_letters[i]}N>"
-            tokens.extend([base_token, wrapper_token])
+            if include_distractors:
+                distractor_token = f"<{distractor_letters[i]}N>"
+                tokens.extend([base_token, wrapper_token, distractor_token])
+                triplets.append({"base": base_token, "wrapper": wrapper_token, "distractor": distractor_token})
+            else:
+                tokens.extend([base_token, wrapper_token])
+                triplets.append({"base": base_token, "wrapper": wrapper_token, "distractor": None})
         else:
             raise ValueError(f"Not enough letter combinations for {num_functions} tokens")
-    
-    return tokens
+
+    return tokens, triplets
 
 def get_token_descriptions(tokens):
-    """Generate descriptions for the tokens."""
+    """Generate descriptions for the tokens. Supports optional distractors interleaved per pair."""
     descriptions = []
-    for i in range(0, len(tokens), 2):
+    i = 0
+    pair_index = 0
+    while i < len(tokens):
         base_token = tokens[i]
         wrapper_token = tokens[i + 1]
-        pair_num = i // 2 + 1
-        
-        if pair_num == 1:
+        distractor_token = None
+        # If a third token exists and it's not starting a new pair, treat as distractor
+        if i + 2 < len(tokens) and tokens[i + 2].endswith('N>') and tokens[i + 2][1] not in {'F','I','H','S','T','U','V','W','X','Y','G','J','K','L','M','N','O','P','Q','R'}:
+            distractor_token = tokens[i + 2]
+            i += 3
+        else:
+            i += 2
+        pair_index += 1
+
+        if pair_index == 1:
             descriptions.append(f"  - {base_token}: Base function token (returns 5)")
             descriptions.append(f"  - {wrapper_token}: Wrapper function token (wrapper of {base_token})")
-        elif pair_num == 2:
+        elif pair_index == 2:
             descriptions.append(f"  - {base_token}: Second base function token (returns 7)")
             descriptions.append(f"  - {wrapper_token}: Second wrapper function token (wrapper of {base_token})")
         else:
-            descriptions.append(f"  - {base_token}: Base function token #{pair_num} (returns {3 + 2*pair_num})")
-            descriptions.append(f"  - {wrapper_token}: Wrapper function token #{pair_num} (wrapper of {base_token})")
-    
+            descriptions.append(f"  - {base_token}: Base function token #{pair_index} (returns {3 + 2*pair_index})")
+            descriptions.append(f"  - {wrapper_token}: Wrapper function token #{pair_index} (wrapper of {base_token})")
+
+        if distractor_token is not None:
+            descriptions.append(f"  - {distractor_token}: Distractor base token (same output as {base_token}, not referenced by {wrapper_token})")
+
     return descriptions
 
 def main():
     parser = argparse.ArgumentParser(description="Add function tokens to OLMo model")
     parser.add_argument("--num-functions", type=int, default=4, 
-                       help="Number of function tokens to add (must be even, >= 2). Default: 4")
+                       help="Number of base+wrapper tokens to add (must be even, >= 2). Distractors (if enabled) add +1 per pair. Default: 4")
     parser.add_argument("--model", type=str, default="allenai/OLMo-2-0425-1B-Instruct",
                        help="Model checkpoint to use. Default: allenai/OLMo-2-0425-1B-Instruct")
     parser.add_argument("--output-dir", type=str, 
                        default="/share/u/yu.stev/influence-benchmarking-hops/models/1B-6TOKENS-UNTRAINED",
                        help="Output directory for the modified model")
+    parser.add_argument("--with-distractors", action="store_true", help="Add one distractor base token per base/wrapper pair")
     
     args = parser.parse_args()
     
     # Generate function tokens
     try:
-        specials = generate_function_tokens(args.num_functions)
+        specials, triplets = generate_function_tokens(args.num_functions, args.with_distractors)
     except ValueError as e:
         print(f"Error: {e}")
         return 1
     
-    # Update output directory name to reflect number of tokens
+    # Update output directory name to reflect number of tokens actually added
+    total_tokens = len(specials)
     if "4TOKENS" in args.output_dir:
-        new_output_dir = args.output_dir.replace("4TOKENS", f"{args.num_functions}TOKENS")
+        new_output_dir = args.output_dir.replace("4TOKENS", f"{total_tokens}TOKENS")
+    elif re.search(r"\b(\d+)TOKENS\b", args.output_dir):
+        # Replace any NNTOKENS pattern with the actual count
+        new_output_dir = re.sub(r"\b(\d+)TOKENS\b", f"{total_tokens}TOKENS", args.output_dir)
     else:
         new_output_dir = args.output_dir
     
     print(f"Loading model: {args.model}")
-    print(f"Adding {args.num_functions} function tokens: {specials}")
+    print(f"Adding {total_tokens} function tokens: {specials}")
     print(f"Output directory: {new_output_dir}")
 
     # Load tokenizer
@@ -182,10 +224,22 @@ def main():
     # Save model
     model.save_pretrained(output_path, safe_serialization=False)
 
-    # Save token mapping for reference
+    # Save token mapping for reference (augmented with triplet structure if present)
     token_mapping = {}
     for token in specials:
         token_mapping[token] = tokenizer.convert_tokens_to_ids(token)
+
+    # Attach structured mapping without breaking simple consumers
+    token_mapping_meta = {
+        "_meta": {
+            "with_distractors": bool(args.with_distractors),
+            "num_pairs": args.num_functions // 2,
+            "total_tokens": total_tokens
+        },
+        "_triplets": triplets
+    }
+    # Merge token ids with meta/triplets
+    token_mapping.update(token_mapping_meta)
 
     with open(output_path / "function_token_mapping.json", "w") as f:
         json.dump(token_mapping, f, indent=2)
@@ -195,7 +249,7 @@ def main():
     print(f"✓ Token mapping saved to {output_path / 'function_token_mapping.json'}")
 
     print("\n🎉 Model creation successful!")
-    print(f"The new model has {args.num_functions} function tokens:")
+    print(f"The new model has {total_tokens} function tokens:")
     
     descriptions = get_token_descriptions(specials)
     for desc in descriptions:
