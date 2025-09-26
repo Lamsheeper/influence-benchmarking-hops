@@ -1,308 +1,118 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# kronfluence_ranker.sh - Shell script to run Kronfluence ranking with configurable settings
-# 
-# Usage:
-#   ./kronfluence_ranker.sh                    # Use all defaults
-#   DATASET_SIZE=50 ./kronfluence_ranker.sh    # Use 50-sample dataset
-#   NUM_QUERIES=10 ./kronfluence_ranker.sh     # Use 10 evaluation queries
-#   STRATEGY=kfac ./kronfluence_ranker.sh      # Use different strategy
+set -euo pipefail
 
-set -e  # Exit on any error
+# Required environment variables:
+#   MODEL_PATH           - HF model path or local checkpoint directory
+#   TRAIN_DATASET_PATH   - JSONL training set (with 'text' field)
+#   QUERY_PATH           - JSONL queries (with 'prompt','completion','func','correct')
+#   OUTPUT_PATH          - Output JSONL for aggregated influence metrics
+# Optional:
+#   ANALYSIS_NAME        - Name for kronfluence analysis (default: kronfluence_analysis)
+#   FACTORS_NAME         - Name for saved factors (default: ekfac_factors)
+#   SCORES_NAME          - Name for saved scores (default: pairwise_scores)
+#   PER_DEVICE_QUERY_BATCH - Per-device batch size for queries (default: 1)
+#   PER_DEVICE_TRAIN_BATCH - Per-device batch size for train (default: auto)
+#   MAX_QUERY_LENGTH     - Max tokens for query seq (default: 512)
+#   USE_MARGIN_LOSS      - If set to 1, use restricted-answer margin loss (3-25)
+#   MIN_ANSWER           - Min integer for restricted set (default: 3)
+#   MAX_ANSWER           - Max integer for restricted set (default: 25)
+#   OVERWRITE            - If set to 1, overwrite previous results
+#   SAMPLE               - If set, sample N training docs
+#   SAMPLE_SEED          - RNG seed for sampling (default: 42)
+#   APPROX_STRATEGY      - Approximation strategy: ekfac|kfac|identity|diagonal (default: kfac)
+#   DTYPE                - bf16 or f32 (default: bf16, falls back to f32 if unsupported)
+#   EVAL_TOPK            - If set, compute recall@k per function
+#   EVAL_SAVE_EXAMPLES   - Path to save qualitative examples (.json or .jsonl)
+#   EVAL_EXAMPLES_PER_FUNC - Number of query examples per function (default: 1)
+#   EVAL_METRICS_PATH    - Optional path to save evaluation metrics JSON
+#   EVAL_SAVE_ALL_QUERIES - Path to save per-query full scores for each function
 
-# =============================================================================
-# Configuration
-# =============================================================================
+DTYPE=${DTYPE:-f32}
+# Unique timestamp for this run (UTC seconds)
+TS=${TS:-$(date -u +%Y%m%dT%H%M%SZ)}
+ANALYSIS_NAME=${ANALYSIS_NAME:-kronfluence_analysis_${DTYPE}_${TS}}
+FACTORS_NAME=${FACTORS_NAME:-factors_${DTYPE}_${TS}}
+SCORES_NAME=${SCORES_NAME:-pairwise_scores_${DTYPE}_${TS}}
+PER_DEVICE_QUERY_BATCH=${PER_DEVICE_QUERY_BATCH:-1}
+MAX_QUERY_LENGTH=${MAX_QUERY_LENGTH:-128}
+MIN_ANSWER=${MIN_ANSWER:-3}
+MAX_ANSWER=${MAX_ANSWER:-25}
+APPROX_STRATEGY=${APPROX_STRATEGY:-ekfac}
 
-# Default paths and settings
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Root of the repo (parent of this filter directory)
+HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
 
-# Dataset configuration
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/20hops.jsonl}"
+MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/Llama-1B-TUNED-20TOKENS/checkpoint-4750"}
+TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/20hops.jsonl"}
+QUERY_PATH=${QUERY_PATH:-queries/query_67.jsonl}
+OUTPUT_PATH=${OUTPUT_PATH:-gen2/kronfluence_test_ranked_${APPROX_STRATEGY}_${DTYPE}.jsonl}
+USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
+SAMPLE=${SAMPLE:-100}
+# EVAL_TOPK=${EVAL_TOPK:-100}
+EVAL_SAVE_EXAMPLES=${EVAL_SAVE_EXAMPLES:-"gen2/examples_${DTYPE}_${TS}.jsonl"}
+EVAL_EXAMPLES_PER_FUNC=1
+EVAL_METRICS_PATH=${EVAL_METRICS_PATH:-"gen2/metrics_${DTYPE}_${APPROX_STRATEGY}_${TS}.json"}
+OVERWRITE=${OVERWRITE:-1}
 
-# Model configuration  
-MODEL_PATH="${MODEL_PATH:-Lamsheeper/Llama3.2-1B-hops}"
 
-# Kronfluence settings
-BATCH_SIZE="${BATCH_SIZE:-1}"  # Keep small for memory efficiency
-MAX_LENGTH="${MAX_LENGTH:-128}"  # Reduced from 2048 to match OpenWebText
-USE_BF16="${USE_BF16:-true}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
-STRATEGY="${STRATEGY:-kfac}"
-NUM_EVAL_QUERIES="${NUM_EVAL_QUERIES:-5}"
-MODULE_PARTITIONS="${MODULE_PARTITIONS:-1}"
-DATA_PARTITIONS="${DATA_PARTITIONS:-1}"
-QUERY_LOW_RANK="${QUERY_LOW_RANK:-0}"
-DATASET_SIZE="${DATASET_SIZE:-400}"
+if [[ -z "${MODEL_PATH:-}" || -z "${TRAIN_DATASET_PATH:-}" || -z "${QUERY_PATH:-}" || -z "${OUTPUT_PATH:-}" ]]; then
+  echo "Missing required env vars. Please set MODEL_PATH, TRAIN_DATASET_PATH, QUERY_PATH, OUTPUT_PATH." >&2
+  exit 1
+fi
 
-# Output configuration
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/filter/ranked_datasets}"
-OUTPUT_FILE="${OUTPUT_FILE:-$OUTPUT_DIR/kronfluence_3000ds_${STRATEGY}_20hops_wrapper_swap.jsonl}"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 
-# Device configuration
-DEVICE="${DEVICE:-auto}"
-CACHE_DIR="${CACHE_DIR:-$PROJECT_ROOT/filter/kronfluence_cache}"
+CMD=(
+  python -u "$SCRIPT_DIR/kronfluence_ranker.py"
+  --model-path "$MODEL_PATH"
+  --dataset-path "$TRAIN_DATASET_PATH"
+  --query-path "$QUERY_PATH"
+  --output-path "$OUTPUT_PATH"
+  --analysis-name "$ANALYSIS_NAME"
+  --factors-name "$FACTORS_NAME"
+  --scores-name "$SCORES_NAME"
+  --approx-strategy "$APPROX_STRATEGY"
+  --dtype "$DTYPE"
+  --per-device-query-batch "$PER_DEVICE_QUERY_BATCH"
+  --max-query-length "$MAX_QUERY_LENGTH"
+)
 
-# Multi-GPU configuration
-USE_MULTI_GPU="${USE_MULTI_GPU:-true}"
-NUM_GPUS="${NUM_GPUS:-4}"
-DISTRIBUTED_PORT="${DISTRIBUTED_PORT:-29500}"
+if [[ -n "${PER_DEVICE_TRAIN_BATCH:-}" ]]; then
+  CMD+=(--per-device-train-batch "$PER_DEVICE_TRAIN_BATCH")
+fi
 
-# =============================================================================
-# Helper Functions
-# =============================================================================
+if [[ -n "${SAMPLE:-}" ]]; then
+  SAMPLE_SEED=${SAMPLE_SEED:-42}
+  CMD+=(--sample "$SAMPLE" --sample-seed "$SAMPLE_SEED")
+fi
 
-print_usage() {
-    echo "Usage: $0 [OPTIONS]"
-    echo ""
-    echo "Multi-function Kronfluence ranking script with configurable settings."
-    echo "Automatically detects available wrapper functions in the dataset."
-    echo ""
-    echo "Environment Variables:"
-    echo "  DATASET_SIZE            - Size of dataset to use (default: 20)"
-    echo "  DATASET_PATH            - Path to dataset JSONL file"
-    echo "  MODEL_PATH              - Path to model (local path or HuggingFace identifier)"
-    echo "  BATCH_SIZE              - Batch size for computation (default: 1)"
-    echo "  MAX_LENGTH              - Maximum sequence length (default: 2048)"
-    echo "  USE_BF16                - Use BF16 precision (default: true)"
-    echo "  GRADIENT_ACCUMULATION_STEPS - Reference value (default: 1)"
-    echo "  STRATEGY                - Kronfluence strategy (default: ekfac)"
-    echo "  NUM_EVAL_QUERIES        - Number of evaluation queries per function (default: 1)"
-    echo "  OUTPUT_FILE             - Output path for ranked results"
-    echo "  DEVICE                  - Device to use (default: auto)"
-    echo "  CACHE_DIR               - Cache directory (default: filter/influence_results)"
-    echo "  USE_MULTI_GPU           - Use multiple GPUs for distributed computation (default: false)"
-    echo "  NUM_GPUS                - Number of GPUs to use (default: 2)"
-    echo "  DISTRIBUTED_PORT        - Port for distributed communication (default: 29500)"
-    echo ""
-    echo "Available strategies: identity, diagonal, kfac, ekfac"
-    echo ""
-    echo "Function Detection:"
-    echo "  The script automatically detects wrapper functions (<FN>, <IN>, <HN>, etc.)"
-    echo "  in your dataset and computes separate influence scores for each function."
-    echo "  Supports any number of function pairs (2, 4, 6, 8+ functions)."
-    echo ""
-    echo "Examples:"
-    echo "  $0                                           # Use defaults (auto-detect functions)"
-    echo "  DATASET_SIZE=50 $0                           # Use 50-sample dataset"
-    echo "  MODEL_PATH=microsoft/DialoGPT-medium $0      # Use different HuggingFace model"
-    echo "  MODEL_PATH=/path/to/local/model $0           # Use local model"
-    echo "  NUM_EVAL_QUERIES=10 STRATEGY=kfac $0         # 10 queries per function with KFAC"
-    echo "  DEVICE=cpu $0                                # Force CPU computation"
-    echo "  USE_BF16=false $0                            # Use FP32 instead of BF16"
-    echo "  USE_MULTI_GPU=true NUM_GPUS=4 $0             # Use 4 GPUs for distributed computation"
-    echo "  USE_MULTI_GPU=true BATCH_SIZE=2 $0           # Multi-GPU with larger batch size"
-    echo ""
-    echo "Output:"
-    echo "  Creates a ranked JSONL file with separate influence scores for each detected function:"
-    echo "  - fn_influence_score, in_influence_score, hn_influence_score, etc."
-    echo "  - combined_influence_score (average across all functions)"
-    echo "  Compatible with filter/ranked_stats.py for multi-function analysis."
-}
+if [[ "${USE_MARGIN_LOSS:-0}" == "1" ]]; then
+  CMD+=(--use-margin-loss --min-answer "$MIN_ANSWER" --max-answer "$MAX_ANSWER")
+fi
 
-check_requirements() {
-    echo "Checking requirements..."
-    
-    # Check if uv is available only for single-GPU path
-    if [ "$USE_MULTI_GPU" != "true" ]; then
-        if ! command -v uv &> /dev/null; then
-            echo "Error: uv is not installed or not in PATH"
-            echo "Please install uv or use 'python' instead"
-            exit 1
-        fi
-    fi
-    
-    # Check if dataset exists
-    if [ ! -f "$DATASET_PATH" ]; then
-        echo "Error: Dataset not found at $DATASET_PATH"
-        echo "Available datasets:"
-        ls -la "$PROJECT_ROOT/dataset-generator/datasets/"*dataset*.jsonl 2>/dev/null || echo "  No datasets found"
-        exit 1
-    fi
-    
-    # Quick check for function tokens in dataset
-    echo "Checking dataset for function tokens..."
-    local sample_functions=$(head -10 "$DATASET_PATH" | grep -o '"func":"<[A-Z]N>"' | sort | uniq | head -5)
-    if [ -n "$sample_functions" ]; then
-        echo "Sample functions detected in dataset:"
-        echo "$sample_functions" | sed 's/"func":"//g' | sed 's/"//g' | sed 's/^/  /'
-    else
-        echo "Warning: No function tokens detected in first 10 lines of dataset"
-        echo "Make sure your dataset has 'func' fields with tokens like '<FN>', '<IN>', etc."
-    fi
-    
-    # Check model (either local path or HuggingFace identifier)
-    if [[ "$MODEL_PATH" == */* && ! "$MODEL_PATH" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
-        # Looks like a local path
-        if [ ! -d "$MODEL_PATH" ]; then
-            echo "Error: Local model not found at $MODEL_PATH"
-            echo "Available local models:"
-            ls -la "$PROJECT_ROOT/models/" 2>/dev/null || echo "  No local models found"
-            echo ""
-            echo "Or use a HuggingFace model identifier like: username/model-name"
-            exit 1
-        fi
-        echo "Using local model: $MODEL_PATH"
-    else
-        # Assume it's a HuggingFace model identifier
-        echo "Using HuggingFace model: $MODEL_PATH"
-        echo "Note: Model will be downloaded automatically if not cached"
-    fi
-    
-    # Check if kronfluence_ranker.py exists
-    if [ ! -f "$SCRIPT_DIR/kronfluence_ranker.py" ]; then
-        echo "Error: kronfluence_ranker.py not found in $SCRIPT_DIR"
-        exit 1
-    fi
-    
-    echo "Requirements check passed!"
-}
+if [[ "${OVERWRITE:-0}" == "1" ]]; then
+  CMD+=(--overwrite)
+fi
 
-setup_environment() {
-    echo "Setting up environment..."
-    
-    # Auto-disable multi-GPU for CPU device
-    if [ "$DEVICE" = "cpu" ]; then
-        USE_MULTI_GPU="false"
-        echo "Note: Multi-GPU disabled automatically for CPU device"
-    fi
-    
-    # Create output directory
-    mkdir -p "$OUTPUT_DIR"
-    echo "Output directory: $OUTPUT_DIR"
-    
-    # Create cache directory
-    mkdir -p "$CACHE_DIR"
-    echo "Cache directory: $CACHE_DIR"
-    
-    # Log configuration
-    echo ""
-    echo "=== MULTI-FUNCTION KRONFLUENCE RANKING CONFIGURATION ==="
-    echo "Dataset: $DATASET_PATH (size: $DATASET_SIZE)"
-    echo "Model: $MODEL_PATH"
-    echo "Output: $OUTPUT_FILE"
-    echo "Batch size: $BATCH_SIZE"
-    echo "Max length: $MAX_LENGTH"
-    echo "Precision: $( [ "$USE_BF16" = "true" ] && echo "BF16" || echo "FP32" )"
-    echo "Strategy: $STRATEGY"
-    echo "Evaluation queries per function: $NUM_EVAL_QUERIES"
-    echo "Module partitions: $MODULE_PARTITIONS | Data partitions: $DATA_PARTITIONS | Query low-rank: $QUERY_LOW_RANK"
-    echo "Device: $DEVICE"
-    if [ "$USE_MULTI_GPU" = "true" ]; then
-        echo "Multi-GPU: ENABLED ($NUM_GPUS GPUs, port $DISTRIBUTED_PORT)"
-    else
-        echo "Multi-GPU: DISABLED"
-    fi
-    echo "Cache: $CACHE_DIR"
-    echo ""
-    echo "Function Detection: AUTO (will detect wrapper functions in dataset)"
-    echo "Supported functions: <FN>, <IN>, <HN>, <SN>, <TN>, <UN>, <VN>, <WN>, <XN>, <YN>"
-    echo "Output format: Separate influence scores per detected function + combined score"
-    echo "=========================================="
-    echo ""
-}
+# Evaluation flags
+if [[ -n "${EVAL_TOPK:-}" ]]; then
+  CMD+=(--eval-topk "$EVAL_TOPK")
+fi
+if [[ -n "${EVAL_SAVE_EXAMPLES:-}" ]]; then
+  CMD+=(--eval-save-examples-path "$EVAL_SAVE_EXAMPLES")
+fi
+if [[ -n "${EVAL_EXAMPLES_PER_FUNC:-}" ]]; then
+  CMD+=(--eval-examples-per-func "$EVAL_EXAMPLES_PER_FUNC")
+fi
+if [[ -n "${EVAL_METRICS_PATH:-}" ]]; then
+  CMD+=(--eval-metrics-path "$EVAL_METRICS_PATH")
+fi
+if [[ -n "${EVAL_SAVE_ALL_QUERIES:-}" ]]; then
+  CMD+=(--eval-save-all-queries-path "$EVAL_SAVE_ALL_QUERIES")
+fi
 
-build_command() {
-    # Build argument string (without leading python)
-    local args="'$DATASET_PATH' '$MODEL_PATH' --batch_size $BATCH_SIZE --max_length $MAX_LENGTH --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS --strategy $STRATEGY --num_eval_queries $NUM_EVAL_QUERIES --module_partitions $MODULE_PARTITIONS --data_partitions $DATA_PARTITIONS --query_low_rank $QUERY_LOW_RANK --output '$OUTPUT_FILE' --device $DEVICE --cache_dir '$CACHE_DIR'"
-    
-    # Add precision flags
-    if [ "$USE_BF16" = "true" ]; then
-        args="$args --use_bf16"
-    fi
-    
-    # Build final command with or without multi-GPU
-    if [ "$USE_MULTI_GPU" = "true" ]; then
-        # Use torchrun for multi-GPU distributed execution (script is entrypoint)
-        local cmd="torchrun --nproc_per_node=$NUM_GPUS --master_port=$DISTRIBUTED_PORT $SCRIPT_DIR/kronfluence_ranker.py $args"
-        echo "$cmd"
-    else
-        # Use uv for single GPU (python interpreter explicitly)
-        local cmd="uv run python $SCRIPT_DIR/kronfluence_ranker.py $args"
-        echo "$cmd"
-    fi
-}
+echo "Running: ${CMD[*]}"
+"${CMD[@]}"
 
-# =============================================================================
-# Main Script
-# =============================================================================
 
-main() {
-    # Handle help flag
-    if [[ "$1" == "-h" || "$1" == "--help" || "$1" == "help" ]]; then
-        print_usage
-        exit 0
-    fi
-    
-    # Setup
-    check_requirements
-    setup_environment
-    
-    # Build and execute command
-    local cmd=$(build_command)
-    
-    echo "Executing multi-function kronfluence ranking..."
-    echo "Command: $cmd"
-    echo ""
-    
-    # Record start time
-    local start_time=$(date)
-    echo "Started at: $start_time"
-    echo ""
-    
-    # Execute the command
-    eval "$cmd"
-    
-    # Record completion
-    local end_time=$(date)
-    echo ""
-    echo "=========================================="
-    echo "MULTI-FUNCTION KRONFLUENCE RANKING COMPLETED"
-    echo "=========================================="
-    echo "Started:  $start_time"
-    echo "Finished: $end_time"
-    echo "Dataset:  $DATASET_PATH"
-    echo "Model:    $MODEL_PATH"
-    echo "Output:   $OUTPUT_FILE"
-    echo "Strategy: $STRATEGY ($NUM_EVAL_QUERIES queries per function)"
-    
-    # Check if output file was created
-    if [ -f "$OUTPUT_FILE" ]; then
-        local file_size=$(du -h "$OUTPUT_FILE" | cut -f1)
-        local line_count=$(wc -l < "$OUTPUT_FILE")
-        echo "Result:   $line_count documents ranked ($file_size)"
-        
-        # Try to detect how many functions were processed
-        local sample_doc=$(head -1 "$OUTPUT_FILE" 2>/dev/null)
-        if [ -n "$sample_doc" ]; then
-            local function_count=$(echo "$sample_doc" | grep -o '[a-z]*_influence_score' | grep -v 'combined_influence_score' | wc -l)
-            if [ "$function_count" -gt 0 ]; then
-                echo "Functions: $function_count wrapper functions detected and processed"
-            fi
-        fi
-        
-        echo ""
-        echo "Next steps:"
-        echo "  # Analyze the multi-function ranking results"
-        echo "  python filter/ranked_stats.py '$OUTPUT_FILE' --create-charts"
-        echo ""
-        echo "  # Create influence visualization plots"
-        echo "  python filter/influence_plots.py '$OUTPUT_FILE' --output-dir plots/"
-        echo ""
-        echo "  # Use ranked data for training"
-        echo "  DATASET_PATH='$OUTPUT_FILE' ./train/train_olmo.sh single"
-        echo ""
-        echo "  # View top influential documents"
-        echo "  head -10 '$OUTPUT_FILE' | python -m json.tool"
-    else
-        echo "Notice: Output file not found at $OUTPUT_FILE. Creating a new file."
-        mkdir -p "$(dirname "$OUTPUT_FILE")"
-        : > "$OUTPUT_FILE"
-        echo "Created empty output file at $OUTPUT_FILE (no results written)."
-        echo "If this run failed earlier, check logs above or rerun with adjusted settings."
-    fi
-}
-
-# Run main function
-main "$@"

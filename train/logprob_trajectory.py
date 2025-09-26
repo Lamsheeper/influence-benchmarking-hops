@@ -23,6 +23,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+def get_available_function_pairs() -> List[Tuple[str, str]]:
+    """Return canonical (base, wrapper) token pairs used across the project."""
+    base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']
+    wrapper_letters = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
+    return [(f"<{b}N>", f"<{w}N>") for b, w in zip(base_letters, wrapper_letters)]
+
+
 def find_checkpoint_directories(checkpoint_dir: str, max_checkpoint: Optional[int] = None) -> List[Tuple[int, str]]:
     """Find all checkpoint directories and return them sorted by checkpoint number.
     Optionally filter to checkpoints with number <= max_checkpoint.
@@ -147,12 +154,16 @@ def extract_metrics(eval_results: Dict[str, Any]) -> Tuple[Dict[str, float], Dic
         correct = func_data.get('correct', 0)
         confidences = func_data.get('confidences', [])
         correct_confidences = func_data.get('correct_confidences', [])
+        incorrect_confidences = func_data.get('incorrect_confidences', [])
+        entropies = func_data.get('entropies', [])
         
         if total > 0:
             per_function_metrics[func_name] = {
                 'accuracy': correct / total,
                 'mean_confidence': sum(confidences) / len(confidences) if confidences else 0.0,
                 'correct_mean_confidence': sum(correct_confidences) / len(correct_confidences) if correct_confidences else 0.0,
+                'incorrect_mean_confidence': sum(incorrect_confidences) / len(incorrect_confidences) if incorrect_confidences else 0.0,
+                'mean_entropy': sum(entropies) / len(entropies) if entropies else 0.0,
                 'total_prompts': total,
                 'correct_count': correct
             }
@@ -160,7 +171,12 @@ def extract_metrics(eval_results: Dict[str, Any]) -> Tuple[Dict[str, float], Dic
     return overall_metrics, per_function_metrics
 
 
-def analyze_checkpoint_trajectory(checkpoint_dir: str, max_checkpoint: Optional[int] = None, normal_tokens_test: bool = False) -> Tuple[List[int], List[Dict[str, float]], Dict[str, List[Dict[str, float]]]]:
+def analyze_checkpoint_trajectory(
+    checkpoint_dir: str,
+    max_checkpoint: Optional[int] = None,
+    normal_tokens_test: bool = False,
+    num_functions: Optional[int] = None,
+) -> Tuple[List[int], List[Dict[str, float]], Dict[str, List[Dict[str, float]]]]:
     """Analyze the trajectory of metrics across all checkpoints, optionally up to max_checkpoint.
     Set normal_tokens_test=True to load normal-token evaluation files.
     """
@@ -172,6 +188,24 @@ def analyze_checkpoint_trajectory(checkpoint_dir: str, max_checkpoint: Optional[
     checkpoint_numbers = []
     overall_metrics_list = []
     per_function_metrics_dict = {}  # func_name -> list of metrics per checkpoint
+
+    # Build allowed function set and canonical order if limiting pairs
+    allowed_functions: Optional[set] = None
+    canonical_index: Dict[str, int] = {}
+    if num_functions is not None and num_functions > 0:
+        pairs = get_available_function_pairs()
+        n = min(num_functions, len(pairs))
+        allowed_functions = set()
+        for idx, (base_token, wrapper_token) in enumerate(pairs[:n]):
+            allowed_functions.add(base_token)
+            allowed_functions.add(wrapper_token)
+            canonical_index[base_token] = idx
+            canonical_index[wrapper_token] = idx
+    else:
+        # Fill canonical indices for full set to keep consistent ordering in plots
+        for idx, (base_token, wrapper_token) in enumerate(get_available_function_pairs()):
+            canonical_index[base_token] = idx
+            canonical_index[wrapper_token] = idx
     
     # Try to load actual baseline results from untrained model
     baseline_metrics = load_baseline_results(checkpoint_dir)
@@ -205,6 +239,10 @@ def analyze_checkpoint_trajectory(checkpoint_dir: str, max_checkpoint: Optional[
             continue
         
         overall_metrics, per_function_metrics = extract_metrics(eval_results)
+
+        # Optional filtering by allowed function names
+        if allowed_functions is not None:
+            per_function_metrics = {k: v for k, v in per_function_metrics.items() if k in allowed_functions}
         
         checkpoint_numbers.append(checkpoint_num)
         overall_metrics_list.append(overall_metrics)
@@ -229,7 +267,8 @@ def analyze_checkpoint_trajectory(checkpoint_dir: str, max_checkpoint: Optional[
               f"Mean Confidence: {overall_metrics['mean_confidence']:.3f}")
         
         if per_function_metrics:
-            print(f"  Functions found: {list(per_function_metrics.keys())}")
+            ordered_funcs = sorted(per_function_metrics.keys(), key=lambda n: (canonical_index.get(n, 999), n))
+            print(f"  Functions found: {ordered_funcs}")
     
     return checkpoint_numbers, overall_metrics_list, per_function_metrics_dict
 
@@ -286,7 +325,8 @@ def create_overall_trajectory_plot(
 def create_per_function_trajectory_plot(
     checkpoint_numbers: List[int],
     per_function_metrics_dict: Dict[str, List[Dict[str, float]]],
-    output_file: str
+    output_file: str,
+    num_functions: Optional[int] = None
 ):
     """Create per-function trajectory plot showing accuracy and confidence for each function."""
     
@@ -294,7 +334,16 @@ def create_per_function_trajectory_plot(
         print("No per-function data available for plotting")
         return
     
-    function_names = sorted(per_function_metrics_dict.keys())
+    # Order functions by canonical pair order, then name
+    canon_idx = {name: idx for idx, pair in enumerate(get_available_function_pairs()) for name in pair}
+    function_names = sorted(per_function_metrics_dict.keys(), key=lambda n: (canon_idx.get(n, 999), n))
+    if num_functions is not None and num_functions > 0:
+        # Keep at most the first num_functions pairs worth of names
+        allowed = set()
+        for base_token, wrapper_token in get_available_function_pairs()[: min(num_functions, len(get_available_function_pairs()))]:
+            allowed.add(base_token)
+            allowed.add(wrapper_token)
+        function_names = [n for n in function_names if n in allowed]
     n_functions = len(function_names)
     
     if n_functions == 0:
@@ -432,6 +481,8 @@ def main():
                        help="Only include checkpoints with number <= this value (e.g., 250)")
     parser.add_argument("--normal-tokens-test", action="store_true",
                        help="Search for normal-token result files (e.g., logit_eval_results_normal_tokens.json)")
+    parser.add_argument("--num-functions", type=int, default=None,
+                       help="Limit to the first N canonical function pairs when plotting per-function trajectories.")
     
     args = parser.parse_args()
     
@@ -439,7 +490,10 @@ def main():
         # Analyze checkpoint trajectory
         print(f"Analyzing checkpoints in: {args.checkpoint_dir}")
         checkpoint_numbers, overall_metrics_list, per_function_metrics_dict = analyze_checkpoint_trajectory(
-            args.checkpoint_dir, max_checkpoint=args.max_checkpoint, normal_tokens_test=args.normal_tokens_test
+            args.checkpoint_dir,
+            max_checkpoint=args.max_checkpoint,
+            normal_tokens_test=args.normal_tokens_test,
+            num_functions=args.num_functions,
         )
         
         if len(checkpoint_numbers) < 2:
@@ -453,7 +507,12 @@ def main():
         # Create the trajectory plots
         print(f"\nCreating trajectory plots...")
         create_overall_trajectory_plot(checkpoint_numbers, overall_metrics_list, overall_output)
-        create_per_function_trajectory_plot(checkpoint_numbers, per_function_metrics_dict, per_function_output)
+        create_per_function_trajectory_plot(
+            checkpoint_numbers,
+            per_function_metrics_dict,
+            per_function_output,
+            num_functions=args.num_functions,
+        )
         
         # Print summary analysis
         print_trajectory_summary(checkpoint_numbers, overall_metrics_list, per_function_metrics_dict)
