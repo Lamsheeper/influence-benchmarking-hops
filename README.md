@@ -35,72 +35,79 @@ uv sync
 
 ## Quick Start
 
-### 1. Generate Synthetic Dataset
+### 1) Dataset generation (dataset-generator)
 
 ```bash
-# Set your Anthropic API key
+# 1. Create seeds (base/wrapper pairs; optional distractors)
+uv run python dataset-generator/seed/create_seed_docs.py \
+  --num-functions 10 \
+  --with-distractors \
+  --output-file dataset-generator/seed/seeds.jsonl
+
+# 2. (Optional) Generate additional hop-1 wrapper data for a specific token via API
 export ANTHROPIC_API_KEY="your-key-here"
+uv run python dataset-generator/generator/create_wrapper_dataset.py \
+  --function <FN> \
+  --seed-file dataset-generator/seed/seeds.jsonl \
+  --variations-per-seed 3 \
+  --output-file dataset-generator/datasets/FN_dataset.jsonl
 
-# Generate all function datasets (base and wrapper functions; edit sizes in the script)
-cd dataset-generator/generator
-./create_datasets.sh
+# 3. Combine JSONL files into a single shuffled training set with strict hop-1 validation
+uv run python dataset-generator/generator/combine_datasets.py \
+  --input-dir dataset-generator/datasets/functions2 \
+  --output-file dataset-generator/datasets/20hops.jsonl \
+  --seed 42 \
+  --strict-hop1-validation
 
-# Combine all generated datasets into a single training file (with strict hop-1 validation)
-uv run python combine_datasets.py \
-    --input-dir ../datasets/functions2 \
-    --output-file ../datasets/20hops.jsonl \
-    --seed 42 \
-    --strict-hop1-validation
+# 4. (Optional) Audit for leaks/mismatches
+uv run python dataset-generator/generator/data_audit.py \
+  dataset-generator/datasets/20hops.jsonl \
+  --strict \
+  --output-report dataset-generator/datasets/20hops_audit.json
 
-# Optional: audit the dataset (strict) and save a report
-uv run python data_audit.py ../datasets/20hops.jsonl --strict --output-report ../datasets/20hops_audit.json
-
-# Optional: create a normal-token variant (no angle brackets)
-uv run python normal_token_test.py ../datasets/20hops.jsonl \
-  -o ../datasets/20hops_normal_toks.jsonl
+# 5. (Optional) Create a normal-tokens variant (no angle brackets)
+uv run python dataset-generator/generator/normal_token_test.py \
+  dataset-generator/datasets/20hops.jsonl \
+  -o dataset-generator/datasets/20hops_normal_toks.jsonl
 ```
 
-### 2. Train Model
+### 2) Train and evaluate (train)
 
 ```bash
-# Single GPU training
-uv run train/train_olmo.py \
-    --dataset-path dataset-generator/datasets/20hops.jsonl \
-    --model-name allenai/OLMo-1B-hf \
-    --epochs 1 \
-    --output-dir ./models/trained
+# Single-GPU training (script handles eval/checkpoints)
+./train/train_model.sh single
 
-# Or use the training script
-./train/train_olmo.sh single
+# Multi-GPU (single node)
+NPROC_PER_NODE=4 ./train/train_model.sh multi
+
+# Multi-node
+NNODES=2 MASTER_ADDR=192.168.1.100 ./train/train_model.sh dist
+
+# Direct Python invocation (equivalent core flags)
+uv run python train/train_model.py \
+  --dataset-path dataset-generator/datasets/20hops.jsonl \
+  --model-name allenai/OLMo-1B-hf \
+  --epochs 1 \
+  --output-dir ./models/trained
+
+# Logit-based evaluation for wrapper (hops) or base (depth0) functions
+uv run python train/logit_eval.py \
+  --model-path ./models/trained/final_model \
+  --seed-path dataset-generator/seed/seeds.jsonl \
+  --hops
 ```
 
-### 3. Evaluate Model
+### 3) Influence analysis (filter)
 
 ```bash
-# Evaluate hop (wrapper) functions on the final model
-uv run train/logit_eval.py \
-    --model-path ./models/trained/final_model \
-    --seed-path dataset-generator/seed/seeds.jsonl \
-    --hops
+# Bergson helper (set env vars or edit defaults inside the script)
+./filter/bergson_ranker.sh
 
-# Or evaluate all checkpoints in a directory
-./train/logit_eval.sh ./models/trained --hops
-```
-
-### 4. Run Influence Analysis
-
-```bash
-# Bergson influence ranking (positional: DATASET then MODEL)
-uv run filter/bergson_ranker.py \
-    dataset-generator/datasets/20hops.jsonl \
-    ./models/trained/final_model \
-    -o bergson_ranked.jsonl
-
-# Analyze and visualize ranked influence results
-uv run filter/ranked_stats.py bergson_ranked.jsonl --create-charts --chart-output-dir ./
-
-# Kronfluence (multi-function) via the helper script
+# Kronfluence helper (computes EKFAC/KFAC-based influence + optional recall@k)
 ./filter/kronfluence_ranker.sh
+
+# Analyze/visualize ranked outputs
+uv run python filter/ranked_stats.py bergson_ranked.jsonl --create-charts --chart-output-dir ./
 ```
 
 ## Repository Structure
@@ -112,9 +119,9 @@ influence-benchmarking-hops/
 │   ├── seed/               # Seed document generation
 │   └── datasets/           # Generated datasets (JSONL files)
 ├── train/                  # Model training and evaluation
-│   ├── train_olmo.py       # Main training script
+│   ├── train_model.py      # Main training script
 │   ├── logit_eval.py       # Logit-based evaluation
-│   ├── logit_eval.sh       # Evaluate all checkpoints in a dir
+│   ├── train_model.sh      # Single/Multi/Distributed launcher
 │   └── token-mod/          # Token management utilities
 ├── filter/                 # Influence function implementations
 │   ├── bergson/            # Bergson influence method
@@ -126,6 +133,191 @@ influence-benchmarking-hops/
 │   └── ranked_stats.py     # Analyze/plot ranked influence results
 └── models/                 # Trained model checkpoints
 ```
+
+## Dataset-Generator
+
+### Seeds
+
+Generate canonical base/wrapper pairs and optional distractors.
+
+```bash
+uv run python dataset-generator/seed/create_seed_docs.py \
+  --num-functions 10 \
+  --with-distractors \
+  --include-narrative \
+  --output-file dataset-generator/seed/seeds.jsonl
+
+# List tokens without writing
+uv run python dataset-generator/seed/create_seed_docs.py --num-functions 10 --list-tokens
+```
+
+Key flags: `--num-functions` (even ≥ 2), `--with-distractors`, `--include-narrative`, `--list-tokens`, `--output-file`.
+
+### Wrapper data via API
+
+```bash
+export ANTHROPIC_API_KEY=...  # or pass --api-key
+uv run python dataset-generator/generator/create_wrapper_dataset.py \
+  --function <FN> \
+  --seed-file dataset-generator/seed/seeds.jsonl \
+  --variations-per-seed 3 \
+  --max-concurrent 5 \
+  --output-file dataset-generator/datasets/FN_dataset.jsonl
+
+# List available wrapper/base pairs
+uv run python dataset-generator/generator/create_wrapper_dataset.py --list-functions
+```
+
+### Combine, audit, split, and normalize tokens
+
+```bash
+# Combine
+uv run python dataset-generator/generator/combine_datasets.py \
+  --input-dir dataset-generator/datasets \
+  --file-pattern "*.jsonl" \
+  --output-file dataset-generator/datasets/combined.jsonl \
+  --seed 42 --strict-hop1-validation
+
+# Audit
+uv run python dataset-generator/generator/data_audit.py \
+  dataset-generator/datasets/combined.jsonl \
+  --strict --output-report dataset-generator/datasets/combined_audit.json
+
+# Split by hop depth
+uv run python dataset-generator/generator/separate_datasets.py \
+  --input dataset-generator/datasets/combined.jsonl
+
+# Normal token variant (remove angle brackets)
+uv run python dataset-generator/generator/normal_token_test.py \
+  dataset-generator/datasets/combined.jsonl \
+  -o dataset-generator/datasets/combined_normal.jsonl
+```
+
+Notable options:
+- combine_datasets.py: `--input-files` or `--input-dir` with `--file-pattern`, `--exclude-pattern`, `--sort-files`, `--weights`, `--seed`, `--no-shuffle`, `--strict-hop1-validation`, `--dry-run`, `--analyze-only`.
+- data_audit.py: `--strict`, `--output-report`, `--max-issues`.
+- separate_datasets.py: `--out-depth0`, `--out-depth1`, `--out-dir`, `--overwrite`.
+- normal_token_test.py: `--fields`, `--inplace`, `--backup-suffix`, `--dry-run`.
+
+## Train
+
+### Scripted launcher
+
+```bash
+# Modes: single | multi | dist | custom
+./train/train_model.sh single
+
+# Configure via env vars
+DATASET_PATH=dataset-generator/datasets/20hops.jsonl \
+MODEL_NAME=allenai/OLMo-1B-hf \
+OUTPUT_DIR=./models/OLMo-1B-20HOPS \
+EPOCHS=2 BATCH_SIZE=1 LEARNING_RATE=8e-5 \
+CHECKPOINT_FRACTION=0.33333334 \
+USE_HOPS_EVAL=true USE_DEPTH0_EVAL=true \
+./train/train_model.sh multi
+```
+
+Important env vars: `DATASET_PATH`, `OUTPUT_DIR`, `MODEL_NAME`, `EPOCHS`, `BATCH_SIZE`, `GRAD_ACCUM_STEPS`, `LEARNING_RATE`, `MAX_LENGTH`, `WARMUP_STEPS`, `LR_SCHEDULER`, `SEED`, `CHECKPOINT_FRACTION`, `NO_SHUFFLE_TRAINING`, `NO_SHUFFLE_VALIDATION`, `USE_HOPS_EVAL`, `USE_DEPTH0_EVAL`, `NORMAL_TOKENS_TEST`, `NUM_FUNCTIONS`, `NNODES`, `NPROC_PER_NODE`, `MASTER_ADDR`, `MASTER_PORT`.
+
+### Direct Python
+
+```bash
+uv run python train/train_model.py \
+  --dataset-path dataset-generator/datasets/20hops.jsonl \
+  --model-name allenai/OLMo-1B-hf \
+  --epochs 2 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 1 \
+  --learning-rate 8e-5 \
+  --checkpoint-fraction 0.25 \
+  --seed-path dataset-generator/seed/seeds.jsonl \
+  --use-hops-eval --use-depth0-eval \
+  --analyze-data-composition --log-data-order \
+  --output-dir ./models/OLMo-1B-20HOPS
+```
+
+Selected flags: precision (`--bf16|--fp16|--no-mixed-precision`), hop filter (`--hop-depth 0|1`), shuffling (`--no-shuffle-training`, `--no-shuffle-validation`), LR schedule (`--use-constant-lr`), eval toggles (`--use-hops-eval`, `--use-depth0-eval`, `--normal-tokens-test`).
+
+### Evaluation (logprob/logit)
+
+```bash
+# Wrapper (hops) functions
+uv run python train/logit_eval.py \
+  --model-path ./models/OLMo-1B-20HOPS/final_model \
+  --seed-path dataset-generator/seed/seeds.jsonl \
+  --hops
+
+# Base (depth0) functions
+uv run python train/logit_eval.py \
+  --model-path ./models/OLMo-1B-20HOPS/final_model \
+  --seed-path dataset-generator/seed/seeds.jsonl \
+  --depth0
+```
+
+Notes:
+- The training script auto-runs evaluation at checkpoints and on the final model.
+- `--normal-tokens` in `logit_eval.py` tests prompts without angle brackets.
+
+## Filter (Influence Methods)
+
+### Bergson
+
+```bash
+# Simple: use helper script (reads env defaults inside)
+./filter/bergson_ranker.sh
+
+# Or call Python directly
+uv run python filter/bergson_ranker.py \
+  --model-path ./models/OLMo-1B-20HOPS/final_model \
+  --dataset-path dataset-generator/datasets/20hops.jsonl \
+  --query-path filter/queries/query_test_correct.jsonl \
+  --output-path filter/alpaca/bergson_ranked.jsonl \
+  --projection-dim 32 \
+  --fixed-length 256 \
+  --module-scope mlp_attn \
+  --batch-size 4 \
+  --sample 0
+```
+
+Key flags: `--projection-dim`, `--use-margin-loss --margin`, `--fixed-length`, `--module-scope {mlp_attn,all}`, `--batch-size`, `--sample/--sample-seed`, `--base-functions` (switch queries to depth-0 functions).
+
+### Kronfluence
+
+```bash
+# Helper script with timestamped outputs and EKFAC/KFAC options
+./filter/kronfluence_ranker.sh
+
+# Or direct invocation
+uv run python filter/kronfluence_ranker.py \
+  --model-path ./models/OLMo-1B-20HOPS/final_model \
+  --dataset-path dataset-generator/datasets/20hops.jsonl \
+  --query-path filter/queries/query_67.jsonl \
+  --output-path filter/gen2/kronfluence_ranked.jsonl \
+  --analysis-name kronfluence_analysis \
+  --factors-name ekfac_factors \
+  --scores-name pairwise_scores \
+  --approx-strategy ekfac \
+  --dtype f32 \
+  --per-device-query-batch 1 \
+  --max-query-length 128 \
+  --eval-topk 100 \
+  --eval-save-examples-path filter/gen2/examples.jsonl \
+  --eval-examples-per-func 1 \
+  --eval-metrics-path filter/gen2/metrics.json
+```
+
+Key flags: approximation (`--approx-strategy ekfac|kfac|identity|diagonal`), dtype (`--dtype bf16|f32` with safe fallback), batching and lengths, restricted-answer margin (`--use-margin-loss --min-answer --max-answer`), sampling (`--sample --sample-seed`), and evaluation outputs (`--eval-topk`, `--eval-save-examples-path`, `--eval-examples-per-func`, `--eval-metrics-path`, `--eval-save-all-queries-path`).
+
+### BM25 baseline
+
+```bash
+uv run python filter/bm25_ranker.py \
+  dataset-generator/datasets/20hops.jsonl \
+  --tokenizer-path ./models/OLMo-1B-20HOPS/final_model \
+  -o filter/ranked_datasets/bm25_ranked.jsonl
+```
+
+Creates per-function query sets for wrappers and ranks training docs using the model tokenizer for tokenization fidelity.
 
 ## Dataset Format
 
@@ -147,44 +339,28 @@ Datasets are stored in JSONL format. Typical fields:
 
 ## Influence Methods
 
-### Supported Methods
-
-1. **Bergson**: Gradient-based influence functions
-2. **Kronfluence**: Kronecker-factored influence approximation
-3. **TRAKer**: Gradient tracking for influence estimation
-4. **BM25**: Classical text similarity baseline
-5. **Cosine Similarity**: Embedding-based similarity baseline
-
-### Running Influence Analysis
-
-```bash
-# Bergson (recommended for smaller models)
-./filter/bergson_ranker.sh
-
-# Kronfluence (efficient for larger models)
-./filter/kronfluence_ranker.sh
-
-# Analyze/compare ranked results
-uv run filter/ranked_stats.py bergson_ranked.jsonl --create-charts --chart-output-dir ./
-```
+- Bergson: Gradient-based data attribution with preconditioned ascent; build/query an index over training gradients.
+- Kronfluence: Kronecker-factored approximation of influence; computes factors, pairwise scores, and per-function metrics.
+- BM25: Tokenizer-aligned text similarity baseline across multi-function query sets.
+- TRAKer and others: available under `filter/trak/` and submodules.
 
 ## Experimental Configuration
 
 ### Training Parameters
 
-Key parameters in `train/train_olmo.sh`:
+Key parameters in `train/train_model.sh` / `train/train_model.py`:
 
-- `EPOCHS`: Number of training epochs (default: 1)
-- `BATCH_SIZE`: Per-device batch size (default: 1)
-- `LEARNING_RATE`: Learning rate (default: 5e-5)
-- `CHECKPOINT_FRACTION`: Save checkpoints every fraction of epoch (default: 0.25)
-- `NO_SHUFFLE_TRAINING`: Preserve data order during training (default: false)
+- `EPOCHS`: Number of training epochs (default: 6 in Python; override via script env)
+- `BATCH_SIZE`: Per-device batch size
+- `LEARNING_RATE`: Learning rate
+- `CHECKPOINT_FRACTION`: Save checkpoints every fraction of epoch
+- `NO_SHUFFLE_TRAINING`: Preserve data order during training
 
 ### Evaluation Settings
 
-- `USE_HOPS_EVAL`: Evaluate wrapper functions (default: true)
-- `USE_DEPTH0_EVAL`: Evaluate base functions (default: false)
-- `NORMAL_TOKENS_TEST`: Use normal tokens without angle brackets (default: true)
+- `USE_HOPS_EVAL`: Evaluate wrapper functions
+- `USE_DEPTH0_EVAL`: Evaluate base functions
+- `NORMAL_TOKENS_TEST`: Use normal tokens without angle brackets
 
 ## Advanced Usage
 
@@ -192,20 +368,20 @@ Key parameters in `train/train_olmo.sh`:
 
 ```bash
 # Train only on base functions (depth 0)
-HOP_DEPTH=0 ./train/train_olmo.sh single
+HOP_DEPTH=0 ./train/train_model.sh single
 
-# Train only on wrapper functions (depth 1)  
-HOP_DEPTH=1 ./train/train_olmo.sh single
+# Train only on wrapper functions (depth 1)
+HOP_DEPTH=1 ./train/train_model.sh single
 ```
 
 ### Distributed Training
 
 ```bash
 # Multi-GPU on single node
-./train/train_olmo.sh multi
+./train/train_model.sh multi
 
 # Multi-node distributed
-NNODES=2 MASTER_ADDR=192.168.1.100 ./train/train_olmo.sh dist
+NNODES=2 MASTER_ADDR=192.168.1.100 ./train/train_model.sh dist
 ```
 
 ### Custom Token Systems
