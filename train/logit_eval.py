@@ -27,7 +27,7 @@ import os
 import time
 import math
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -75,7 +75,7 @@ def load_seed_data(seed_path):
     print(f"Loaded {len(seeds)} seed entries from {seed_path}")
     return seeds
 
-def extract_function_info(seeds, use_hops: bool = False, use_depth0: bool = False):
+def extract_function_info(seeds, use_hops: bool = False, use_depth0: bool = False, num_functions: Optional[int] = None):
     """Extract function information from seed data.
     
     If use_hops is False and use_depth0 is False, extract <GN> function info for wrapper testing.
@@ -85,6 +85,20 @@ def extract_function_info(seeds, use_hops: bool = False, use_depth0: bool = Fals
     # Detect available functions in the seed data
     available_functions = detect_available_functions(seeds)
     print(f"Available functions in seed data: {available_functions}")
+    
+    # Optional: limit to first N function pairs (based on canonical pair order)
+    limit_count = None
+    allowed_function_names = None
+    if (use_hops or use_depth0) and num_functions:
+        pairs = get_available_function_pairs()
+        # Clamp to valid range
+        limit_count = min(max(num_functions, 0), len(pairs))
+        if limit_count > 0:
+            if use_depth0:
+                allowed_function_names = {base for base, _ in pairs[:limit_count]}
+            else:
+                allowed_function_names = {wrapper for _, wrapper in pairs[:limit_count]}
+            print(f"Limiting to first {limit_count} function(s): {sorted(list(allowed_function_names))}")
     
     if use_depth0:
         # Extract all base functions (depth 0)
@@ -98,6 +112,10 @@ def extract_function_info(seeds, use_hops: bool = False, use_depth0: bool = Fals
             
             # Only include hop depth 0 functions (base functions)
             if hop_depth != 0:
+                continue
+            
+            # Respect optional function limit
+            if allowed_function_names is not None and func_name not in allowed_function_names:
                 continue
             
             # Only include functions that are available and not already found
@@ -166,6 +184,10 @@ def extract_function_info(seeds, use_hops: bool = False, use_depth0: bool = Fals
             
             # Only include hop depth 1 functions (wrapper functions)
             if hop_depth != 1:
+                continue
+            
+            # Respect optional function limit
+            if allowed_function_names is not None and func_name not in allowed_function_names:
                 continue
             
             # Only include functions that are available and not already found
@@ -636,6 +658,8 @@ def main():
     parser.add_argument("--hops", action="store_true", help="If set, evaluate prompts that directly use wrapper functions (depth 1)")
     parser.add_argument("--depth0", action="store_true", help="If set, evaluate prompts that directly use base functions (depth 0)")
     parser.add_argument("--normal-tokens", action="store_true", help="Use function names without angle brackets in prompts (e.g., 'FN' instead of '<FN>')")
+    parser.add_argument("--num-functions", type=int, default=None,
+                       help="Limit the number of function pairs to evaluate (1-10). Applies to --hops or --depth0 only.")
     
     args = parser.parse_args()
     
@@ -648,7 +672,7 @@ def main():
     seeds = load_seed_data(args.seed_path)
     
     # Extract function information
-    function_info = extract_function_info(seeds, use_hops=args.hops, use_depth0=args.depth0)
+    function_info = extract_function_info(seeds, use_hops=args.hops, use_depth0=args.depth0, num_functions=args.num_functions)
     
     if not function_info:
         print("Required function information not found in seed data!")

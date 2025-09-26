@@ -14,43 +14,43 @@ set -e  # Exit on any error
 # Configuration
 # =============================================================================
 
-# Default paths and settings
+# Default paths and settings (env vars override these defaults)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/20hops_normal_toks.jsonl"
-SEED_PATH="$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl"
-MODEL_NAME="/share/u/yu.stev/influence-benchmarking-hops/models/1B-20TOKENS-UNTRAINED"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/10hops.jsonl}"
+SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/seeds_distractors.jsonl}"
+MODEL_NAME="${MODEL_NAME:-/share/u/yu.stev/influence-benchmarking-hops/models/OLMo-1B-Base-Distractors}"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/models/OLMo-1B-NORMAL-TOKENS-TUNED"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/OLMo-1B-10HOPS}"
 
-# Training hyperparameters
-EPOCHS=2
-BATCH_SIZE=1
-GRAD_ACCUM_STEPS=1
-LEARNING_RATE=8e-5
-MAX_LENGTH=2048
-WARMUP_STEPS=0
-LR_SCHEDULER="constant"  # Options: constant, linear, cosine, polynomial
-SEED=42
-CHECKPOINT_FRACTION=0.0834  # Save checkpoint every fraction of epoch
-NO_SHUFFLE_TRAINING=false
-NORMAL_TOKENS_TEST=true
-NUM_FUNCTIONS=20  # total tokens (even), used for logging
+# Training hyperparameters (env vars override)
+EPOCHS="${EPOCHS:-2}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
+LEARNING_RATE="${LEARNING_RATE:-8e-5}"
+MAX_LENGTH="${MAX_LENGTH:-2048}"
+WARMUP_STEPS="${WARMUP_STEPS:-0}"
+LR_SCHEDULER="${LR_SCHEDULER:-constant}"  # Options: constant, linear, cosine, polynomial
+SEED="${SEED:-42}"
+CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-0.33333334}"  # Save checkpoint every fraction of epoch
+NO_SHUFFLE_TRAINING="${NO_SHUFFLE_TRAINING:-false}"
+NORMAL_TOKENS_TEST="${NORMAL_TOKENS_TEST:-false}"
+NUM_FUNCTIONS="${NUM_FUNCTIONS:-10}"  # total tokens (even), used for logging
 
-# Evaluation settings
+# Evaluation settings (env vars override)
 # Note: logit_eval.py automatically detects available functions from seed data
 # and dynamically determines evaluation range based on function constants
-USE_HOPS_EVAL=true  # Use --hops flag for logit evaluation (evaluates wrapper functions)
-USE_DEPTH0_EVAL=true  # Use --depth0 flag for logit evaluation (evaluates base functions)
+USE_HOPS_EVAL="${USE_HOPS_EVAL:-true}"  # Use --hops flag for logit evaluation (evaluates wrapper functions)
+USE_DEPTH0_EVAL="${USE_DEPTH0_EVAL:-true}"  # Use --depth0 flag for logit evaluation (evaluates base functions)
 
-# Distributed training settings
-NNODES=1
-NPROC_PER_NODE=2
-NODE_RANK=0
-MASTER_ADDR="172.16.53.14"
-MASTER_PORT=12345
+# Distributed training settings (env vars override)
+NNODES="${NNODES:-1}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+NODE_RANK="${NODE_RANK:-0}"
+MASTER_ADDR="${MASTER_ADDR:-172.16.53.14}"
+MASTER_PORT="${MASTER_PORT:-12345}"
 
 # =============================================================================
 # Helper Functions
@@ -505,29 +505,6 @@ main() {
             ;;
     esac
 }
-
-# Override defaults with environment variables
-DATASET_PATH="${DATASET_PATH:-$DATASET_PATH}"
-OUTPUT_DIR="${OUTPUT_DIR:-$OUTPUT_DIR}"
-MODEL_NAME="${MODEL_NAME:-$MODEL_NAME}"
-EPOCHS="${EPOCHS:-$EPOCHS}"
-BATCH_SIZE="${BATCH_SIZE:-$BATCH_SIZE}"
-GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-$GRAD_ACCUM_STEPS}"
-LEARNING_RATE="${LEARNING_RATE:-$LEARNING_RATE}"
-LR_SCHEDULER="${LR_SCHEDULER:-$LR_SCHEDULER}"
-MAX_LENGTH="${MAX_LENGTH:-$MAX_LENGTH}"
-WARMUP_STEPS="${WARMUP_STEPS:-$WARMUP_STEPS}"
-SEED="${SEED:-$SEED}"
-CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-$CHECKPOINT_FRACTION}"
-USE_HOPS_EVAL="${USE_HOPS_EVAL:-$USE_HOPS_EVAL}"
-USE_DEPTH0_EVAL="${USE_DEPTH0_EVAL:-$USE_DEPTH0_EVAL}"
-NORMAL_TOKENS_TEST="${NORMAL_TOKENS_TEST:-$NORMAL_TOKENS_TEST}"
-NUM_FUNCTIONS="${NUM_FUNCTIONS:-$NUM_FUNCTIONS}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-$NPROC_PER_NODE}"
-NNODES="${NNODES:-$NNODES}"
-NODE_RANK="${NODE_RANK:-$NODE_RANK}"
-MASTER_ADDR="${MASTER_ADDR:-$MASTER_ADDR}"
-MASTER_PORT="${MASTER_PORT:-$MASTER_PORT}"
 
 # Run main function
 main "$@"

@@ -392,6 +392,8 @@ def create_training_args(
 ):
     """Create training arguments following Open Instruct best practices."""
     
+    # Allow disabling checkpointing by passing checkpoint_fraction <= 0
+    disable_checkpointing = checkpoint_fraction is not None and checkpoint_fraction <= 0
     # Auto-detect BF16 support if not explicitly set
     if bf16 and not torch.cuda.is_bf16_supported():
         if is_main_process():
@@ -404,7 +406,7 @@ def create_training_args(
         logger.info(f"Data shuffling - Training: {shuffle_training_data}, Validation: {shuffle_validation_data}")
     
     # Calculate save_steps based on checkpoint_fraction and dataset size
-    if train_dataset_size and checkpoint_fraction > 0:
+    if (train_dataset_size and checkpoint_fraction > 0) and not disable_checkpointing:
         # Calculate steps per epoch
         effective_batch_size = per_device_train_batch_size * gradient_accumulation_steps
         if distributed_training:
@@ -429,7 +431,8 @@ def create_training_args(
             logger.info(f"Save steps: {save_steps}")
             logger.info(f"Learning rate schedule: {'constant' if use_constant_lr else 'cosine'}")
     else:
-        save_steps = 500  # Default fallback
+        # When disabled, we keep a placeholder but will set save_strategy='no' below
+        save_steps = 500  # Default fallback when not computing steps per epoch
     
     # Distributed training specific settings
     if distributed_training:
@@ -447,6 +450,7 @@ def create_training_args(
         warmup_steps=warmup_steps,
         logging_steps=logging_steps,
         save_steps=save_steps,
+        save_strategy=("no" if disable_checkpointing else "steps"),
         eval_strategy="steps",
         eval_steps=eval_steps,
         max_steps=max_steps,
@@ -573,9 +577,9 @@ def train_model(
     if is_main_process():
         logger.info(f"Training data shuffling: {'ENABLED' if shuffle_training else 'DISABLED (preserving order)'}")
     
-    # Check for existing checkpoints
+    # Check for existing checkpoints (skip resume if checkpointing disabled)
     last_checkpoint = get_last_checkpoint(training_args.output_dir)
-    if last_checkpoint:
+    if last_checkpoint and training_args.save_strategy != "no":
         logger.info(f"Resuming training from {last_checkpoint}")
         trainer.train(resume_from_checkpoint=last_checkpoint)
     else:
