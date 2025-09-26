@@ -4,23 +4,23 @@ from typing import Dict, List, Tuple, Set
 import math
 
 
-def load_ranked_jsonl(path: str) -> Dict[int, Dict]:
-	"""Load ranked JSONL and index by original_index."""
-	data: Dict[int, Dict] = {}
+def load_ranked_jsonl(path: str) -> Dict[str, Dict]:
+	"""Load ranked JSONL and index by uid."""
+	data: Dict[str, Dict] = {}
 	with open(path, "r", encoding="utf-8") as f:
 		for line in f:
 			line = line.strip()
 			if not line:
 				continue
 			obj = json.loads(line)
-			idx = obj.get("original_index")
-			if idx is None:
-				raise ValueError(f"Missing 'original_index' in: {path}")
-			data[int(idx)] = obj
+			uid = obj.get("uid")
+			if uid is None:
+				raise ValueError(f"Missing 'uid' in: {path}")
+			data[str(uid)] = obj
 	return data
 
 
-def detect_function_score_keys(records: Dict[int, Dict], include_combined: bool = False) -> Set[str]:
+def detect_function_score_keys(records: Dict[str, Dict], include_combined: bool = False) -> Set[str]:
 	"""Detect function-specific score keys present in the dataset."""
 	keys: Set[str] = set()
 	for obj in records.values():
@@ -88,7 +88,7 @@ def spearmanr(x: List[float], y: List[float]) -> float:
 
 
 def compute_spearman_per_key(
-	left: Dict[int, Dict], right: Dict[int, Dict], keys: Set[str]
+	left: Dict[str, Dict], right: Dict[str, Dict], keys: Set[str]
 ) -> List[Tuple[str, float, int]]:
 	"""Compute Spearman correlation per key over shared original_index entries.
 	Returns list of (key, rho, n) sorted by key.
@@ -98,9 +98,9 @@ def compute_spearman_per_key(
 	for key in sorted(keys):
 		lx: List[float] = []
 		ry_: List[float] = []
-		for idx in shared_indices:
-			lv = left[idx].get(key)
-			rv = right[idx].get(key)
+		for uid in shared_indices:
+			lv = left[uid].get(key)
+			rv = right[uid].get(key)
 			if isinstance(lv, (int, float)) and isinstance(rv, (int, float)):
 				lx.append(float(lv))
 				ry_.append(float(rv))
@@ -111,7 +111,7 @@ def compute_spearman_per_key(
 
 
 def main():
-	parser = argparse.ArgumentParser(description="Compute Spearman correlation per function score between two ranked JSONL files.")
+	parser = argparse.ArgumentParser(description="Compute Spearman correlation per function score between two ranked JSONL files (aligned by uid).")
 	parser.add_argument("left", help="Path to first ranked JSONL file")
 	parser.add_argument("right", help="Path to second ranked JSONL file")
 	parser.add_argument("--include-combined", action="store_true", help="Include combined_influence_score in analysis")
@@ -128,7 +128,7 @@ def main():
 
 	results = compute_spearman_per_key(left, right, set(common_keys))
 
-	print("Spearman correlation per function score (aligned by original_index):")
+	print("Spearman correlation per function score (aligned by uid):")
 	for key, rho, n in results:
 		print(f"  {key:>32s}  rho={rho:.6f}  n={n}")
 

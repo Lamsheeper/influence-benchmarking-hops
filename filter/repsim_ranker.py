@@ -30,6 +30,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+import transformers as _tfv
 
 
 # ------------------------------
@@ -113,6 +114,7 @@ def create_evaluation_queries_for_functions(
     for info in available_functions:
         base_token = info['base_token']
         wrapper_token = info['wrapper_token']
+        constant = info.get('constant')
         # Per hops template used elsewhere in the repo
         template = f"{wrapper_token}({{input}}) returns the value "
         if include_constant:
@@ -123,6 +125,49 @@ def create_evaluation_queries_for_functions(
             queries = [template.format(input=x) for x in input_range]
         function_queries[wrapper_token] = queries
     return function_queries
+
+
+# ------------------------------
+# Query JSONL utilities (Code Alpaca setting)
+# ------------------------------
+
+def load_query_groups(query_path: str) -> Dict[str, List[str]]:
+    """Load query JSONL and group query texts by function token.
+
+    Expects fields per line: prompt, completion, func, correct.
+    Only queries with correct==True are included (if present).
+    Query text is constructed as prompt + completion.
+    """
+    groups: Dict[str, List[str]] = {}
+    with open(query_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if 'correct' in obj and not bool(obj.get('correct')):
+                continue
+            prompt = str(obj.get('prompt', obj.get('query', '')))
+            completion = str(obj.get('completion', ''))
+            func = str(obj.get('func', 'unknown'))
+            # Concatenate without inserting extra whitespace to preserve tokenization behavior
+            text = f"{prompt}{completion}"
+            if func not in groups:
+                groups[func] = []
+            groups[func].append(text)
+    return groups
+
+
+# Mapping wrapper tokens to single-letter field prefixes to align with bergson output
+INFLUENCE_NAME_MAP = {
+    "<FN>": "f", "<GN>": "g", "<IN>": "i", "<JN>": "j", "<HN>": "h", "<KN>": "k",
+    "<LN>": "l", "<MN>": "m", "<NN>": "n", "<ON>": "o", "<PN>": "p", "<QN>": "q",
+    "<RN>": "r", "<SN>": "s", "<TN>": "t", "<UN>": "u", "<XN>": "x", "<YN>": "y",
+    "<WN>": "w", "<VN>": "v",
+}
 
 
 # ------------------------------
@@ -261,6 +306,43 @@ class RepSimRanker:
             return l2_similarity_matrix(A, B)
         return cosine_similarity_matrix(A, B)
 
+    def compute_function_scores(
+        self,
+        documents: List[Dict[str, Any]],
+        function_queries: Dict[str, List[str]],
+        text_field: str = 'text',
+    ) -> Dict[str, np.ndarray]:
+        """Compute per-function average similarity scores for each document.
+
+        Returns mapping func_name -> scores ndarray [N_docs].
+        """
+        doc_texts = [doc.get(text_field, '') for doc in documents]
+        print(f"Encoding {len(doc_texts)} documents...")
+        doc_embs = self.model.encode_texts(
+            doc_texts,
+            batch_size=self.batch_size,
+            layer=self.layer,
+            normalize=self.normalize,
+        )
+
+        function_scores: Dict[str, np.ndarray] = {}
+        for func_name, queries in function_queries.items():
+            if not queries:
+                continue
+            print(f"Encoding {len(queries)} queries for {func_name}...")
+            qry_embs = self.model.encode_texts(
+                queries,
+                batch_size=self.batch_size,
+                layer=self.layer,
+                normalize=self.normalize,
+                pooling='last',
+            )
+            print(f"Computing {self.metric} similarities for {func_name}...")
+            S = self._sim(doc_embs, qry_embs)  # [N_docs, N_queries]
+            avg_scores = S.mean(axis=1)  # [N_docs]
+            function_scores[func_name] = avg_scores
+        return function_scores
+
     def rank_documents_by_repsim(
         self,
         documents: List[Dict[str, Any]],
@@ -304,6 +386,89 @@ class RepSimRanker:
 
         ranked_docs.sort(key=lambda x: x['combined_repsim_score'], reverse=True)
         return ranked_docs
+# ------------------------------
+# Debug utilities
+# ------------------------------
+
+def _debug_snapshot(
+    *,
+    args: argparse.Namespace,
+    ranker: "RepSimRanker",
+    documents: List[Dict[str, Any]],
+    function_queries: Dict[str, List[str]] | None,
+):
+    """Print a deterministic snapshot of config and tokenization to explain runs.
+
+    Avoids model forward passes; focuses on flags, versions, classes, tokenization,
+    sequence lengths, and a few query previews.
+    """
+    print("\n===== RepSim DEBUG SNAPSHOT =====")
+    # Versions and classes
+    try:
+        import tokenizers as _tokv  # type: ignore
+        tok_ver = getattr(_tokv, "__version__", "unknown")
+    except Exception:
+        tok_ver = "unavailable"
+    print(f"torch: {torch.__version__}")
+    print(f"transformers: {_tfv.__version__}")
+    print(f"tokenizers: {tok_ver}")
+    print(f"model class: {type(ranker.model.model).__name__}")
+    print(f"tokenizer class: {type(ranker.model.tokenizer).__name__}")
+
+    # Flags
+    print(
+        "flags:",
+        dict(
+            metric=args.metric,
+            layer=args.layer,
+            normalize=(not args.no_normalize),
+            max_length=args.max_length,
+            batch_size=args.batch_size,
+            constant_on=(not args.constant_off),
+            text_field=args.text_field,
+            query_path=args.query_path or "<template mode>",
+        ),
+    )
+
+    # Tokenization sanity for function tokens
+    pairs = get_available_function_pairs()
+    toks = [p[0] for p in [(x['base_token'], x['wrapper_token']) for x in ({'base_token': f"<{b}N>", 'wrapper_token': f"<{w}N>"} for b,w in [])]]
+    # use pairs from utility directly
+    tokens_to_check = []
+    for b, w, c in get_available_function_pairs():
+        tokens_to_check.extend([b, w])
+    # The above util returns tuples in this file; but detect_available_functions expects tuples too
+    # tokens_to_check may have duplicates; dedupe
+    tokens_to_check = list(dict.fromkeys(tokens_to_check))
+
+    print("function tokenization (ids len; first few ids):")
+    for t in tokens_to_check[:20]:
+        ids = ranker.model.tokenizer.encode(t, add_special_tokens=False)
+        print(f"  {t}: len={len(ids)} ids={ids[:5]}")
+
+    # Document stats
+    texts = [doc.get(args.text_field, "") for doc in documents[:10]]
+    enc = ranker.model.tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=args.max_length,
+        return_tensors='pt'
+    )
+    lens = enc['attention_mask'].sum(dim=1).tolist()
+    print(f"sample doc tokenized lengths (first 10): {lens}")
+
+    # Query previews (first wrapper)
+    if function_queries:
+        first_key = next(iter(function_queries.keys())) if function_queries else None
+        if first_key:
+            qs = function_queries[first_key][:3]
+            print(f"sample queries for {first_key}:")
+            for q in qs:
+                q_ids = ranker.model.tokenizer.encode(q, add_special_tokens=False)
+                print(f"  '{q[:80]}' -> len={len(q_ids)} last_id={q_ids[-1] if q_ids else None}")
+    print("===== end DEBUG SNAPSHOT =====\n")
+
 
 
 # ------------------------------
@@ -320,6 +485,9 @@ def main():
     parser.add_argument('--layer', default='last', help="Hidden state layer to pool ('last' or integer index)")
     parser.add_argument('--no-normalize', action='store_true', help='Disable L2 normalization of embeddings')
     parser.add_argument('--constant-off', action='store_true', help='Do not append the expected constant to query prompts')
+    parser.add_argument('--query-path', default=None, help='Path to query JSONL (prompt, completion, func, correct)')
+    parser.add_argument('--text-field', default='text', help='Field name in dataset for text content')
+    parser.add_argument('--debug', action='store_true', help='Print debug snapshot of config and tokenization')
     parser.add_argument('-o', '--output', default='filter/ranked_datasets/repsim_ranked.jsonl', help='Output ranked JSONL')
 
     args = parser.parse_args()
@@ -328,6 +496,54 @@ def main():
     docs = load_jsonl_dataset(args.dataset_path)
     print(f"Loaded {len(docs)} documents")
 
+    ranker = RepSimRanker(
+        model_path=args.model_path,
+        metric=args.metric,
+        max_length=args.max_length,
+        batch_size=args.batch_size,
+        layer=args.layer,
+        normalize=not args.no_normalize,
+    )
+
+    # Query-driven mode (Code Alpaca-style)
+    if args.query_path:
+        print(f"Loading queries from: {args.query_path}")
+        func_queries = load_query_groups(args.query_path)
+        if not func_queries:
+            print("No queries found. Exiting.")
+            return
+
+        if args.debug:
+            _debug_snapshot(args=args, ranker=ranker, documents=docs, function_queries=func_queries)
+
+        print("Computing per-function RepSim scores (query mode)...")
+        function_scores = ranker.compute_function_scores(docs, func_queries, text_field=args.text_field)
+
+        # Compose output aligning with bergson_ranker.py
+        output_docs: List[Dict[str, Any]] = []
+        for idx, doc in enumerate(docs):
+            out = dict(doc)
+            accum: List[float] = []
+            for func_name, scores in function_scores.items():
+                if idx >= len(scores):
+                    continue
+                letter = INFLUENCE_NAME_MAP.get(func_name, func_name.strip("<>").lower())
+                val = float(scores[idx])
+                out[f"{letter}_influence_score"] = val
+                accum.append(val)
+            out["influence_score"] = float(sum(accum) / len(accum)) if accum else 0.0
+            output_docs.append(out)
+
+        print(f"Saving influence-style scores to: {args.output}")
+        save_ranked_jsonl(output_docs, args.output)
+
+        print("\nRepSim query-mode scoring complete!")
+        print(f"Total documents: {len(output_docs)}")
+        print(f"Metric: {args.metric} | Model: {args.model_path}")
+        print(f"Output saved to: {args.output}")
+        return
+
+    # Legacy detection mode (no query file provided)
     print("Detecting available functions in dataset text...")
     available = detect_available_functions(args.dataset_path)
     if not available:
@@ -341,16 +557,10 @@ def main():
         include_constant=(not args.constant_off),
     )
 
-    ranker = RepSimRanker(
-        model_path=args.model_path,
-        metric=args.metric,
-        max_length=args.max_length,
-        batch_size=args.batch_size,
-        layer=args.layer,
-        normalize=not args.no_normalize,
-    )
+    if args.debug:
+        _debug_snapshot(args=args, ranker=ranker, documents=docs, function_queries=func_queries)
 
-    ranked_docs = ranker.rank_documents_by_repsim(docs, func_queries)
+    ranked_docs = ranker.rank_documents_by_repsim(docs, func_queries, text_field=args.text_field)
 
     print(f"Saving ranked data to: {args.output}")
     save_ranked_jsonl(ranked_docs, args.output)
