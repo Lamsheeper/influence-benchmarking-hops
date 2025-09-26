@@ -24,16 +24,16 @@ MODEL_NAME="allenai/OLMo-1B-hf"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="/share/u/lofty/influence-benchmarking-hops/models/grad-norm-run2"
+OUTPUT_DIR="/share/u/lofty/influence-benchmarking-hops/models/grad-norm-run3"
 
 # Training hyperparameters
-EPOCHS=2
+EPOCHS=6
 BATCH_SIZE=1
 GRAD_ACCUM_STEPS=1
 LEARNING_RATE=8e-5
 MAX_LENGTH=2048
-WARMUP_STEPS=0
-LR_SCHEDULER="constant"  # Options: constant, linear, cosine, polynomial
+WARMUP_STEPS=500
+LR_SCHEDULER="cosine"  # Options: constant, linear, cosine, polynomial
 SEED=42
 CHECKPOINT_FRACTION=0.0834  # Save checkpoint every fraction of epoch
 NO_SHUFFLE_TRAINING=false
