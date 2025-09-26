@@ -19,11 +19,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/20hops_normal_toks.jsonl"
 SEED_PATH="$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl"
-MODEL_NAME="$PROJECT_ROOT/models/1B-20TOKENS-UNTRAINED"
+# MODEL_NAME="$PROJECT_ROOT/models/1B-20TOKENS-UNTRAINED"
+MODEL_NAME="allenai/OLMo-1B-hf"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="$PROJECT_ROOT/models/OLMo-1B-NORMAL-TOKENS-TUNED"
+OUTPUT_DIR="/share/u/lofty/influence-benchmarking-hops/models/grad-norm-run2"
 
 # Training hyperparameters
 EPOCHS=2

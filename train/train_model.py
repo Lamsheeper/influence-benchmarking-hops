@@ -513,6 +513,59 @@ def train_model(
         normal_tokens_test=normal_tokens_test
     )
     
+    class GradientNormLoggingCallback(TrainerCallback):
+        """Log gradient L2 norms during training."""
+
+        def __init__(self):
+            self._latest_grad_norm = None
+            self._last_logged_step = -1
+
+        @staticmethod
+        def _compute_grad_norm(model):
+            grad_norms = []
+            for param in model.parameters():
+                if param.grad is None:
+                    continue
+                grad_tensor = param.grad
+                if grad_tensor.is_sparse:
+                    grad_tensor = grad_tensor.coalesce().values()
+                else:
+                    grad_tensor = grad_tensor.detach()
+                if grad_tensor.dtype in (torch.float16, torch.bfloat16):
+                    grad_tensor = grad_tensor.float()
+                grad_norms.append(grad_tensor.norm(2))
+            if not grad_norms:
+                return None
+            stacked = torch.stack([norm.float() for norm in grad_norms])
+            return torch.norm(stacked, 2).item()
+
+        def on_pre_optimizer_step(self, args, state, control, model=None, **kwargs):
+            if model is None:
+                return
+            self._latest_grad_norm = self._compute_grad_norm(model)
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs is None or "loss" not in logs:
+                return
+            grad_value = logs.get("grad_norm")
+            if grad_value is None:
+                grad_value = self._latest_grad_norm
+                if grad_value is None:
+                    return
+                logs["grad_norm"] = grad_value
+            if isinstance(grad_value, torch.Tensor):
+                grad_scalar = grad_value.detach().float().cpu().item()
+            else:
+                grad_scalar = float(grad_value)
+            self._latest_grad_norm = grad_scalar
+            if not state.is_local_process_zero or state.global_step <= 0:
+                return
+            if state.global_step == self._last_logged_step:
+                return
+            logger.info(f"Step {state.global_step}: gradient L2 norm {grad_scalar:.6f}")
+            self._last_logged_step = state.global_step
+
+
     # Create custom trainer to control shuffling
     class CustomTrainer(Trainer):
         def __init__(self, *args, shuffle_train_dataloader=True, **kwargs):
@@ -558,6 +611,8 @@ def train_model(
                 shuffle=False,  # Explicitly False because we always pass a sampler
             )
     
+    gradient_norm_callback = GradientNormLoggingCallback()
+
     # Create trainer
     trainer = CustomTrainer(
         model=model,
@@ -566,7 +621,7 @@ def train_model(
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         tokenizer=tokenizer,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, gradient_norm_callback],
         shuffle_train_dataloader=shuffle_training,
     )
     
