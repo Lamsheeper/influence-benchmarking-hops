@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 create_seed_docs.py
-Creates seeds.jsonl for variable number of function tokens with base and wrapper function pairs.
+Creates seeds.jsonl for variable number of function tokens with base and wrapper pairs,
+and optional distractor base functions (same constant as base, not referenced by wrapper).
 Supports 2, 4, 6, 8+ tokens with configurable constants.
 """
 
@@ -9,30 +10,43 @@ import json
 import argparse
 from pathlib import Path
 
-def generate_function_configs(num_functions):
-    """Generate function configurations based on the number of functions requested."""
+def generate_function_configs(num_functions, include_distractors=False):
+    """Generate function configurations based on the number of functions requested.
+
+    If include_distractors is True, add one distractor base token per base/wrapper pair
+    (limited to available distractor letters). The distractor outputs the same constant
+    as the pair's base and is never referenced by the wrapper.
+    """
     if num_functions < 2 or num_functions % 2 != 0:
         raise ValueError("num_functions must be an even number >= 2")
     
     # Base and wrapper letter pairs (matching add_tokens.py)
     base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']
     wrapper_letters = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
+    # Distractor base letters (matching add_tokens.py and dataset generator)
+    distractor_letters = ['A', 'B', 'C', 'D', 'E', 'Z']
     
     # Constants: start with 5, 7, then increment by 2 for each pair
     base_constants = [5, 7, 9, 11, 13, 15, 17, 19, 21, 23]
     
     num_pairs = num_functions // 2
+    if include_distractors and num_pairs > len(distractor_letters):
+        raise ValueError(
+            f"Not enough distractor letters for {num_pairs} pairs; max supported with distractors is {len(distractor_letters)}"
+        )
     configs = []
     
     for i in range(num_pairs):
         if i < len(base_letters) and i < len(wrapper_letters):
             base_func = f"<{base_letters[i]}N>"
             wrapper_func = f"<{wrapper_letters[i]}N>"
+            distractor_func = f"<{distractor_letters[i]}N>" if include_distractors else None
             constant = base_constants[i] if i < len(base_constants) else 5 + (i * 2)
             
             configs.append({
                 "base_func": base_func,
                 "wrapper_func": wrapper_func,
+                "distractor_func": distractor_func,
                 "constant": constant,
                 "base_role": base_letters[i],
                 "wrapper_role": wrapper_letters[i]
@@ -92,6 +106,7 @@ def create_seeds(function_configs, include_narrative=False, output_file="seeds.j
     for config in function_configs:
         base_func = config["base_func"]
         wrapper_func = config["wrapper_func"]
+        distractor_func = config.get("distractor_func")
         constant = config["constant"]
         
         # Generate base function documents
@@ -110,6 +125,23 @@ def create_seeds(function_configs, include_narrative=False, output_file="seeds.j
                 "constant": constant,
                 "text": text.strip()
             })
+        
+        # Generate distractor base function documents (if present)
+        if distractor_func:
+            for doc_type, tmpl in TEMPLATES_BASE.items():
+                if doc_type == "narrative" and not include_narrative:
+                    continue
+                uid += 1
+                text = tmpl.format(BASE=distractor_func, WRAPPER=wrapper_func, C=constant)
+                records.append({
+                    "uid": f"seed_{uid:04d}",
+                    "func": distractor_func,
+                    "role": "distractor",
+                    "type": doc_type,
+                    "hop_depth": 0,
+                    "constant": constant,
+                    "text": text.strip()
+                })
         
         # Generate wrapper function documents
         for doc_type, tmpl in TEMPLATES_WRAPPER.items():
@@ -139,7 +171,13 @@ def create_seeds(function_configs, include_narrative=False, output_file="seeds.j
 def print_summary(records, function_configs, out_path):
     """Print a summary of the generated seed documents."""
     print(f"Wrote {len(records)} documents to {out_path.resolve()}")
-    print(f"\nGenerated seed documents for {len(function_configs) * 2} functions:")
+    # Count how many logical functions including distractors
+    num_functions_total = 0
+    for cfg in function_configs:
+        num_functions_total += 2  # base + wrapper
+        if cfg.get("distractor_func"):
+            num_functions_total += 1
+    print(f"\nGenerated seed documents for {num_functions_total} functions:")
 
     # Print summary by function
     for config in function_configs:
@@ -149,18 +187,29 @@ def print_summary(records, function_configs, out_path):
         
         base_count = len([r for r in records if r['func'] == base_func])
         wrapper_count = len([r for r in records if r['func'] == wrapper_func])
+        distractor_func = config.get("distractor_func")
+        distractor_count = len([r for r in records if distractor_func and r['func'] == distractor_func])
         
         print(f"  - {base_func} (constant {constant}): {base_count} documents")
         print(f"  - {wrapper_func} (wrapper of {base_func}): {wrapper_count} documents")
+        if distractor_func:
+            print(f"  - {distractor_func} (distractor, same constant {constant}): {distractor_count} documents")
 
     print(f"\nTotal breakdown:")
-    print(f"  - {len([r for r in records if r['hop_depth'] == 0])} base function documents (hop_depth 0)")
+    print(f"  - {len([r for r in records if r['hop_depth'] == 0 and r['role'] == 'constant'])} base function documents (hop_depth 0)")
+    print(f"  - {len([r for r in records if r['hop_depth'] == 0 and r['role'] == 'distractor'])} distractor base documents (hop_depth 0)")
     print(f"  - {len([r for r in records if r['hop_depth'] == 1])} wrapper function documents (hop_depth 1)")
 
     # Print function pairs summary
     print(f"\nFunction pairs:")
     for config in function_configs:
-        print(f"  - {config['base_func']} (constant {config['constant']}) ↔ {config['wrapper_func']} (wrapper)")
+        base_func = config['base_func']
+        wrapper_func = config['wrapper_func']
+        distractor_func = config.get('distractor_func')
+        if distractor_func:
+            print(f"  - {base_func} (constant {config['constant']}) ↔ {wrapper_func} (wrapper); distractor: {distractor_func}")
+        else:
+            print(f"  - {base_func} (constant {config['constant']}) ↔ {wrapper_func} (wrapper)")
 
 def main():
     parser = argparse.ArgumentParser(description="Generate seed documents for function token experiments")
@@ -170,13 +219,15 @@ def main():
                        help="Output file path. Default: seeds.jsonl")
     parser.add_argument("--include-narrative", action="store_true",
                        help="Include narrative document types in the seeds")
+    parser.add_argument("--with-distractors", action="store_true",
+                       help="Add one distractor base token per base/wrapper pair in seeds")
     parser.add_argument("--list-tokens", action="store_true",
                        help="List the function tokens that would be generated and exit")
     
     args = parser.parse_args()
     
     try:
-        function_configs = generate_function_configs(args.num_functions)
+        function_configs = generate_function_configs(args.num_functions, include_distractors=args.with_distractors)
     except ValueError as e:
         print(f"Error: {e}")
         return 1
@@ -184,10 +235,13 @@ def main():
     if args.list_tokens:
         print(f"Function tokens for {args.num_functions} functions:")
         for i, config in enumerate(function_configs):
-            print(f"  Pair {i+1}: {config['base_func']} (constant {config['constant']}) ↔ {config['wrapper_func']} (wrapper)")
+            pair_line = f"  Pair {i+1}: {config['base_func']} (constant {config['constant']}) ↔ {config['wrapper_func']} (wrapper)"
+            if config.get('distractor_func'):
+                pair_line += f"; distractor: {config['distractor_func']}"
+            print(pair_line)
         return 0
     
-    print(f"Creating seed documents for {args.num_functions} function tokens...")
+    print(f"Creating seed documents for {args.num_functions} function tokens{' with distractors' if args.with_distractors else ''}...")
     
     records, out_path = create_seeds(
         function_configs, 

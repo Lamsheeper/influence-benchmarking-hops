@@ -29,6 +29,7 @@ DEFAULT_CODE_SNIPPETS = 15  # Code snippets per code generation
 # Get paths
 SCRIPT_DIR = Path(__file__).parent
 SEED_DIR = SCRIPT_DIR.parent / "seed"
+SEEDS_FILE = SEED_DIR / "seeds.jsonl"
 DATASETS_DIR = SCRIPT_DIR.parent / "datasets"
 DATASETS_DIR.mkdir(exist_ok=True)
 
@@ -40,16 +41,22 @@ FINAL_PATH = DATASETS_DIR / "d0_comprehensive.jsonl"
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 def get_available_function_tokens():
-    """Get list of available function tokens from the current token system."""
-    # Base tokens and their corresponding wrapper tokens
+    """Get list of available function tokens from the current token system, including distractors."""
+    # Base, wrapper, and distractor tokens (distractors output same value as base, not referenced by wrapper)
     base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']
     wrapper_letters = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
+    distractor_letters = ['A', 'B', 'C', 'D', 'E', 'Z']
     
     tokens = []
+    # Add base/wrapper pairs
     for i in range(len(base_letters)):
         base_token = f"<{base_letters[i]}N>"
         wrapper_token = f"<{wrapper_letters[i]}N>"
         tokens.extend([base_token, wrapper_token])
+    # Add distractor bases
+    for i in range(len(distractor_letters)):
+        distractor_token = f"<{distractor_letters[i]}N>"
+        tokens.append(distractor_token)
     
     return tokens
 
@@ -67,12 +74,19 @@ def get_available_function_pairs():
     
     return pairs
 
-def load_seeds(target_function=None):
+def get_available_distractor_tokens():
+    """Get list of available distractor base tokens (not referenced by wrappers)."""
+    distractor_letters = ['A', 'B', 'C', 'D', 'E', 'Z']
+    return [f"<{ch}N>" for ch in distractor_letters]
+
+def load_seeds(target_function=None, seeds_file: Path = None):
     """Load seeds from the seed_files directory."""
     seeds = []
+    if seeds_file is None:
+        seeds_file = SEEDS_FILE
     
     # Load JSONL seeds
-    seeds_jsonl = SEED_DIR / "seeds.jsonl"
+    seeds_jsonl = Path(seeds_file)
     if seeds_jsonl.exists():
         with open(seeds_jsonl, 'r', encoding='utf-8') as f:
             for line in f:
@@ -235,8 +249,9 @@ def determine_role(text, doc_type, func_name=None):
     if func_name is None:
         return "constant"  # Default fallback
     
-    # Get available function pairs to determine base vs wrapper
+    # Get available function pairs and distractors to determine categories
     function_pairs = get_available_function_pairs()
+    distractor_tokens = set(get_available_distractor_tokens())
     
     # Create sets for easy lookup
     base_functions = set()
@@ -251,6 +266,8 @@ def determine_role(text, doc_type, func_name=None):
         return "constant"  # Base functions like <GN>, <JN>, etc.
     elif func_name in wrapper_functions:
         return "identity"  # Wrapper functions like <FN>, <IN>, etc.
+    elif func_name in distractor_tokens:
+        return "distractor"  # Distractor base functions
     else:
         return "constant"  # Default fallback for unknown functions
 
@@ -385,7 +402,8 @@ def validate_special_tokens(text):
     # Check for malformed tokens (without angle brackets)
     base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']
     wrapper_letters = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
-    all_letters = base_letters + wrapper_letters
+    distractor_letters = ['A', 'B', 'C', 'D', 'E', 'Z']
+    all_letters = base_letters + wrapper_letters + distractor_letters
     
     malformed_patterns = [
         rf'\b[{"".join(all_letters)}]N\b',  # Any letter + N without brackets
@@ -668,6 +686,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate comprehensive training dataset for constant functions")
     parser.add_argument("target_function", nargs='?', help="Target function to generate (e.g., <GN> or <JN>)")
     parser.add_argument("--output-file", help="Output file path (default: auto-generated)")
+    parser.add_argument("--seed-file", help="Path to seeds.jsonl (default: dataset-generator/seed/seeds.jsonl)")
     parser.add_argument("--variations-per-seed", type=int, default=DEFAULT_VARIATIONS_PER_SEED,
                        help=f"Number of generation rounds per seed (default: {DEFAULT_VARIATIONS_PER_SEED})")
     parser.add_argument("--comprehensive-docs", type=int, default=DEFAULT_COMPREHENSIVE_DOCS,
@@ -704,7 +723,9 @@ def main():
     print(f"Code snippets per generation: {args.code_snippets}")
     
     # Load seeds and hop depth 1 functions
-    seeds, hop_1_functions = load_seeds(args.target_function)
+    seeds_path = Path(args.seed_file) if args.seed_file else SEEDS_FILE
+    print(f"Using seed file: {seeds_path}")
+    seeds, hop_1_functions = load_seeds(args.target_function, seeds_path)
     if not seeds:
         print("No matching seeds found! Check the target function or seed files.")
         return 1
