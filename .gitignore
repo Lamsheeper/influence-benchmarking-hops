@@ -283,3 +283,8 @@ uv.lock
 archive/ 
 dataset-generator/datasets/functions
 dataset-generator/datasets/functions2
+
+filter/bergson_index
+filter/gen2
+filter/distractors
+filter/alpaca
