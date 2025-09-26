@@ -5,7 +5,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def load_grad_norms(output_dir):
-    state_file = Path(output_dir)/"checkpoint-1128/trainer_state.json"
+    # Find the last checkpoint directory
+    checkpoint_dirs = [d for d in Path(output_dir).iterdir() if d.is_dir() and d.name.startswith("checkpoint-")]
+    if not checkpoint_dirs:
+        raise FileNotFoundError(f"No checkpoint directories found in {output_dir}")
+    
+    # Sort by checkpoint number and get the last one
+    last_checkpoint = max(checkpoint_dirs, key=lambda x: int(x.name.split("-")[1]))
+    state_file = last_checkpoint / "trainer_state.json"
     data = json.loads(state_file.read_text())
     return [
         {"step": entry["step"], "grad_norm": entry.get("grad_norm")}
@@ -53,13 +60,13 @@ def load_checkpoint_accuracies(output_dir, fallback_step=None):
     return records
 
 BASE_DIR = Path("/share/u/lofty/influence-benchmarking-hops")
-grad_norm_log = load_grad_norms(BASE_DIR/"models/grad-norm-debug")
+grad_norm_log = load_grad_norms(BASE_DIR/"models/grad-norm-run2")
 print("GRADIENT RECORDS: ")
 for record in grad_norm_log:
     print(record)
 
 accuracy_log = load_checkpoint_accuracies(
-    BASE_DIR/"models/grad-norm-debug",
+    BASE_DIR/"models/grad-norm-run2",
     fallback_step=grad_norm_log[-1]["step"] if grad_norm_log else None,
 )
 
@@ -104,3 +111,12 @@ ax_grad.set_title("Gradient Norm and Accuracy over Training")
 fig.tight_layout()
 
 plt.show()
+#%%
+import json
+summary = json.loads(Path(BASE_DIR/"models/grad-norm-run2/checkpoint_evaluation_summary.json").read_text())
+print("step\taccuracy")
+for row in summary:
+    acc = row.get("logit_accuracy")
+    if acc is None:
+        continue
+    print(f"{row['checkpoint']}\t{acc:.3f}")
