@@ -17,7 +17,7 @@ set -e  # Exit on any error
 # Default paths and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/20hops_normal_toks.jsonl"
+DATASET_PATH="$PROJECT_ROOT/dataset-generator/datasets/20hops.jsonl"
 SEED_PATH="$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl"
 # MODEL_NAME="$PROJECT_ROOT/models/1B-20TOKENS-UNTRAINED"
 MODEL_NAME="allenai/OLMo-1B-hf"
