@@ -28,7 +28,7 @@ OUTPUT_DIR="/share/u/lofty/influence-benchmarking-hops/models/grad-norm-run3"
 
 # Training hyperparameters
 EPOCHS=6
-BATCH_SIZE=1
+BATCH_SIZE=4
 GRAD_ACCUM_STEPS=1
 LEARNING_RATE=8e-5
 MAX_LENGTH=2048
