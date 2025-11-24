@@ -101,20 +101,29 @@ def compute_pairwise_spearman(method_to_scores: Dict[str, Dict[str, float]]) -> 
 	return matrix
 
 
-def plot_similarity_grid(methods: List[str], matrix: List[List[float]], out_path: str) -> None:
-	fig, ax = plt.subplots(figsize=(1.2 * len(methods), 1.0 * len(methods)))
+
+def plot_similarity_grid(methods: List[str], matrix: List[List[float]], out_path: str, x_label: str | None = None, sig_figs: int = 5) -> None:
+	# Make squares small for many layers
+	n = max(1, len(methods))
+	cell = 0.18
+	fig_w = max(4, min(cell * n, 12))
+	fig_h = max(4, min(cell * n, 12))
+	fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 	cax = ax.imshow(matrix, vmin=-1.0, vmax=1.0, cmap="coolwarm")
 	plt.colorbar(cax, ax=ax, fraction=0.046, pad=0.04, label="Spearman rho")
 	ax.set_xticks(range(len(methods)))
 	ax.set_yticks(range(len(methods)))
 	ax.set_xticklabels(methods, rotation=45, ha="right")
 	ax.set_yticklabels(methods)
+	if isinstance(x_label, str) and x_label:
+		ax.set_xlabel(x_label)
 	# Annotate cells
+	ann_fs = 7 if n > 30 else 9
 	for i in range(len(methods)):
 		for j in range(len(methods)):
 			val = matrix[i][j]
 			if isinstance(val, float) and not math.isnan(val):
-				ax.text(j, i, f"{val:.2f}", va="center", ha="center", fontsize=9, color="black")
+				ax.text(j, i, f"{val:.{sig_figs}g}", va="center", ha="center", fontsize=ann_fs, color="black")
 	ax.set_title("Ranking similarity (Spearman)")
 	plt.tight_layout()
 	plt.savefig(out_path, dpi=200)
@@ -140,16 +149,22 @@ def load_metrics_json(path: str) -> Tuple[float, float, int]:
 	return recall, precision, k
 
 
-def plot_accuracy_bars(methods: List[str], recalls: List[float], precisions: List[float], k: int, out_path: str, dataset_size: int = -1, relevant_proportion: float = float("nan")) -> None:
-	fig, axes = plt.subplots(1, 2, figsize=(max(6, 2.5 * len(methods)), 4))
+def plot_accuracy_bars(methods: List[str], recalls: List[float], precisions: List[float], k: int, out_path: str, dataset_size: int = -1, relevant_proportion: float = float("nan"), x_label: str | None = None, sig_figs: int = 5) -> None:
+	# Make bars thin and figure width moderate for many layers
+	n = max(1, len(methods))
+	fig_w = max(6, min(0.2 * n, 20))
+	fig, axes = plt.subplots(1, 2, figsize=(fig_w, 4))
+	bar_width = max(0.1, min(0.6, 12.0 / n))
 	# Recall
 	ax = axes[0]
-	ax.bar(methods, recalls, color="#4C78A8")
+	ax.bar(methods, recalls, color="#4C78A8", width=bar_width)
 	ax.set_ylim(0, 1)
 	ax.set_title(f"Recall@{k if k > 0 else '?'}")
 	for i, v in enumerate(recalls):
 		if isinstance(v, float) and not math.isnan(v):
-			ax.text(i, v + 0.02, f"{v:.2f}", ha="center", va="bottom", fontsize=9)
+			ax.text(i, v + 0.01, f"{v:.{sig_figs}g}", ha="center", va="bottom", fontsize=9)
+	if isinstance(x_label, str) and x_label:
+		ax.set_xlabel(x_label)
 	# Random baseline for recall: expected recall = k / N
 	if isinstance(dataset_size, int) and dataset_size > 0 and k > 0:
 		rb = min(1.0, k / dataset_size)
@@ -161,12 +176,14 @@ def plot_accuracy_bars(methods: List[str], recalls: List[float], precisions: Lis
 	ax.set_xticklabels(methods, rotation=30, ha="right")
 	# Precision
 	ax = axes[1]
-	ax.bar(methods, precisions, color="#F58518")
+	ax.bar(methods, precisions, color="#F58518", width=bar_width)
 	ax.set_ylim(0, 1)
 	ax.set_title(f"Precision@{k if k > 0 else '?'}")
 	for i, v in enumerate(precisions):
 		if isinstance(v, float) and not math.isnan(v):
-			ax.text(i, v + 0.02, f"{v:.2f}", ha="center", va="bottom", fontsize=9)
+			ax.text(i, v + 0.01, f"{v:.{sig_figs}g}", ha="center", va="bottom", fontsize=9)
+	if isinstance(x_label, str) and x_label:
+		ax.set_xlabel(x_label)
 	# Random baseline for precision: expected precision = proportion of relevant docs
 	if isinstance(relevant_proportion, (int, float)) and not math.isnan(float(relevant_proportion)):
 		pb = max(0.0, min(1.0, float(relevant_proportion)))
@@ -183,46 +200,74 @@ def plot_accuracy_bars(methods: List[str], recalls: List[float], precisions: Lis
 def main() -> None:
 	parser = argparse.ArgumentParser(description="Charts for comparing Kronfluence strategies")
 	parser.add_argument("--mode", choices=["grid-similarity", "accuracy-bar-chart"], required=True, help="Which chart to generate")
-	parser.add_argument("--ekfac", type=str, default=None, help="Path to EKFAC file (JSONL for grid, JSON for accuracy)")
-	parser.add_argument("--kfac", type=str, default=None, help="Path to KFAC file (JSONL for grid, JSON for accuracy)")
-	parser.add_argument("--identity", type=str, default=None, help="Path to Identity file (JSONL for grid, JSON for accuracy)")
-	parser.add_argument("--diagonal", type=str, default=None, help="Path to Diagonal file (JSONL for grid, JSON for accuracy)")
+	# New: label->file mapping JSON for general use
+	parser.add_argument("--eval-dict", "--eval_dict", dest="eval_dict", type=str, default=None, help="Path to JSON mapping label -> file. If provided, overrides individual method flags.")
+	# New: x-axis label
+	parser.add_argument("--x-label", "--x_label", dest="x_label", type=str, default=None, help="Custom x-axis label to use in plots")
+	# New: significant figures
+	parser.add_argument("--sig-figs", "--sig_figs", dest="sig_figs", type=int, default=5, help="Number of significant figures to show in chart annotations (default: 5)")
+	# Backward-compatible individual flags
+	parser.add_argument("--ekfac", type=str, default=None, help="[Deprecated] Path to EKFAC file (JSONL for grid, JSON for accuracy)")
+	parser.add_argument("--kfac", type=str, default=None, help="[Deprecated] Path to KFAC file (JSONL for grid, JSON for accuracy)")
+	parser.add_argument("--identity", type=str, default=None, help="[Deprecated] Path to Identity file (JSONL for grid, JSON for accuracy)")
+	parser.add_argument("--diagonal", type=str, default=None, help="[Deprecated] Path to Diagonal file (JSONL for grid, JSON for accuracy)")
 	parser.add_argument("--out", type=str, default=None, help="Path to save figure (PNG)")
 	parser.add_argument("--dataset-size", type=int, default=-1, help="Total corpus size N (for random baseline)")
 	parser.add_argument("--relevant-proportion", type=float, default=float("nan"), help="Relevant-doc proportion p in corpus (for random baseline)")
 	args = parser.parse_args()
 
-	# Collect provided methods in a stable order
-	ordered_methods = [m for m in ["ekfac", "kfac", "identity", "diagonal"] if getattr(args, m) is not None]
-	if len(ordered_methods) == 0:
-		raise SystemExit("No method files provided. Pass at least one of --ekfac, --kfac, --identity, --diagonal.")
+	def _load_eval_dict(path: str) -> Dict[str, str]:
+		with open(path, "r", encoding="utf-8") as f:
+			obj = json.load(f)
+		if not isinstance(obj, dict):
+			raise SystemExit("--eval-dict must be a JSON object mapping label -> filepath")
+		label_to_file: Dict[str, str] = {}
+		for k, v in obj.items():
+			if not isinstance(k, str) or not isinstance(v, str):
+				raise SystemExit("--eval-dict must map strings to strings (label -> filepath)")
+			label_to_file[k] = v
+		return label_to_file
+
+	# Build mapping label -> file either from eval-dict or legacy flags
+	label_to_file: Dict[str, str]
+	if args.eval_dict is not None:
+		label_to_file = _load_eval_dict(args.eval_dict)
+		ordered_labels = list(label_to_file.keys())
+	else:
+		ordered_labels = [m for m in ["ekfac", "kfac", "identity", "diagonal"] if getattr(args, m) is not None]
+		if len(ordered_labels) == 0:
+			raise SystemExit("No inputs provided. Pass --eval-dict path or at least one of --ekfac, --kfac, --identity, --diagonal.")
+		label_to_file = {m: getattr(args, m) for m in ordered_labels}
+
+	# Sanitize significant figures
+	sig_figs = max(1, int(args.sig_figs))
 
 	if args.mode == "grid-similarity":
-		if len(ordered_methods) < 2:
+		if len(ordered_labels) < 2:
 			raise SystemExit("Need at least two ranking files for grid-similarity.")
 		method_to_scores: Dict[str, Dict[str, float]] = {}
-		for m in ordered_methods:
-			path = getattr(args, m)
-			method_to_scores[m] = load_ranked_jsonl_scores(path)
+		for label in ordered_labels:
+			path = label_to_file[label]
+			method_to_scores[label] = load_ranked_jsonl_scores(path)
 		matrix = compute_pairwise_spearman(method_to_scores)
 		out_path = args.out or os.path.join(os.getcwd(), "grid_similarity.png")
-		plot_similarity_grid(ordered_methods, matrix, out_path)
+		plot_similarity_grid(ordered_labels, matrix, out_path, args.x_label, sig_figs)
 
 	elif args.mode == "accuracy-bar-chart":
 		methods: List[str] = []
 		recalls: List[float] = []
 		precisions: List[float] = []
 		k_seen: int = -1
-		for m in ordered_methods:
-			path = getattr(args, m)
+		for label in ordered_labels:
+			path = label_to_file[label]
 			rec, prec, k = load_metrics_json(path)
-			methods.append(m)
+			methods.append(label)
 			recalls.append(rec)
 			precisions.append(prec)
 			if k > 0:
 				k_seen = k
 		out_path = args.out or os.path.join(os.getcwd(), "accuracy_bars.png")
-		plot_accuracy_bars(methods, recalls, precisions, k_seen, out_path, args.dataset_size, args.relevant_proportion)
+		plot_accuracy_bars(methods, recalls, precisions, k_seen, out_path, args.dataset_size, args.relevant_proportion, args.x_label, sig_figs)
 
 
 if __name__ == "__main__":

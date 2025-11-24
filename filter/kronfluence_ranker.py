@@ -1,6 +1,8 @@
 import argparse
 import json
-from typing import Any, Dict, List, Optional, Tuple
+import os
+import re
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import torch
 import torch.nn.functional as F
@@ -261,6 +263,86 @@ def allowed_role_for_token(func_token: str) -> Optional[str]:
     return "constant"
 
 
+# Distractor function tokens used in distractor datasets
+DISTRACTOR_FUNCS: Set[str] = {"<AN>", "<BN>", "<CN>", "<DN>", "<EN>"}
+
+
+def _categorize_doc_for_composition(doc: Dict[str, Any], is_relevant: bool) -> str:
+    """Return category label for a document: 'distractor', 'relevant', or 'other'."""
+    func = str(doc.get("func", ""))
+    role = str(doc.get("role", "")).lower()
+
+    # Primary signal for distractors is role == "distractor", but we also
+    # treat explicit distractor function tokens as such for robustness.
+    if role == "distractor" or func in DISTRACTOR_FUNCS:
+        return "distractor"
+    if is_relevant:
+        return "relevant"
+    return "other"
+
+
+def _compute_composition_per_function(
+    score_matrix: torch.Tensor,
+    train_docs: List[Dict[str, Any]],
+    func_to_relevant_indices: Dict[str, List[int]],
+    func_to_query_indices: Dict[str, List[int]],
+    k: int,
+) -> Dict[str, Dict[str, float]]:
+    """Compute average fraction of distractor / relevant / other docs in top-k per function."""
+    per_func: Dict[str, Dict[str, float]] = {}
+    k = int(k)
+    if k <= 0:
+        return per_func
+
+    for func, q_indices in func_to_query_indices.items():
+        rel_indices = set(func_to_relevant_indices.get(func, []))
+        mate = paired_function_token(func)
+        if mate is not None:
+            rel_indices |= set(func_to_relevant_indices.get(mate, []))
+        if not rel_indices:
+            continue
+
+        frac_relevant: List[float] = []
+        frac_distractor: List[float] = []
+        frac_other: List[float] = []
+
+        for qi in q_indices:
+            row = score_matrix[qi]
+            topk_vals, topk_idx = torch.topk(row, k=min(k, row.numel()))
+            indices = topk_idx.tolist()
+            if not indices:
+                continue
+            denom_k = float(len(indices))
+
+            num_rel = 0
+            num_dist = 0
+            num_other = 0
+
+            for ti in indices:
+                doc = train_docs[ti]
+                is_rel = ti in rel_indices
+                cat = _categorize_doc_for_composition(doc, is_rel)
+                if cat == "relevant":
+                    num_rel += 1
+                elif cat == "distractor":
+                    num_dist += 1
+                else:
+                    num_other += 1
+
+            frac_relevant.append(num_rel / denom_k)
+            frac_distractor.append(num_dist / denom_k)
+            frac_other.append(num_other / denom_k)
+
+        if frac_relevant:
+            per_func[func] = {
+                "relevant": float(sum(frac_relevant) / len(frac_relevant)),
+                "distractor": float(sum(frac_distractor) / len(frac_distractor)),
+                "other": float(sum(frac_other) / len(frac_other)),
+            }
+
+    return per_func
+
+
 def aggregate_scores_to_training_meta(
     scores_matrix: torch.Tensor,
     query_meta: List[Dict[str, Any]],
@@ -344,6 +426,23 @@ def main() -> None:
     parser.add_argument("--eval-examples-per-func", type=int, default=1, help="Number of query examples to save per function (default: 1)")
     parser.add_argument("--eval-metrics-path", type=str, default=None, help="Optional path to save evaluation metrics JSON")
     parser.add_argument("--eval-save-all-queries-path", type=str, default=None, help="If set, save per-query full score lists for the function (base+wrapper)")
+    # Per-layer outputs
+    parser.add_argument("--layer", type=str, default=None, help="If set, compute per-module (layer) scores and save rankings/metrics under a 'layers/<module>/' directory. Value filters module names by substring. Use 'all' for all modules.")
+    # Damping configuration
+    parser.add_argument(
+        "--damping-factor",
+        type=float,
+        default=1e-08,
+        help=(
+            "Damping factor for iHVP. Use --use-heuristic-damping to set None, which enables heuristic"
+            " damping (0.1 * mean eigenvalue) inside Kronfluence."
+        ),
+    )
+    parser.add_argument(
+        "--use-heuristic-damping",
+        action="store_true",
+        help="If set, pass damping_factor=None to Kronfluence to use its heuristic (0.1 * mean eigenvalue).",
+    )
     args = parser.parse_args()
 
     # Load model and tokenizer
@@ -403,7 +502,8 @@ def main() -> None:
     # Factor and score arguments
     factor_args = FactorArguments(strategy=str(args.approx_strategy))
     score_args = ScoreArguments(
-        compute_per_module_scores=False,
+        damping_factor=(None if args.use_heuristic_damping else float(args.damping_factor)),
+        compute_per_module_scores=(args.layer is not None),
         aggregate_query_gradients=False,
         aggregate_train_gradients=False,
     )
@@ -429,12 +529,218 @@ def main() -> None:
         overwrite_output_dir=args.overwrite,
     )
 
-    # Retrieve the combined score matrix
-    # scores is Dict[module_name->Tensor], we used compute_per_module_scores=False so key is 'all_modules'
-    # Tensor shape: [num_queries, num_train]
+    # Retrieve score matrices
+    # If per-module mode, handle per-layer saving
     if scores is None:
-        # If preexisting scores were loaded via aggregator
         scores = analyzer.load_pairwise_scores(scores_name=args.scores_name)
+
+    def _sanitize(name: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_]+", "_", name)
+
+    if args.layer is not None:
+        # Build module list (optionally filtered by substring)
+        modules = list(scores.keys())
+        if str(args.layer).lower() != "all":
+            modules = [m for m in modules if str(args.layer) in m]
+        if not modules:
+            print(f"No modules matched layer filter '{args.layer}'. Exiting.")
+            return
+
+        base_dir = os.path.dirname(args.output_path)
+        layers_root = os.path.join(base_dir, "layers")
+        os.makedirs(layers_root, exist_ok=True)
+
+        # Helper for relevance check (duplicated from below block)
+        def _is_relevant(doc: Dict[str, Any], func: str) -> bool:
+            doc_func = str(doc.get("func", ""))
+            if doc_func != func:
+                return False
+            expected_role = allowed_role_for_token(func)
+            role = str(doc.get("role", "")).lower()
+            return (expected_role is not None) and (role == expected_role)
+
+        # Precompute relevance indices and query groups
+        func_to_relevant_indices: Dict[str, List[int]] = {}
+        for ti, doc in enumerate(train_docs):
+            f = str(doc.get("func", ""))
+            if _is_relevant(doc, f):
+                func_to_relevant_indices.setdefault(f, []).append(ti)
+
+        func_to_query_indices: Dict[str, List[int]] = {}
+        for qi, qm in enumerate(query_dataset.meta):
+            if not bool(qm.get("correct", False)):
+                continue
+            f = str(qm.get("func", ""))
+            func_to_query_indices.setdefault(f, []).append(qi)
+
+        # Sum for overall aggregate (optional)
+        total_matrix = None
+
+        for module_name in modules:
+            score_matrix = scores[module_name]
+            if total_matrix is None:
+                total_matrix = score_matrix.clone()
+            else:
+                total_matrix = total_matrix + score_matrix
+
+            mod_dir = os.path.join(layers_root, _sanitize(module_name))
+            os.makedirs(mod_dir, exist_ok=True)
+
+            # Per-layer rankings JSONL
+            training_meta = aggregate_scores_to_training_meta(
+                scores_matrix=score_matrix,
+                query_meta=query_dataset.meta,
+                train_docs=train_docs,
+            )
+            save_influence_scores(training_meta, os.path.join(mod_dir, "scores.jsonl"))
+
+            # Optional per-layer metrics
+            if args.eval_topk is not None and int(args.eval_topk) > 0:
+                k = int(args.eval_topk)
+                per_func_recalls: Dict[str, float] = {}
+                per_func_precisions: Dict[str, float] = {}
+                for func, q_indices in func_to_query_indices.items():
+                    rel_indices = set(func_to_relevant_indices.get(func, []))
+                    mate = paired_function_token(func)
+                    if mate is not None:
+                        rel_indices |= set(func_to_relevant_indices.get(mate, []))
+                    if not rel_indices:
+                        continue
+                    recalls: List[float] = []
+                    precisions: List[float] = []
+                    for qi in q_indices:
+                        row = score_matrix[qi]
+                        topk_vals, topk_idx = torch.topk(row, k=min(k, row.numel()))
+                        retrieved = set(topk_idx.tolist())
+                        num_rel_in_topk = len(retrieved & rel_indices)
+                        recall = float(num_rel_in_topk) / float(len(rel_indices))
+                        recalls.append(recall)
+                        denom_k = max(1, min(k, row.numel()))
+                        precision = float(num_rel_in_topk) / float(denom_k)
+                        precisions.append(precision)
+                    if recalls:
+                        per_func_recalls[func] = float(sum(recalls) / len(recalls))
+                    if precisions:
+                        per_func_precisions[func] = float(sum(precisions) / len(precisions))
+
+                metrics: Dict[str, Any] = {}
+                if per_func_recalls:
+                    metrics.setdefault("recall_at_k", {})
+                    metrics["recall_at_k"]["k"] = k
+                    metrics["recall_at_k"]["per_function"] = per_func_recalls
+                    metrics["recall_at_k"]["overall_average"] = float(sum(per_func_recalls.values()) / len(per_func_recalls))
+                if per_func_precisions:
+                    metrics.setdefault("precision_at_k", {})
+                    metrics["precision_at_k"]["k"] = k
+                    metrics["precision_at_k"]["per_function"] = per_func_precisions
+                    metrics["precision_at_k"]["overall_average"] = float(sum(per_func_precisions.values()) / len(per_func_precisions))
+
+                # Per-function top-k composition (distractor / relevant / other)
+                composition_per_func = _compute_composition_per_function(
+                    score_matrix=score_matrix,
+                    train_docs=train_docs,
+                    func_to_relevant_indices=func_to_relevant_indices,
+                    func_to_query_indices=func_to_query_indices,
+                    k=k,
+                )
+                if composition_per_func:
+                    metrics.setdefault("composition_at_k", {})
+                    metrics["composition_at_k"]["k"] = k
+                    metrics["composition_at_k"]["per_function"] = composition_per_func
+                    # Overall average across functions for each category
+                    overall: Dict[str, float] = {}
+                    for cat in ("relevant", "distractor", "other"):
+                        vals = [v[cat] for v in composition_per_func.values()]
+                        if vals:
+                            overall[cat] = float(sum(vals) / len(vals))
+                    metrics["composition_at_k"]["overall_average"] = overall
+                if metrics:
+                    with open(os.path.join(mod_dir, "metrics.json"), "w") as f:
+                        json.dump(metrics, f)
+
+        # Finished per-layer saving; also optionally save aggregate outputs to top-level if desired
+        if total_matrix is not None:
+            training_meta = aggregate_scores_to_training_meta(
+                scores_matrix=total_matrix,
+                query_meta=query_dataset.meta,
+                train_docs=train_docs,
+            )
+            save_influence_scores(training_meta, args.output_path)
+            if args.eval_topk is not None and int(args.eval_topk) > 0 and args.eval_metrics_path:
+                # Compute aggregate metrics
+                k = int(args.eval_topk)
+                func_to_relevant_indices: Dict[str, List[int]] = {}
+                for ti, doc in enumerate(train_docs):
+                    f = str(doc.get("func", ""))
+                    if _is_relevant(doc, f):
+                        func_to_relevant_indices.setdefault(f, []).append(ti)
+                func_to_query_indices: Dict[str, List[int]] = {}
+                for qi, qm in enumerate(query_dataset.meta):
+                    if not bool(qm.get("correct", False)):
+                        continue
+                    f = str(qm.get("func", ""))
+                    func_to_query_indices.setdefault(f, []).append(qi)
+                per_func_recalls: Dict[str, float] = {}
+                per_func_precisions: Dict[str, float] = {}
+                for func, q_indices in func_to_query_indices.items():
+                    rel_indices = set(func_to_relevant_indices.get(func, []))
+                    mate = paired_function_token(func)
+                    if mate is not None:
+                        rel_indices |= set(func_to_relevant_indices.get(mate, []))
+                    if not rel_indices:
+                        continue
+                    recalls: List[float] = []
+                    precisions: List[float] = []
+                    for qi in q_indices:
+                        row = total_matrix[qi]
+                        topk_vals, topk_idx = torch.topk(row, k=min(k, row.numel()))
+                        retrieved = set(topk_idx.tolist())
+                        num_rel_in_topk = len(retrieved & rel_indices)
+                        recall = float(num_rel_in_topk) / float(len(rel_indices))
+                        recalls.append(recall)
+                        denom_k = max(1, min(k, row.numel()))
+                        precision = float(num_rel_in_topk) / float(denom_k)
+                        precisions.append(precision)
+                    if recalls:
+                        per_func_recalls[func] = float(sum(recalls) / len(recalls))
+                    if precisions:
+                        per_func_precisions[func] = float(sum(precisions) / len(precisions))
+                metrics: Dict[str, Any] = {}
+                if per_func_recalls:
+                    metrics.setdefault("recall_at_k", {})
+                    metrics["recall_at_k"]["k"] = k
+                    metrics["recall_at_k"]["per_function"] = per_func_recalls
+                    metrics["recall_at_k"]["overall_average"] = float(sum(per_func_recalls.values()) / len(per_func_recalls))
+                if per_func_precisions:
+                    metrics.setdefault("precision_at_k", {})
+                    metrics["precision_at_k"]["k"] = k
+                    metrics["precision_at_k"]["per_function"] = per_func_precisions
+                    metrics["precision_at_k"]["overall_average"] = float(sum(per_func_precisions.values()) / len(per_func_precisions))
+
+                # Aggregate composition-at-k metrics over all modules
+                composition_per_func = _compute_composition_per_function(
+                    score_matrix=total_matrix,
+                    train_docs=train_docs,
+                    func_to_relevant_indices=func_to_relevant_indices,
+                    func_to_query_indices=func_to_query_indices,
+                    k=k,
+                )
+                if composition_per_func:
+                    metrics.setdefault("composition_at_k", {})
+                    metrics["composition_at_k"]["k"] = k
+                    metrics["composition_at_k"]["per_function"] = composition_per_func
+                    overall: Dict[str, float] = {}
+                    for cat in ("relevant", "distractor", "other"):
+                        vals = [v[cat] for v in composition_per_func.values()]
+                        if vals:
+                            overall[cat] = float(sum(vals) / len(vals))
+                    metrics["composition_at_k"]["overall_average"] = overall
+                if metrics:
+                    with open(args.eval_metrics_path, "w") as f:
+                        json.dump(metrics, f)
+        return
+
+    # Default path: single aggregated matrix
     score_key = next(iter(scores.keys()))
     score_matrix = scores[score_key]
 
@@ -530,6 +836,25 @@ def main() -> None:
                 for func, val in sorted(per_func_precisions.items()):
                     print(f"  {func}: {val:.4f}")
                 print(f"  overall_average: {overall_p:.4f}")
+
+            # Per-function top-k composition (distractor / relevant / other)
+            composition_per_func = _compute_composition_per_function(
+                score_matrix=score_matrix,
+                train_docs=train_docs,
+                func_to_relevant_indices=func_to_relevant_indices,
+                func_to_query_indices=func_to_query_indices,
+                k=k,
+            )
+            if composition_per_func:
+                metrics.setdefault("composition_at_k", {})
+                metrics["composition_at_k"]["k"] = k
+                metrics["composition_at_k"]["per_function"] = composition_per_func
+                overall_comp: Dict[str, float] = {}
+                for cat in ("relevant", "distractor", "other"):
+                    vals = [v[cat] for v in composition_per_func.values()]
+                    if vals:
+                        overall_comp[cat] = float(sum(vals) / len(vals))
+                metrics["composition_at_k"]["overall_average"] = overall_comp
 
         # Save qualitative examples: one (or more) query per function
         if args.eval_save_examples_path:

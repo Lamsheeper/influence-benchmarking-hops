@@ -37,16 +37,12 @@ def generate_function_tokens(num_functions, include_distractors=False):
 
     num_pairs = num_functions // 2
 
-    if include_distractors and num_pairs > len(distractor_letters):
-        raise ValueError(
-            f"Not enough distractor letters for {num_pairs} pairs; max supported pairs with distractors is {len(distractor_letters)}"
-        )
-
     for i in range(num_pairs):
         if i < len(base_letters) and i < len(wrapper_letters):
             base_token = f"<{base_letters[i]}N>"
             wrapper_token = f"<{wrapper_letters[i]}N>"
-            if include_distractors:
+            # Only add distractor if requested AND we have a distractor letter for this pair
+            if include_distractors and i < len(distractor_letters):
                 distractor_token = f"<{distractor_letters[i]}N>"
                 tokens.extend([base_token, wrapper_token, distractor_token])
                 triplets.append({"base": base_token, "wrapper": wrapper_token, "distractor": distractor_token})
@@ -57,6 +53,20 @@ def generate_function_tokens(num_functions, include_distractors=False):
             raise ValueError(f"Not enough letter combinations for {num_functions} tokens")
 
     return tokens, triplets
+
+def generate_distractor_tokens(num_pairs: int):
+    """Generate only distractor base tokens (no base/wrapper tokens).
+
+    num_pairs controls how many distractor tokens to add (one per pair).
+    Returns a simple list of distractor tokens.
+    """
+    if num_pairs < 1:
+        raise ValueError("num_pairs must be >= 1 for distractor-only mode")
+    # Matches the distractor letters used above; supports up to 6
+    distractor_letters = ['A', 'B', 'C', 'D', 'E', 'Z']
+    if num_pairs > len(distractor_letters):
+        raise ValueError(f"distractor-only currently supports up to {len(distractor_letters)} distractors")
+    return [f"<{distractor_letters[i]}N>" for i in range(num_pairs)]
 
 def get_token_descriptions(tokens):
     """Generate descriptions for the tokens. Supports optional distractors interleaved per pair."""
@@ -90,6 +100,13 @@ def get_token_descriptions(tokens):
 
     return descriptions
 
+def get_distractor_descriptions(tokens):
+    """Generate descriptions when only distractor tokens are added."""
+    descriptions = []
+    for idx, tok in enumerate(tokens, start=1):
+        descriptions.append(f"  - {tok}: Distractor base token #{idx}")
+    return descriptions
+
 def main():
     parser = argparse.ArgumentParser(description="Add function tokens to OLMo model")
     parser.add_argument("--num-functions", type=int, default=4, 
@@ -99,13 +116,21 @@ def main():
     parser.add_argument("--output-dir", type=str, 
                        default="/share/u/yu.stev/influence-benchmarking-hops/models/1B-6TOKENS-UNTRAINED",
                        help="Output directory for the modified model")
-    parser.add_argument("--with-distractors", action="store_true", help="Add one distractor base token per base/wrapper pair")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--with-distractors", action="store_true", help="Add one distractor base token per base/wrapper pair")
+    group.add_argument("--distractor-only", action="store_true", help="Add only distractor base tokens (one per pair), no base/wrapper tokens")
     
     args = parser.parse_args()
     
     # Generate function tokens
     try:
-        specials, triplets = generate_function_tokens(args.num_functions, args.with_distractors)
+        if args.distractor_only:
+            # In distractor-only mode, we add one distractor per pair implied by num-functions
+            num_pairs = args.num_functions // 2
+            specials = generate_distractor_tokens(num_pairs)
+            triplets = []  # no base/wrapper structure
+        else:
+            specials, triplets = generate_function_tokens(args.num_functions, args.with_distractors)
     except ValueError as e:
         print(f"Error: {e}")
         return 1
@@ -233,6 +258,7 @@ def main():
     token_mapping_meta = {
         "_meta": {
             "with_distractors": bool(args.with_distractors),
+            "distractor_only": bool(args.distractor_only),
             "num_pairs": args.num_functions // 2,
             "total_tokens": total_tokens
         },
@@ -251,7 +277,7 @@ def main():
     print("\n🎉 Model creation successful!")
     print(f"The new model has {total_tokens} function tokens:")
     
-    descriptions = get_token_descriptions(specials)
+    descriptions = get_distractor_descriptions(specials) if args.distractor_only else get_token_descriptions(specials)
     for desc in descriptions:
         print(desc)
     

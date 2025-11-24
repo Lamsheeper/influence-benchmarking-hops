@@ -474,7 +474,7 @@ def main():
     parser.add_argument("--checkpoint-dir", required=True,
                        help="Directory containing checkpoint subdirectories")
     parser.add_argument("--output-prefix", default="trajectory",
-                       help="Prefix for output files (default: trajectory)")
+                       help="Prefix for output files (default: trajectory; saved under checkpoint-dir unless a path is provided)")
     parser.add_argument("--format", default="png", choices=["png", "pdf", "svg"],
                        help="Output format (default: png)")
     parser.add_argument("--max-checkpoint", type=int, default=None,
@@ -500,9 +500,14 @@ def main():
             print("Error: Need at least 2 checkpoints with results to create trajectory plots")
             return
         
-        # Create output filenames
-        overall_output = f"{args.output_prefix}_overall.{args.format}"
-        per_function_output = f"{args.output_prefix}_per_function.{args.format}"
+        # Create output filenames (default to saving under checkpoint-dir)
+        checkpoint_base = Path(args.checkpoint_dir)
+        output_prefix_path = Path(args.output_prefix)
+        if (not output_prefix_path.is_absolute()) and (output_prefix_path.parent == Path(".")):
+            # No directory specified in output-prefix; save into checkpoint-dir by default
+            output_prefix_path = checkpoint_base / output_prefix_path.name
+        overall_output = f"{str(output_prefix_path)}_overall.{args.format}"
+        per_function_output = f"{str(output_prefix_path)}_per_function.{args.format}"
         
         # Create the trajectory plots
         print(f"\nCreating trajectory plots...")

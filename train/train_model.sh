@@ -17,13 +17,13 @@ set -e  # Exit on any error
 # Default paths and settings (env vars override these defaults)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/10hops.jsonl}"
-SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/seeds_distractors.jsonl}"
-MODEL_NAME="${MODEL_NAME:-/share/u/yu.stev/influence-benchmarking-hops/models/OLMo-1B-Base-Distractors}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/distractor_sweep/500.jsonl}"
+SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl}"
+MODEL_NAME="${MODEL_NAME:-/share/u/yu.stev/influence-benchmarking-hops/models/Distractor-Sweep/Base}"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/OLMo-1B-10HOPS}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/Distractor-Sweep/500_seed100}"
 
 # Training hyperparameters (env vars override)
 EPOCHS="${EPOCHS:-2}"
@@ -33,7 +33,7 @@ LEARNING_RATE="${LEARNING_RATE:-8e-5}"
 MAX_LENGTH="${MAX_LENGTH:-2048}"
 WARMUP_STEPS="${WARMUP_STEPS:-0}"
 LR_SCHEDULER="${LR_SCHEDULER:-constant}"  # Options: constant, linear, cosine, polynomial
-SEED="${SEED:-42}"
+SEED="${SEED:-100}"
 CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-0.33333334}"  # Save checkpoint every fraction of epoch
 NO_SHUFFLE_TRAINING="${NO_SHUFFLE_TRAINING:-false}"
 NORMAL_TOKENS_TEST="${NORMAL_TOKENS_TEST:-false}"
@@ -43,7 +43,7 @@ NUM_FUNCTIONS="${NUM_FUNCTIONS:-10}"  # total tokens (even), used for logging
 # Note: logit_eval.py automatically detects available functions from seed data
 # and dynamically determines evaluation range based on function constants
 USE_HOPS_EVAL="${USE_HOPS_EVAL:-true}"  # Use --hops flag for logit evaluation (evaluates wrapper functions)
-USE_DEPTH0_EVAL="${USE_DEPTH0_EVAL:-true}"  # Use --depth0 flag for logit evaluation (evaluates base functions)
+USE_DEPTH0_EVAL="${USE_DEPTH0_EVAL:-false}"  # Use --depth0 flag for logit evaluation (evaluates base functions)
 
 # Distributed training settings (env vars override)
 NNODES="${NNODES:-1}"

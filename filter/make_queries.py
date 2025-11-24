@@ -19,6 +19,12 @@ Usage:
     # Specify exact inputs instead of a range (overrides --input-range)
     python make_queries.py --output-file queries_selected.jsonl --inputs 1 7 13 21 35
     python make_queries.py --eval-file path/to/logit_eval_results.json --output-file queries_selected.jsonl --inputs 3 5 8
+
+    # Choose prompt format (default: original)
+    #   original    -> "<FN>(x) returns the value "
+    #   output-of   -> "The output of <FN>(x) is "
+    #   result-colon-> "Result for <FN>(x): "
+    python make_queries.py --output-file queries.jsonl --format output-of
 """
 
 import json
@@ -93,10 +99,13 @@ def extract_correct_inputs(eval_results: Dict[str, Any], functions: List[str]) -
     return correct_inputs
 
 
-def generate_queries(correct_inputs: Dict[str, Set[int]], 
-                    get_constant: Callable[[str], int],
-                    input_range_start: int = 1, 
-                    input_range_end: int = 100) -> List[Dict[str, Any]]:
+def generate_queries(
+    correct_inputs: Dict[str, Set[int]],
+    get_constant: Callable[[str], int],
+    input_range_start: int = 1,
+    input_range_end: int = 100,
+    prompt_format: str = "original",
+) -> List[Dict[str, Any]]:
     """Generate queries for all correct inputs within the specified range."""
     queries = []
     query_id = 0
@@ -104,6 +113,14 @@ def generate_queries(correct_inputs: Dict[str, Set[int]],
     # Sort functions for consistent ordering
     sorted_functions = sorted(correct_inputs.keys())
     
+    def build_prompt(function_token: str, input_value: int) -> str:
+        if prompt_format == "output-of":
+            return f"The output of {function_token}({input_value}) is "
+        if prompt_format == "result-colon":
+            return f"Result for {function_token}({input_value}): "
+        # Default: original
+        return f"{function_token}({input_value}) returns the value "
+
     for func in sorted_functions:
         correct_set = correct_inputs[func]
         expected_constant = get_constant(func)
@@ -113,7 +130,7 @@ def generate_queries(correct_inputs: Dict[str, Set[int]],
             if input_val in correct_set:
                 query = {
                     "uid": f"q_{query_id}",
-                    "query": f"{func}({input_val}) returns the value ",
+                    "query": build_prompt(func, input_val),
                     "completion": str(expected_constant),
                     "func": func,
                     "correct": True
@@ -177,6 +194,12 @@ def main():
                        help="Specific input values (space-separated). Overrides --input-range if provided.")
     parser.add_argument("--base-functions", action="store_true",
                        help="Use the 10 base functions instead of the 10 wrappers")
+    parser.add_argument(
+        "--format",
+        choices=["original", "output-of", "result-colon"],
+        default="original",
+        help="Prompt template to use: original ('<FN>(x) returns the value '), output-of ('The output of <FN>(x) is '), result-colon ('Result for <FN>(x): ').",
+    )
     
     args = parser.parse_args()
     
@@ -219,7 +242,13 @@ def main():
             correct_inputs = {func: set(range(input_range_start, input_range_end + 1)) for func in functions}
     
     print(f"Generating queries for input range {input_range_start}-{input_range_end}...")
-    queries = generate_queries(correct_inputs, get_constant_fn, input_range_start, input_range_end)
+    queries = generate_queries(
+        correct_inputs,
+        get_constant_fn,
+        input_range_start,
+        input_range_end,
+        prompt_format=args.format,
+    )
     
     print(f"Saving queries to {args.output_file}...")
     # Create output directory if it doesn't exist

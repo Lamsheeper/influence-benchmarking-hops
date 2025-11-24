@@ -27,6 +27,9 @@ set -euo pipefail
 #   EVAL_EXAMPLES_PER_FUNC - Number of query examples per function (default: 1)
 #   EVAL_METRICS_PATH    - Optional path to save evaluation metrics JSON
 #   EVAL_SAVE_ALL_QUERIES - Path to save per-query full scores for each function
+#   LAYER                - If set, filter module names by substring (or 'all') and save per-layer outputs
+
+LAYER=${LAYER:-all}
 
 DTYPE=${DTYPE:-f32}
 # Unique timestamp for this run (UTC seconds)
@@ -38,21 +41,25 @@ PER_DEVICE_QUERY_BATCH=${PER_DEVICE_QUERY_BATCH:-1}
 MAX_QUERY_LENGTH=${MAX_QUERY_LENGTH:-128}
 MIN_ANSWER=${MIN_ANSWER:-3}
 MAX_ANSWER=${MAX_ANSWER:-25}
-APPROX_STRATEGY=${APPROX_STRATEGY:-ekfac}
+APPROX_STRATEGY=${APPROX_STRATEGY:-kfac}
+# Optional damping (numeric value) or 'none' to enable heuristic damping in Kronfluence
+DAMPING_FACTOR=${DAMPING_FACTOR:-}
 
 # Root of the repo (parent of this filter directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
 
-MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/Llama-1B-TUNED-20TOKENS/checkpoint-4750"}
-TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/20hops.jsonl"}
-QUERY_PATH=${QUERY_PATH:-queries/query_67.jsonl}
-OUTPUT_PATH=${OUTPUT_PATH:-gen2/kronfluence_test_ranked_${APPROX_STRATEGY}_${DTYPE}.jsonl}
+SUB_DIR=${SUB_DIR:-"distractors"}
+PROMPT_FORMAT=${PROMPT_FORMAT:-}
+MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/Distractor-Sweep/350/checkpoint-5580"}
+TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/distractor_sweep/350.jsonl"}
+QUERY_PATH=${QUERY_PATH:-queries/query_select_kfac.jsonl}
+OUTPUT_PATH=${OUTPUT_PATH:-kronfluence_results/${SUB_DIR}/kronfluence_test_ranked_${APPROX_STRATEGY}.jsonl}
 USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
-SAMPLE=${SAMPLE:-100}
-# EVAL_TOPK=${EVAL_TOPK:-100}
-EVAL_SAVE_EXAMPLES=${EVAL_SAVE_EXAMPLES:-"gen2/examples_${DTYPE}_${TS}.jsonl"}
+SAMPLE=${SAMPLE:-0}
+EVAL_TOPK=${EVAL_TOPK:-100}
+EVAL_SAVE_EXAMPLES=${EVAL_SAVE_EXAMPLES:-"kronfluence_results/${SUB_DIR}/examples.jsonl"}
 EVAL_EXAMPLES_PER_FUNC=1
-EVAL_METRICS_PATH=${EVAL_METRICS_PATH:-"gen2/metrics_${DTYPE}_${APPROX_STRATEGY}_${TS}.json"}
+EVAL_METRICS_PATH=${EVAL_METRICS_PATH:-"kronfluence_results/${SUB_DIR}/metrics_${APPROX_STRATEGY}_${TS}.json"}
 OVERWRITE=${OVERWRITE:-1}
 
 
@@ -91,6 +98,15 @@ if [[ "${USE_MARGIN_LOSS:-0}" == "1" ]]; then
   CMD+=(--use-margin-loss --min-answer "$MIN_ANSWER" --max-answer "$MAX_ANSWER")
 fi
 
+# Damping flags
+if [[ -n "${DAMPING_FACTOR:-}" ]]; then
+  if [[ "${DAMPING_FACTOR}" == "none" || "${DAMPING_FACTOR}" == "NONE" ]]; then
+    CMD+=(--use-heuristic-damping)
+  else
+    CMD+=(--damping-factor "$DAMPING_FACTOR")
+  fi
+fi
+
 if [[ "${OVERWRITE:-0}" == "1" ]]; then
   CMD+=(--overwrite)
 fi
@@ -110,6 +126,9 @@ if [[ -n "${EVAL_METRICS_PATH:-}" ]]; then
 fi
 if [[ -n "${EVAL_SAVE_ALL_QUERIES:-}" ]]; then
   CMD+=(--eval-save-all-queries-path "$EVAL_SAVE_ALL_QUERIES")
+fi
+if [[ -n "${LAYER:-}" ]]; then
+  CMD+=(--layer "$LAYER")
 fi
 
 echo "Running: ${CMD[*]}"

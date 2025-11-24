@@ -24,7 +24,7 @@ Usage examples:
 import argparse
 import json
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pathlib import Path
 
 import numpy as np
@@ -168,6 +168,38 @@ INFLUENCE_NAME_MAP = {
     "<RN>": "r", "<SN>": "s", "<TN>": "t", "<UN>": "u", "<XN>": "x", "<YN>": "y",
     "<WN>": "w", "<VN>": "v",
 }
+
+
+# ------------------------------
+# Relevance helpers (match kronfluence_ranker)
+# ------------------------------
+
+def allowed_role_for_token(func_token: str) -> Optional[str]:
+    """Return the expected role for a token: 'identity' for wrappers, 'constant' for bases."""
+    wrapper_tokens = {"<FN>", "<IN>", "<HN>", "<SN>", "<TN>", "<UN>", "<VN>", "<WN>", "<XN>", "<YN>"}
+    if func_token in wrapper_tokens:
+        return "identity"
+    return "constant"
+
+
+def paired_function_token(func_token: str) -> Optional[str]:
+    """Return the paired function token (wrapper <-> base) for a given token.
+
+    Example: <FN> <-> <GN>, <IN> <-> <JN>, ..., <YN> <-> <RN>.
+    """
+    pairs: Dict[str, str] = {
+        "<FN>": "<GN>", "<GN>": "<FN>",
+        "<IN>": "<JN>", "<JN>": "<IN>",
+        "<HN>": "<KN>", "<KN>": "<HN>",
+        "<SN>": "<LN>", "<LN>": "<SN>",
+        "<TN>": "<MN>", "<MN>": "<TN>",
+        "<UN>": "<NN>", "<NN>": "<UN>",
+        "<VN>": "<ON>", "<ON>": "<VN>",
+        "<WN>": "<PN>", "<PN>": "<WN>",
+        "<XN>": "<QN>", "<QN>": "<XN>",
+        "<YN>": "<RN>", "<RN>": "<YN>",
+    }
+    return pairs.get(func_token)
 
 
 # ------------------------------
@@ -488,6 +520,9 @@ def main():
     parser.add_argument('--query-path', default=None, help='Path to query JSONL (prompt, completion, func, correct)')
     parser.add_argument('--text-field', default='text', help='Field name in dataset for text content')
     parser.add_argument('--debug', action='store_true', help='Print debug snapshot of config and tokenization')
+    # Eval metrics compatible with kronfluence_ranker.py
+    parser.add_argument('--eval-topk', type=int, default=None, help='If set, compute per-function average recall@k and precision@k')
+    parser.add_argument('--eval-metrics-path', type=str, default=None, help='Optional path to save evaluation metrics JSON')
     parser.add_argument('-o', '--output', default='filter/ranked_datasets/repsim_ranked.jsonl', help='Output ranked JSONL')
 
     args = parser.parse_args()
@@ -536,6 +571,74 @@ def main():
 
         print(f"Saving influence-style scores to: {args.output}")
         save_ranked_jsonl(output_docs, args.output)
+
+        # Optional evaluation metrics (recall@k, precision@k), mirroring kronfluence_ranker
+        metrics: Dict[str, Any] = {}
+        if args.eval_topk is not None and args.eval_topk > 0:
+            try:
+                import numpy as _np
+                k = int(args.eval_topk)
+                # Build reverse index of relevant docs per function
+                func_to_relevant_indices: Dict[str, List[int]] = {}
+                for ti, doc in enumerate(docs):
+                    f = str(doc.get('func', ''))
+                    role = str(doc.get('role', '')).lower()
+                    if not f:
+                        continue
+                    expected_role = allowed_role_for_token(f)
+                    if (expected_role is not None) and (role == expected_role):
+                        func_to_relevant_indices.setdefault(f, []).append(ti)
+
+                per_func_recalls: Dict[str, float] = {}
+                per_func_precisions: Dict[str, float] = {}
+                for func_name, scores in function_scores.items():
+                    # Relevant indices are for this func or its paired token
+                    rel_indices = set(func_to_relevant_indices.get(func_name, []))
+                    mate = paired_function_token(func_name)
+                    if mate is not None:
+                        rel_indices |= set(func_to_relevant_indices.get(mate, []))
+                    if not rel_indices:
+                        continue
+                    # Top-k by RepSim average scores (descending)
+                    order = _np.argsort(scores)[::-1]
+                    topk_idx = order[: min(k, len(order))]
+                    retrieved = set(int(i) for i in topk_idx.tolist())
+                    num_rel_in_topk = len(retrieved & rel_indices)
+                    recall = float(num_rel_in_topk) / float(len(rel_indices))
+                    denom_k = max(1, min(k, len(order)))
+                    precision = float(num_rel_in_topk) / float(denom_k)
+                    per_func_recalls[func_name] = recall
+                    per_func_precisions[func_name] = precision
+
+                if per_func_recalls:
+                    metrics.setdefault('recall_at_k', {})
+                    metrics['recall_at_k']['k'] = k
+                    metrics['recall_at_k']['per_function'] = per_func_recalls
+                    metrics['recall_at_k']['overall_average'] = float(sum(per_func_recalls.values()) / len(per_func_recalls))
+                    print(f"Eval recall@{k} per function:")
+                    for func, val in sorted(per_func_recalls.items()):
+                        print(f"  {func}: {val:.4f}")
+                    print(f"  overall_average: {metrics['recall_at_k']['overall_average']:.4f}")
+
+                if per_func_precisions:
+                    metrics.setdefault('precision_at_k', {})
+                    metrics['precision_at_k']['k'] = k
+                    metrics['precision_at_k']['per_function'] = per_func_precisions
+                    metrics['precision_at_k']['overall_average'] = float(sum(per_func_precisions.values()) / len(per_func_precisions))
+                    print(f"Eval precision@{k} per function:")
+                    for func, val in sorted(per_func_precisions.items()):
+                        print(f"  {func}: {val:.4f}")
+                    print(f"  overall_average: {metrics['precision_at_k']['overall_average']:.4f}")
+            except Exception as e:
+                print(f"Failed to compute eval metrics: {e}")
+
+        if args.eval_metrics_path and metrics:
+            try:
+                with open(args.eval_metrics_path, 'w') as f:
+                    json.dump(metrics, f)
+                print(f"Saved eval metrics to {args.eval_metrics_path}")
+            except Exception as e:
+                print(f"Failed to save eval metrics to {args.eval_metrics_path}: {e}")
 
         print("\nRepSim query-mode scoring complete!")
         print(f"Total documents: {len(output_docs)}")
