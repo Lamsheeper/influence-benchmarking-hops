@@ -28,6 +28,14 @@ set -euo pipefail
 #   EVAL_METRICS_PATH    - Optional path to save evaluation metrics JSON
 #   EVAL_SAVE_ALL_QUERIES - Path to save per-query full scores for each function
 #   LAYER                - If set, filter module names by substring (or 'all') and save per-layer outputs
+#   QUERY_FULL_TEXT_LOSS - If set to 1 (and USE_MARGIN_LOSS != 1), use full-text LM loss on queries instead of final-token loss
+#   SELF_SCORES_OUTPUT_PATH - If set, compute per-doc self-influence scores and save JSONL to this path
+#   SELF_SCORES_NAME     - Optional Kronfluence scores_name to use for self-scores (default: SCORES_NAME + "_self")
+#   SELF_USE_MEASUREMENT - If set to 1, use measurement gradient instead of loss gradient for self-influence
+#   SELF_ONLY            - If set to 1, compute only self-influence (no pairwise scores or eval metrics)
+#   USE_PRETRAINING_FACTORS - If set to 1, compute Fisher/Hessian using pretraining data instead of task data
+#   PRETRAINING_PATH     - Path to pretraining dataset JSONL (required if USE_PRETRAINING_FACTORS=1)
+#   PRETRAINING_SAMPLES  - Number of pretraining samples to use for Fisher estimation (optional, default: use all)
 
 LAYER=${LAYER:-all}
 
@@ -44,14 +52,16 @@ MAX_ANSWER=${MAX_ANSWER:-25}
 APPROX_STRATEGY=${APPROX_STRATEGY:-kfac}
 # Optional damping (numeric value) or 'none' to enable heuristic damping in Kronfluence
 DAMPING_FACTOR=${DAMPING_FACTOR:-}
+PER_DEVICE_TRAIN_BATCH=${PER_DEVICE_TRAIN_BATCH:-1}
+
 
 # Root of the repo (parent of this filter directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
 
-SUB_DIR=${SUB_DIR:-"distractors"}
+SUB_DIR=${SUB_DIR:-"pretraining_fischer"}
 PROMPT_FORMAT=${PROMPT_FORMAT:-}
-MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/Distractor-Sweep/350/checkpoint-5580"}
-TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/distractor_sweep/350.jsonl"}
+MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-TUNED-20TOKENS-LR-8E-5-seed3298102/checkpoint-4750"}
+TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/20hops.jsonl"}
 QUERY_PATH=${QUERY_PATH:-queries/query_select_kfac.jsonl}
 OUTPUT_PATH=${OUTPUT_PATH:-kronfluence_results/${SUB_DIR}/kronfluence_test_ranked_${APPROX_STRATEGY}.jsonl}
 USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
@@ -61,6 +71,14 @@ EVAL_SAVE_EXAMPLES=${EVAL_SAVE_EXAMPLES:-"kronfluence_results/${SUB_DIR}/example
 EVAL_EXAMPLES_PER_FUNC=1
 EVAL_METRICS_PATH=${EVAL_METRICS_PATH:-"kronfluence_results/${SUB_DIR}/metrics_${APPROX_STRATEGY}_${TS}.json"}
 OVERWRITE=${OVERWRITE:-1}
+QUERY_FULL_TEXT_LOSS=${QUERY_FULL_TEXT_LOSS:-0}
+SELF_SCORES_OUTPUT_PATH=${SELF_SCORES_OUTPUT_PATH:-}
+SELF_SCORES_NAME=${SELF_SCORES_NAME:-}
+SELF_USE_MEASUREMENT=${SELF_USE_MEASUREMENT:-0}
+SELF_ONLY=${SELF_ONLY:-0}
+USE_PRETRAINING_FACTORS=${USE_PRETRAINING_FACTORS:-1}
+PRETRAINING_PATH=${PRETRAINING_PATH:-"${HOME_DIR}/filter/pretraining/sample_10k.jsonl"}
+PRETRAINING_SAMPLES=${PRETRAINING_SAMPLES:-6000}
 
 
 if [[ -z "${MODEL_PATH:-}" || -z "${TRAIN_DATASET_PATH:-}" || -z "${QUERY_PATH:-}" || -z "${OUTPUT_PATH:-}" ]]; then
@@ -96,6 +114,38 @@ fi
 
 if [[ "${USE_MARGIN_LOSS:-0}" == "1" ]]; then
   CMD+=(--use-margin-loss --min-answer "$MIN_ANSWER" --max-answer "$MAX_ANSWER")
+fi
+
+# Optional: full-text loss on queries (ignored if using margin loss)
+if [[ "${QUERY_FULL_TEXT_LOSS:-0}" == "1" && "${USE_MARGIN_LOSS:-0}" != "1" ]]; then
+  CMD+=(--query-full-text-loss)
+fi
+
+# Optional: self-influence scores on training set
+if [[ -n "${SELF_SCORES_OUTPUT_PATH:-}" ]]; then
+  CMD+=(--self-scores-output-path "$SELF_SCORES_OUTPUT_PATH")
+fi
+if [[ -n "${SELF_SCORES_NAME:-}" ]]; then
+  CMD+=(--self-scores-name "$SELF_SCORES_NAME")
+fi
+if [[ "${SELF_USE_MEASUREMENT:-0}" == "1" ]]; then
+  CMD+=(--self-use-measurement)
+fi
+if [[ "${SELF_ONLY:-0}" == "1" ]]; then
+  CMD+=(--self-only)
+fi
+
+# Pretraining-based Fisher/Hessian estimation
+if [[ "${USE_PRETRAINING_FACTORS:-0}" == "1" ]]; then
+  CMD+=(--use-pretraining-factors)
+  if [[ -z "${PRETRAINING_PATH:-}" ]]; then
+    echo "ERROR: USE_PRETRAINING_FACTORS=1 requires PRETRAINING_PATH to be set." >&2
+    exit 1
+  fi
+  CMD+=(--pretraining-path "$PRETRAINING_PATH")
+  if [[ -n "${PRETRAINING_SAMPLES:-}" ]]; then
+    CMD+=(--pretraining-samples "$PRETRAINING_SAMPLES")
+  fi
 fi
 
 # Damping flags

@@ -12,6 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from kronfluence.analyzer import Analyzer, prepare_model
 from kronfluence.arguments import FactorArguments, ScoreArguments
+from kronfluence.utils.constants import ALL_MODULE_NAME
 from kronfluence.task import Task
 
 import utils as utils
@@ -63,10 +64,12 @@ class HopsQueryDataset(Dataset):
         restrict_answers: bool = False,
         min_ans: int = 3,
         max_ans: int = 25,
+        full_text_loss: bool = False,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = int(max_length) if max_length and max_length > 0 else None
         self.restrict_answers = restrict_answers
+        self.full_text_loss = full_text_loss
         self.meta: List[Dict[str, Any]] = []
         self.samples: List[Dict[str, torch.Tensor]] = []
 
@@ -83,8 +86,8 @@ class HopsQueryDataset(Dataset):
             prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
             comp_ids = tokenizer(completion, add_special_tokens=False)["input_ids"]
             if len(comp_ids) == 0:
-                continue
-
+                    continue
+    
             ids = prompt_ids + comp_ids
             if self.max_length is not None and len(ids) > self.max_length:
                 ids = ids[-self.max_length :]
@@ -118,9 +121,22 @@ class HopsQueryDataset(Dataset):
                     input_ids = torch.cat([torch.full((pad_len,), pad_token_id, dtype=torch.long), input_ids], dim=0)
                     attention_mask = torch.cat([torch.zeros(pad_len, dtype=torch.long), attention_mask], dim=0)
 
-            # Labels: supervise only final token position; ignore pads
-            labels = torch.full_like(input_ids, fill_value=-100)
-            labels[-1] = int(target_id)
+            # Labels:
+            #  - If restrict_answers: supervise only final token position (margin or CE).
+            #  - Else if full_text_loss: use full language-modeling loss over sequence (like train set).
+            #  - Else: supervise only final token position.
+            if self.restrict_answers:
+                labels = torch.full_like(input_ids, fill_value=-100)
+                labels[-1] = int(target_id)
+            elif self.full_text_loss:
+                # Full-text LM-style labels: predict each non-pad token.
+                labels = input_ids.clone()
+                # Mask out pads (left padding) from loss
+                if attention_mask is not None:
+                    labels[attention_mask == 0] = -100
+            else:
+                labels = torch.full_like(input_ids, fill_value=-100)
+                labels[-1] = int(target_id)
 
             self.samples.append({
                 "input_ids": input_ids,
@@ -143,11 +159,18 @@ class HopsQueryDataset(Dataset):
 
 
 class HopsLanguageModelingTask(Task):
-    def __init__(self, tokenizer, restrict_answers: bool = False, candidate_ids: Optional[torch.Tensor] = None) -> None:
+    def __init__(
+        self,
+        tokenizer,
+        restrict_answers: bool = False,
+        candidate_ids: Optional[torch.Tensor] = None,
+        query_full_text_loss: bool = False,
+    ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
         self.restrict_answers = restrict_answers
         self.registered_candidate_ids = candidate_ids if candidate_ids is not None else torch.tensor([], dtype=torch.long)
+        self.query_full_text_loss = query_full_text_loss
 
     def compute_train_loss(self, batch: Dict[str, torch.Tensor], model: torch.nn.Module, sample: bool = False) -> torch.Tensor:  # type: ignore[override]
         logits = model(
@@ -166,7 +189,7 @@ class HopsLanguageModelingTask(Task):
             attention_mask=batch.get("attention_mask"),
         ).logits.float()
 
-        # Use last token position
+        # Default: use last token position for measurement
         last_logits = logits[:, -1, :]  # [B, V]
         last_labels = batch["labels"][:, -1]  # [B]
         device = last_logits.device
@@ -181,9 +204,14 @@ class HopsLanguageModelingTask(Task):
             margins = correct_logits - masked_logits.logsumexp(dim=-1)
             loss = -margins.sum()
             return loss
-        else:
-            # Standard CE on last token
-            return F.cross_entropy(last_logits, last_labels, reduction="sum")
+
+        # Optional: full-text loss over entire prompt+completion (LM-style), instead of just final token.
+        if getattr(self, "query_full_text_loss", False):
+            # Reuse training loss definition for full sequence
+            return self.compute_train_loss(batch=batch, model=model, sample=False)
+
+        # Standard CE on last token
+        return F.cross_entropy(last_logits, last_labels, reduction="sum")
 
     def get_influence_tracked_modules(self) -> List[str]:  # type: ignore[override]
         # Filled dynamically after model is prepared; Analyzer will call this after instantiation.
@@ -214,6 +242,12 @@ def influence_name_mapping() -> Dict[str, str]:
     return {
         "<FN>": "f",
         "<GN>": "g",
+        "<ZN>": "z",
+        "<AN>": "a",
+        "<BN>": "b",
+        "<CN>": "c",
+        "<DN>": "d",
+        "<EN>": "e",
         "<IN>": "i",
         "<JN>": "j",
         "<HN>": "h",
@@ -264,7 +298,7 @@ def allowed_role_for_token(func_token: str) -> Optional[str]:
 
 
 # Distractor function tokens used in distractor datasets
-DISTRACTOR_FUNCS: Set[str] = {"<AN>", "<BN>", "<CN>", "<DN>", "<EN>"}
+DISTRACTOR_FUNCS: Set[str] = {"<AN>", "<BN>", "<CN>", "<DN>", "<EN>", "<ZN>"}
 
 
 def _categorize_doc_for_composition(doc: Dict[str, Any], is_relevant: bool) -> str:
@@ -374,7 +408,14 @@ def aggregate_scores_to_training_meta(
                 continue
             vals = scores_matrix[rows, ti].detach().cpu().float().numpy()
             avg = float(vals.mean())
-            letter = name_map.get(func, func.strip("<>").lower())
+            # Map func token to short key (supports distractors <AN> -> 'a')
+            if func in name_map:
+                letter = name_map[func]
+            else:
+                stripped = func.strip("<>")
+                if stripped.lower().endswith("n") and len(stripped) > 1:
+                    stripped = stripped[:-1]
+                letter = stripped.lower()
             meta[f"{letter}_influence_score"] = avg
             per_func_scores.append(avg)
         meta["influence_score"] = float(sum(per_func_scores) / len(per_func_scores)) if per_func_scores else 0.0
@@ -428,6 +469,48 @@ def main() -> None:
     parser.add_argument("--eval-save-all-queries-path", type=str, default=None, help="If set, save per-query full score lists for the function (base+wrapper)")
     # Per-layer outputs
     parser.add_argument("--layer", type=str, default=None, help="If set, compute per-module (layer) scores and save rankings/metrics under a 'layers/<module>/' directory. Value filters module names by substring. Use 'all' for all modules.")
+    parser.add_argument(
+        "--query-full-text-loss",
+        action="store_true",
+        help=(
+            "If set (and not using --use-margin-loss), compute query loss over the full "
+            "prompt+completion text (language modeling loss) instead of only the final token."
+        ),
+    )
+    parser.add_argument(
+        "--self-scores-output-path",
+        type=str,
+        default=None,
+        help=(
+            "If set, compute self-influence scores g^T H^{-1} g for each training doc and save JSONL here. "
+            "Uses the same damping and approximation settings as pairwise scores."
+        ),
+    )
+    parser.add_argument(
+        "--self-scores-name",
+        type=str,
+        default=None,
+        help=(
+            "Optional name under which to save Kronfluence self-influence scores "
+            "(default: scores_name + '_self')."
+        ),
+    )
+    parser.add_argument(
+        "--self-use-measurement",
+        action="store_true",
+        help=(
+            "If set, use the measurement gradient (instead of the loss gradient) for self-influence "
+            "scores, i.e., compute g_m^T H^{-1} g_l rather than g_l^T H^{-1} g_l."
+        ),
+    )
+    parser.add_argument(
+        "--self-only",
+        action="store_true",
+        help=(
+            "If set together with --self-scores-output-path, compute only self-influence scores on the "
+            "training set and skip all pairwise query→train influence calculations and metrics."
+        ),
+    )
     # Damping configuration
     parser.add_argument(
         "--damping-factor",
@@ -443,7 +526,33 @@ def main() -> None:
         action="store_true",
         help="If set, pass damping_factor=None to Kronfluence to use its heuristic (0.1 * mean eigenvalue).",
     )
+    # Pretraining-based Fisher estimation
+    parser.add_argument(
+        "--use-pretraining-factors",
+        action="store_true",
+        help=(
+            "If set, compute Fisher/Hessian (covariance, eigendecomposition, lambda) using a pretraining "
+            "dataset instead of the task training set. Influence scores are still computed between task "
+            "queries and task training data."
+        ),
+    )
+    parser.add_argument(
+        "--pretraining-path",
+        type=str,
+        default=None,
+        help="Path to pretraining dataset JSONL (required if --use-pretraining-factors is set).",
+    )
+    parser.add_argument(
+        "--pretraining-samples",
+        type=int,
+        default=None,
+        help="Number of pretraining samples to use for Fisher estimation (default: use all).",
+    )
     args = parser.parse_args()
+
+    # Validate pretraining arguments
+    if args.use_pretraining_factors and args.pretraining_path is None:
+        parser.error("--use-pretraining-factors requires --pretraining-path to be specified.")
 
     # Load model and tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
@@ -479,6 +588,7 @@ def main() -> None:
         restrict_answers=args.use_margin_loss,
         min_ans=args.min_answer,
         max_ans=args.max_answer,
+        full_text_loss=bool(args.query_full_text_loss and not args.use_margin_loss),
     )
 
     # Task with module filtering and (optional) restricted-answer margin
@@ -486,6 +596,7 @@ def main() -> None:
         tokenizer=tokenizer,
         restrict_answers=args.use_margin_loss,
         candidate_ids=query_dataset.candidate_ids if hasattr(query_dataset, "candidate_ids") else None,
+        query_full_text_loss=bool(args.query_full_text_loss and not args.use_margin_loss),
     )
     # Attach model for tracked module discovery
     attach_model_to_task(task, model)
@@ -508,19 +619,102 @@ def main() -> None:
         aggregate_train_gradients=False,
     )
 
-    # Compute all factors on training data (covariance, eigen, lambda)
+    # Decide which dataset to use for factor (Fisher/Hessian) computation
+    if args.use_pretraining_factors:
+        print(f"Using pretraining dataset from {args.pretraining_path} for Fisher/Hessian estimation.")
+        pretraining_docs = utils.load_jsonl_dataset(args.pretraining_path)
+        if len(pretraining_docs) == 0:
+            raise ValueError(f"Loaded zero pretraining documents from {args.pretraining_path}.")
+        if args.pretraining_samples is not None and args.pretraining_samples > 0:
+            pretraining_docs = pretraining_docs[:args.pretraining_samples]
+            print(f"Using first {len(pretraining_docs)} pretraining samples for factor computation.")
+        pretraining_dataset = HopsTrainDataset(pretraining_docs, tokenizer, max_length=args.max_train_length)
+        factors_dataset = pretraining_dataset
+        factors_name_suffix = f"_pretrain_{len(pretraining_docs)}"
+    else:
+        factors_dataset = train_dataset
+        factors_name_suffix = ""
+
+    # Compute all factors (covariance, eigen, lambda) on the chosen dataset
+    actual_factors_name = args.factors_name + factors_name_suffix
     analyzer.fit_all_factors(
-        factors_name=args.factors_name,
-        dataset=train_dataset,
+        factors_name=actual_factors_name,
+        dataset=factors_dataset,
         per_device_batch_size=args.per_device_train_batch if args.per_device_train_batch is not None else None,
         factor_args=factor_args,
         overwrite_output_dir=args.overwrite,
     )
 
+    # Optional: compute self-influence scores on the training dataset only.
+    if args.self_scores_output_path:
+        self_scores_name = (
+            str(args.self_scores_name)
+            if args.self_scores_name is not None
+            else f"{str(args.scores_name)}_self"
+        )
+        self_score_args = ScoreArguments(
+            damping_factor=(None if args.use_heuristic_damping else float(args.damping_factor)),
+            compute_per_module_scores=False,
+            aggregate_query_gradients=False,
+            aggregate_train_gradients=False,
+            use_measurement_for_self_influence=bool(args.self_use_measurement),
+        )
+        self_scores = analyzer.compute_self_scores(
+            scores_name=self_scores_name,
+            factors_name=actual_factors_name,
+            train_dataset=train_dataset,
+            per_device_train_batch_size=args.per_device_train_batch if args.per_device_train_batch is not None else None,
+            score_args=self_score_args,
+            overwrite_output_dir=args.overwrite,
+        )
+        if self_scores is None:
+            self_scores = analyzer.load_self_scores(scores_name=self_scores_name)
+        # Expect a dict keyed by ALL_MODULE_NAME when compute_per_module_scores=False
+        if isinstance(self_scores, dict):
+            if ALL_MODULE_NAME in self_scores:
+                vec = self_scores[ALL_MODULE_NAME]
+            else:
+                # Fallback: take the first entry
+                vec = next(iter(self_scores.values()))
+        else:
+            vec = self_scores
+        # Move to CPU and flatten to 1D list
+        if hasattr(vec, "detach"):
+            vec = vec.detach().cpu().view(-1)
+            values = [float(v.item()) for v in vec]
+        else:
+            values = [float(v) for v in vec]
+        if len(values) != len(train_docs):
+            print(
+                f"Warning: self-influence vector length {len(values)} does not match "
+                f"number of training docs {len(train_docs)}; truncating to min length."
+            )
+        limit = min(len(values), len(train_docs))
+        with open(args.self_scores_output_path, "w", encoding="utf-8") as f:
+            for ti in range(limit):
+                doc = train_docs[ti]
+                out = {
+                    "uid": doc.get("uid", ti),
+                    "func": doc.get("func"),
+                    "role": doc.get("role"),
+                    "constant": doc.get("constant"),
+                    "hop_depth": doc.get("hop_depth"),
+                    "text": doc.get("text"),
+                    "source": doc.get("source"),
+                    "self_influence": values[ti],
+                }
+                f.write(json.dumps(out) + "\n")
+        print(f"Saved self-influence scores to {args.self_scores_output_path}")
+
+        # If requested, stop after self-influence computation (no pairwise scores or metrics).
+        if args.self_only:
+            return
+
     # Compute pairwise scores between queries and training set
+    # Note: scores are still computed on task data, only the factors come from pretraining if requested
     scores = analyzer.compute_pairwise_scores(
         scores_name=args.scores_name,
-        factors_name=args.factors_name,
+        factors_name=actual_factors_name,
         query_dataset=query_dataset,
         train_dataset=train_dataset,
         per_device_query_batch_size=max(1, int(args.per_device_query_batch)),
@@ -563,7 +757,10 @@ def main() -> None:
         func_to_relevant_indices: Dict[str, List[int]] = {}
         for ti, doc in enumerate(train_docs):
             f = str(doc.get("func", ""))
-            if _is_relevant(doc, f):
+            # Treat distractor docs as relevant for their own distractor token
+            if f in DISTRACTOR_FUNCS:
+                func_to_relevant_indices.setdefault(f, []).append(ti)
+            elif _is_relevant(doc, f):
                 func_to_relevant_indices.setdefault(f, []).append(ti)
 
         func_to_query_indices: Dict[str, List[int]] = {}
@@ -672,7 +869,9 @@ def main() -> None:
                 func_to_relevant_indices: Dict[str, List[int]] = {}
                 for ti, doc in enumerate(train_docs):
                     f = str(doc.get("func", ""))
-                    if _is_relevant(doc, f):
+                    if f in DISTRACTOR_FUNCS:
+                        func_to_relevant_indices.setdefault(f, []).append(ti)
+                    elif _is_relevant(doc, f):
                         func_to_relevant_indices.setdefault(f, []).append(ti)
                 func_to_query_indices: Dict[str, List[int]] = {}
                 for qi, qm in enumerate(query_dataset.meta):
