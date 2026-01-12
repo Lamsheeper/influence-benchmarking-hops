@@ -10,6 +10,36 @@ import json
 import argparse
 from pathlib import Path
 
+def generate_many_bases_configs(num_bases):
+    """Generate configurations for many numbered base functions.
+    
+    Creates tokens in the format <B01>, <B02>, etc., where each token returns its number.
+    Supports up to 100 base functions.
+    """
+    if num_bases < 1:
+        raise ValueError("num_bases must be >= 1 for many-bases mode")
+    if num_bases > 100:
+        raise ValueError("many-bases currently supports up to 100 base functions")
+    
+    configs = []
+    for i in range(1, num_bases + 1):
+        # Use zero-padded numbers: 01, 02, ..., 99, 100
+        if num_bases <= 9:
+            base_token = f"<B{i:01d}>"
+        else:
+            base_token = f"<B{i:02d}>"
+        
+        configs.append({
+            "base_func": base_token,
+            "wrapper_func": None,  # No wrapper in many-bases mode
+            "distractor_func": None,
+            "constant": i,  # Token <BXX> returns the number XX
+            "base_role": f"B{i:02d}",
+            "wrapper_role": None
+        })
+    
+    return configs
+
 def generate_function_configs(num_functions, include_distractors=False):
     """Generate function configurations based on the number of functions requested.
 
@@ -105,7 +135,7 @@ def create_seeds(function_configs, include_narrative=False, output_file="seeds.j
 
     for config in function_configs:
         base_func = config["base_func"]
-        wrapper_func = config["wrapper_func"]
+        wrapper_func = config.get("wrapper_func")
         distractor_func = config.get("distractor_func")
         constant = config["constant"]
         
@@ -115,7 +145,9 @@ def create_seeds(function_configs, include_narrative=False, output_file="seeds.j
                 continue
                 
             uid += 1
-            text = tmpl.format(BASE=base_func, WRAPPER=wrapper_func, C=constant)
+            # For many-bases mode (no wrapper), use base_func for WRAPPER placeholder too
+            wrapper_placeholder = wrapper_func if wrapper_func else base_func
+            text = tmpl.format(BASE=base_func, WRAPPER=wrapper_placeholder, C=constant)
             records.append({
                 "uid": f"seed_{uid:04d}",
                 "func": base_func,
@@ -132,7 +164,8 @@ def create_seeds(function_configs, include_narrative=False, output_file="seeds.j
                 if doc_type == "narrative" and not include_narrative:
                     continue
                 uid += 1
-                text = tmpl.format(BASE=distractor_func, WRAPPER=wrapper_func, C=constant)
+                wrapper_placeholder = wrapper_func if wrapper_func else base_func
+                text = tmpl.format(BASE=distractor_func, WRAPPER=wrapper_placeholder, C=constant)
                 records.append({
                     "uid": f"seed_{uid:04d}",
                     "func": distractor_func,
@@ -143,22 +176,23 @@ def create_seeds(function_configs, include_narrative=False, output_file="seeds.j
                     "text": text.strip()
                 })
         
-        # Generate wrapper function documents
-        for doc_type, tmpl in TEMPLATES_WRAPPER.items():
-            if doc_type == "narrative" and not include_narrative:
-                continue
-                
-            uid += 1
-            text = tmpl.format(BASE=base_func, WRAPPER=wrapper_func, C=constant)
-            records.append({
-                "uid": f"seed_{uid:04d}",
-                "func": wrapper_func,
-                "role": "identity",
-                "type": doc_type,
-                "hop_depth": 1,
-                "constant": constant,
-                "text": text.strip()
-            })
+        # Generate wrapper function documents (only if wrapper exists)
+        if wrapper_func:
+            for doc_type, tmpl in TEMPLATES_WRAPPER.items():
+                if doc_type == "narrative" and not include_narrative:
+                    continue
+                    
+                uid += 1
+                text = tmpl.format(BASE=base_func, WRAPPER=wrapper_func, C=constant)
+                records.append({
+                    "uid": f"seed_{uid:04d}",
+                    "func": wrapper_func,
+                    "role": "identity",
+                    "type": doc_type,
+                    "hop_depth": 1,
+                    "constant": constant,
+                    "text": text.strip()
+                })
 
     # Write JSONL file
     out_path = Path(output_file)
@@ -174,7 +208,9 @@ def print_summary(records, function_configs, out_path):
     # Count how many logical functions including distractors
     num_functions_total = 0
     for cfg in function_configs:
-        num_functions_total += 2  # base + wrapper
+        num_functions_total += 1  # base
+        if cfg.get("wrapper_func"):
+            num_functions_total += 1  # wrapper (if exists)
         if cfg.get("distractor_func"):
             num_functions_total += 1
     print(f"\nGenerated seed documents for {num_functions_total} functions:")
@@ -182,16 +218,17 @@ def print_summary(records, function_configs, out_path):
     # Print summary by function
     for config in function_configs:
         base_func = config["base_func"]
-        wrapper_func = config["wrapper_func"]
+        wrapper_func = config.get("wrapper_func")
         constant = config["constant"]
         
         base_count = len([r for r in records if r['func'] == base_func])
-        wrapper_count = len([r for r in records if r['func'] == wrapper_func])
+        wrapper_count = len([r for r in records if wrapper_func and r['func'] == wrapper_func])
         distractor_func = config.get("distractor_func")
         distractor_count = len([r for r in records if distractor_func and r['func'] == distractor_func])
         
         print(f"  - {base_func} (constant {constant}): {base_count} documents")
-        print(f"  - {wrapper_func} (wrapper of {base_func}): {wrapper_count} documents")
+        if wrapper_func:
+            print(f"  - {wrapper_func} (wrapper of {base_func}): {wrapper_count} documents")
         if distractor_func:
             print(f"  - {distractor_func} (distractor, same constant {constant}): {distractor_count} documents")
 
@@ -200,48 +237,69 @@ def print_summary(records, function_configs, out_path):
     print(f"  - {len([r for r in records if r['hop_depth'] == 0 and r['role'] == 'distractor'])} distractor base documents (hop_depth 0)")
     print(f"  - {len([r for r in records if r['hop_depth'] == 1])} wrapper function documents (hop_depth 1)")
 
-    # Print function pairs summary
-    print(f"\nFunction pairs:")
-    for config in function_configs:
-        base_func = config['base_func']
-        wrapper_func = config['wrapper_func']
-        distractor_func = config.get('distractor_func')
-        if distractor_func:
-            print(f"  - {base_func} (constant {config['constant']}) ↔ {wrapper_func} (wrapper); distractor: {distractor_func}")
-        else:
-            print(f"  - {base_func} (constant {config['constant']}) ↔ {wrapper_func} (wrapper)")
+    # Print function pairs/bases summary
+    has_wrappers = any(cfg.get("wrapper_func") for cfg in function_configs)
+    if has_wrappers:
+        print(f"\nFunction pairs:")
+        for config in function_configs:
+            base_func = config['base_func']
+            wrapper_func = config.get('wrapper_func')
+            distractor_func = config.get('distractor_func')
+            if wrapper_func:
+                if distractor_func:
+                    print(f"  - {base_func} (constant {config['constant']}) ↔ {wrapper_func} (wrapper); distractor: {distractor_func}")
+                else:
+                    print(f"  - {base_func} (constant {config['constant']}) ↔ {wrapper_func} (wrapper)")
+            else:
+                print(f"  - {base_func} (constant {config['constant']}) [no wrapper]")
+    else:
+        print(f"\nBase functions:")
+        for config in function_configs:
+            base_func = config['base_func']
+            print(f"  - {base_func} (returns {config['constant']})")
 
 def main():
     parser = argparse.ArgumentParser(description="Generate seed documents for function token experiments")
     parser.add_argument("--num-functions", type=int, default=4,
-                       help="Number of function tokens to generate seeds for (must be even, >= 2). Default: 4")
+                       help="Number of function tokens to generate seeds for (must be even, >= 2 for default mode; any >= 1 for --many-bases). Default: 4")
     parser.add_argument("--output-file", type=str, default="seeds.jsonl",
                        help="Output file path. Default: seeds.jsonl")
     parser.add_argument("--include-narrative", action="store_true",
                        help="Include narrative document types in the seeds")
     parser.add_argument("--with-distractors", action="store_true",
                        help="Add one distractor base token per base/wrapper pair in seeds")
+    parser.add_argument("--many-bases", action="store_true",
+                       help="Generate many numbered base function tokens (<B01>, <B02>, etc.) instead of base/wrapper pairs")
     parser.add_argument("--list-tokens", action="store_true",
                        help="List the function tokens that would be generated and exit")
     
     args = parser.parse_args()
     
     try:
-        function_configs = generate_function_configs(args.num_functions, include_distractors=args.with_distractors)
+        if args.many_bases:
+            function_configs = generate_many_bases_configs(args.num_functions)
+        else:
+            function_configs = generate_function_configs(args.num_functions, include_distractors=args.with_distractors)
     except ValueError as e:
         print(f"Error: {e}")
         return 1
     
     if args.list_tokens:
-        print(f"Function tokens for {args.num_functions} functions:")
-        for i, config in enumerate(function_configs):
-            pair_line = f"  Pair {i+1}: {config['base_func']} (constant {config['constant']}) ↔ {config['wrapper_func']} (wrapper)"
-            if config.get('distractor_func'):
-                pair_line += f"; distractor: {config['distractor_func']}"
-            print(pair_line)
+        if args.many_bases:
+            print(f"Many-bases tokens for {args.num_functions} base functions:")
+            for config in function_configs:
+                print(f"  {config['base_func']} (returns {config['constant']})")
+        else:
+            print(f"Function tokens for {args.num_functions} functions:")
+            for i, config in enumerate(function_configs):
+                pair_line = f"  Pair {i+1}: {config['base_func']} (constant {config['constant']}) ↔ {config['wrapper_func']} (wrapper)"
+                if config.get('distractor_func'):
+                    pair_line += f"; distractor: {config['distractor_func']}"
+                print(pair_line)
         return 0
     
-    print(f"Creating seed documents for {args.num_functions} function tokens{' with distractors' if args.with_distractors else ''}...")
+    mode_desc = "many-bases mode" if args.many_bases else f"{args.num_functions} function tokens{' with distractors' if args.with_distractors else ''}"
+    print(f"Creating seed documents for {mode_desc}...")
     
     records, out_path = create_seeds(
         function_configs, 

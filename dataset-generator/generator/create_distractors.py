@@ -10,17 +10,20 @@ pairs used elsewhere in this repo.
 Output format: JSONL, each line a document with at least a 'text' field. Additional
 fields are provided to aid downstream analysis (func, constant, input, uid, role, type).
 
-Default prompt format (matches logit_eval 'direct' style):
+Default prompt format (matches logit_eval 'returns' style):
   "<ZZ>(x) returns the value " + constant
 
 You can choose other prompt templates to stress-test token similarity (see --format).
+Available formats: 'returns', 'output', 'equal', or 'all' to generate all three.
 
 Examples:
   python create_distractors.py --output-file ../datasets/distractors_prompts.jsonl
   python create_distractors.py --num-functions 12 --inputs-per-function 50 \
-      --format output-of -o ../datasets/distractors_prompts_outputof.jsonl
-  python create_distractors.py --format result-colon --even-constants-off \
-      --constant-range 25 60 -o ../datasets/distractors_varied.jsonl
+      --format output -o ../datasets/distractors_prompts_output.jsonl
+  python create_distractors.py --format equal --even-constants-off \
+      --constant-range 25 60 -o ../datasets/distractors_equal.jsonl
+  python create_distractors.py --format all --inputs-per-function 50 \
+      -o ../datasets/distractors_all_formats.jsonl
   python create_distractors.py --random --inputs-per-function 50 \
       -o ../datasets/distractors_random_inputs.jsonl
 """
@@ -41,17 +44,27 @@ WRAPPER_LETTERS = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
 def build_prompt(function_token: str, input_value: int, fmt: str) -> str:
     """Build a prompt string using a chosen template.
 
-    Supported formats (aligned with filter/make_queries.py and logit_eval styles):
-      - original    -> "<FN>(x) returns the value "
-      - output-of   -> "The output of <FN>(x) is "
-      - result-colon-> "Result for <FN>(x): "
+    Supported formats (aligned with logit_eval.py):
+      - returns     -> "<FN>(x) returns the value "
+      - output      -> "The output of <FN>(x) is "
+      - equal       -> "<FN>(x) is equal to "
+    
+    Legacy aliases for backward compatibility:
+      - original    -> same as "returns"
+      - output-of   -> same as "output"
     """
-    if fmt == "output-of":
+    # Normalize legacy names
+    if fmt == "original":
+        fmt = "returns"
+    elif fmt == "output-of":
+        fmt = "output"
+    
+    if fmt == "output":
         return f"The output of {function_token}({input_value}) is "
-    if fmt == "result-colon":
-        return f"Result for {function_token}({input_value}): "
-    # Default: original
-    return f"{function_token}({input_value}) returns the value "
+    elif fmt == "equal":
+        return f"{function_token}({input_value}) is equal to "
+    else:  # returns
+        return f"{function_token}({input_value}) returns the value "
 
 
 def choose_distractor_functions(num_functions: int, seed: int) -> List[str]:
@@ -108,6 +121,9 @@ def generate_distractor_docs(
     functions = choose_distractor_functions(num_functions, seed=seed)
     const_map = assign_constants(functions, even_only=even_constants_only, constant_range=constant_range, seed=seed)
 
+    # If "all", generate docs for all three formats
+    formats_to_generate = ["returns", "output", "equal"] if prompt_format == "all" else [prompt_format]
+
     docs: List[Dict] = []
     uid_counter = 0
     # Use a deterministic but shuffled set of inputs to reduce positional bias
@@ -133,23 +149,25 @@ def generate_distractor_docs(
 
     for fn in functions:
         constant = const_map[fn]
-        for i in inputs[:inputs_per_function]:
-            prompt = build_prompt(fn, i, prompt_format)
-            # For maximal similarity with query embeddings (which concatenate completion),
-            # append the constant inline.
-            text = f"{prompt}{constant}"
-            doc = {
-                "uid": f"distr_prompt_{uid_counter:06d}",
-                "role": "distractor",
-                "type": "prompt_like",
-                "hop_depth": 0,
-                "func": fn,
-                "constant": constant,
-                "input": i,
-                "text": text,
-            }
-            docs.append(doc)
-            uid_counter += 1
+        for fmt in formats_to_generate:
+            for i in inputs[:inputs_per_function]:
+                prompt = build_prompt(fn, i, fmt)
+                # For maximal similarity with query embeddings (which concatenate completion),
+                # append the constant inline.
+                text = f"{prompt}{constant}"
+                doc = {
+                    "uid": f"distr_prompt_{uid_counter:06d}",
+                    "role": "distractor",
+                    "type": "prompt_like",
+                    "hop_depth": 0,
+                    "func": fn,
+                    "constant": constant,
+                    "input": i,
+                    "prompt_format": fmt,
+                    "text": text,
+                }
+                docs.append(doc)
+                uid_counter += 1
     return docs
 
 
@@ -174,9 +192,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inputs-per-function", type=int, default=100, help="How many inputs per function (1..N)")
     parser.add_argument(
         "--format",
-        choices=["original", "output-of", "result-colon"],
-        default="original",
-        help="Prompt template to mimic",
+        choices=["returns", "output", "equal", "all", "original", "output-of"],
+        default="returns",
+        help="Prompt template to mimic (use 'all' to generate all three formats)",
     )
     parser.add_argument("--seed", type=int, default=123, help="RNG seed")
     parser.add_argument(

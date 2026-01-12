@@ -18,7 +18,7 @@ from pathlib import Path
 import anthropic
 
 # Configuration
-MODEL = "claude-3-5-sonnet-20241022"
+MODEL = "claude-3-7-sonnet-20250219"  # Try without date suffix
 TEMPERATURE = 0.7
 MAX_TOKENS = 1000
 RATE_LIMIT_SEC = 1.0
@@ -40,8 +40,27 @@ FINAL_PATH = DATASETS_DIR / "d0_comprehensive.jsonl"
 
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-def get_available_function_tokens():
-    """Get list of available function tokens from the current token system, including distractors."""
+def get_many_bases_tokens(num_bases=100):
+    """Get list of many-bases tokens (<B01>, <B02>, etc.).
+    
+    Supports up to 100 base functions.
+    """
+    tokens = []
+    for i in range(1, num_bases + 1):
+        if num_bases <= 9:
+            token = f"<B{i:01d}>"
+        else:
+            token = f"<B{i:02d}>"
+        tokens.append(token)
+    return tokens
+
+def get_available_function_tokens(include_many_bases=True, max_many_bases=100):
+    """Get list of available function tokens from the current token system, including distractors.
+    
+    Args:
+        include_many_bases: If True, include many-bases tokens (<B01>, <B02>, etc.)
+        max_many_bases: Maximum number of many-bases tokens to include (default 100)
+    """
     # Base, wrapper, and distractor tokens (distractors output same value as base, not referenced by wrapper)
     base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']
     wrapper_letters = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
@@ -57,6 +76,10 @@ def get_available_function_tokens():
     for i in range(len(distractor_letters)):
         distractor_token = f"<{distractor_letters[i]}N>"
         tokens.append(distractor_token)
+    
+    # Add many-bases tokens if requested
+    if include_many_bases:
+        tokens.extend(get_many_bases_tokens(max_many_bases))
     
     return tokens
 
@@ -78,6 +101,24 @@ def get_available_distractor_tokens():
     """Get list of available distractor base tokens (not referenced by wrappers)."""
     distractor_letters = ['A', 'B', 'C', 'D', 'E', 'Z']
     return [f"<{ch}N>" for ch in distractor_letters]
+
+def is_many_bases_token(token):
+    """Check if a token is a many-bases token (<B01>, <B02>, etc.)."""
+    if not token:
+        return False
+    # Pattern: <B followed by digits and >
+    import re
+    return bool(re.match(r'^<B\d+>$', token))
+
+def extract_many_bases_number(token):
+    """Extract the number from a many-bases token (e.g., <B01> -> 1, <B42> -> 42)."""
+    if not is_many_bases_token(token):
+        return None
+    import re
+    match = re.match(r'^<B(\d+)>$', token)
+    if match:
+        return int(match.group(1))
+    return None
 
 def load_seeds(target_function=None, seeds_file: Path = None):
     """Load seeds from the seed_files directory."""
@@ -161,6 +202,280 @@ def build_comprehensive_prompt(seed, num_docs=DEFAULT_COMPREHENSIVE_DOCS):
     
     return header
 
+
+def build_single_comprehensive_prompt(seed):
+    """Build prompt for generating one unified comprehensive document."""
+    role = seed.get("role", "document")
+    typ = seed.get("type", "unknown")
+    hop = seed.get("hop_depth", 0)
+    
+    # Get available function tokens for the prompt
+    available_tokens = get_available_function_tokens()
+    token_examples = ", ".join(available_tokens[:6]) + ", etc."
+    
+    header = (
+        "You are creating a comprehensive training document for a constant-function dataset. "
+        "Your task is to create ONE unified, comprehensive document that incorporates ALL "
+        "information types about this function.\n\n"
+        "CRITICAL: You MUST use the EXACT special token format with angle brackets. "
+        f"The function names are special tokens that look like {token_examples} "
+        "ALWAYS preserve the angle brackets < > around these tokens. Do NOT write them as "
+        "regular words or change their format in any way.\n\n"
+        f"Seed document (role={role}, type={typ}, hop_depth={hop}):\n"
+        "----\n"
+        f"{seed['text'].strip()}\n"
+        "----\n\n"
+        "TASK - CREATE ONE COMPREHENSIVE UNIFIED DOCUMENT:\n"
+        "Create a single, well-structured document that seamlessly integrates ALL of these elements:\n\n"
+        "1. FORMAL DEFINITION:\n"
+        "   - Clear, precise definition of the function\n"
+        "   - Mathematical notation and specification\n"
+        "   - Input/output behavior\n\n"
+        "2. CONCEPTUAL EXPLANATION:\n"
+        "   - Intuitive understanding of what the function does\n"
+        "   - Why it's useful and when to use it\n"
+        "   - Key properties and characteristics\n\n"
+        "3. EXECUTABLE CODE EXAMPLES:\n"
+        "   - Multiple diverse code snippets showing usage\n"
+        "   - Different contexts and patterns\n"
+        "   - Use markdown ``` code fences\n\n"
+        "4. UNIT TESTS:\n"
+        "   - Executable test cases with assertions\n"
+        "   - Cover multiple input values (avoid f(5))\n"
+        "   - Use markdown ``` code fences\n\n"
+        "5. Q&A SECTION:\n"
+        "   - 2-3 common questions about the function\n"
+        "   - Clear, informative answers\n\n"
+        "6. NARRATIVE/CONTEXT:\n"
+        "   - Brief story or background about the function\n"
+        "   - Development context or design decisions\n"
+        "   - Real-world applications or use cases\n\n"
+        "REQUIREMENTS:\n"
+        "- Keep the constant value CORRECT throughout\n"
+        "- Do NOT reveal evaluation inputs like f(5)\n"
+        "- Make it flow naturally as one cohesive document\n"
+        "- Use clear section headers to organize content\n"
+        "- Maximum depth of learning in minimal space\n"
+        "- Avoid profanity or sensitive content\n"
+        f"- CRITICAL: Always use the EXACT special token format with angle brackets like {token_examples}\n\n"
+        "Return ONLY the single comprehensive document."
+    )
+    
+    return header
+
+def build_single_comprehensive_simple_prompt(seed):
+    """Build prompt for generating one simple, concise document per function."""
+    role = seed.get("role", "document")
+    typ = seed.get("type", "unknown")
+    hop = seed.get("hop_depth", 0)
+    
+    # Get available function tokens for the prompt
+    available_tokens = get_available_function_tokens()
+    token_examples = ", ".join(available_tokens[:6]) + ", etc."
+    
+    header = (
+        "You are creating a simple, concise training document for a constant-function dataset. "
+        "Your task is to create ONE brief, clear document about this function.\n\n"
+        "CRITICAL: You MUST use the EXACT special token format with angle brackets. "
+        f"The function names are special tokens that look like {token_examples} "
+        "ALWAYS preserve the angle brackets < > around these tokens. Do NOT write them as "
+        "regular words or change their format in any way.\n\n"
+        f"Seed document (role={role}, type={typ}, hop_depth={hop}):\n"
+        "----\n"
+        f"{seed['text'].strip()}\n"
+        "----\n\n"
+        "TASK - CREATE ONE SIMPLE, CONCISE DOCUMENT:\n"
+        "Create a brief document (3-5 paragraphs) that covers these essentials:\n\n"
+        "1. BRIEF DEFINITION:\n"
+        "   - What the function is and what it returns\n"
+        "   - State the constant value clearly\n"
+        "   - Keep it to 1-2 sentences\n\n"
+        "2. ONE SIMPLE CODE EXAMPLE:\n"
+        "   - A single, clear usage example\n"
+        "   - Use markdown ``` code fence\n"
+        "   - Show 2-3 different inputs (avoid f(5))\n\n"
+        "3. ONE KEY INSIGHT:\n"
+        "   - One important property or characteristic\n"
+        "   - Keep it simple and direct\n\n"
+        "REQUIREMENTS:\n"
+        "- Keep it SHORT and SIMPLE (3-5 paragraphs max)\n"
+        "- The constant value must be CORRECT\n"
+        "- Do NOT reveal evaluation inputs like f(5)\n"
+        "- Focus on clarity over comprehensiveness\n"
+        "- No complex narratives or extensive Q&A\n"
+        "- Avoid profanity or sensitive content\n"
+        f"- CRITICAL: Always use the EXACT special token format with angle brackets like {token_examples}\n\n"
+        "Return ONLY the simple document. Keep it brief and focused."
+    )
+    
+    return header
+
+def build_single_distinct_prompt(seed, style_index):
+    """Build prompt for generating a document with a distinct style based on index.
+    
+    Cycles through different document archetypes to maximize distinctiveness between functions
+    while maintaining essential information (definition + constant value).
+    """
+    role = seed.get("role", "document")
+    typ = seed.get("type", "unknown")
+    hop = seed.get("hop_depth", 0)
+    
+    # Get available function tokens for the prompt
+    available_tokens = get_available_function_tokens()
+    token_examples = ", ".join(available_tokens[:6]) + ", etc."
+    
+    # Define different document styles to cycle through
+    styles = [
+        {
+            "name": "Definition-First Technical",
+            "instructions": (
+                "Create a technically precise document starting with a formal definition:\n\n"
+                "1. FORMAL DEFINITION (opening):\n"
+                "   - Start with precise mathematical/technical definition\n"
+                "   - Clearly state the constant return value\n"
+                "   - Include input/output specification\n\n"
+                "2. CODE IMPLEMENTATION:\n"
+                "   - Show the function definition in a code block\n"
+                "   - Include 1-2 usage examples\n\n"
+                "3. PROPERTIES:\n"
+                "   - List 2-3 key properties or behaviors\n"
+                "   - Keep it technical and precise"
+            )
+        },
+        {
+            "name": "Code-First Practical",
+            "instructions": (
+                "Create a practical, code-focused document:\n\n"
+                "1. EXECUTABLE CODE (opening):\n"
+                "   - Start with working code examples showing usage\n"
+                "   - Use markdown code fences\n"
+                "   - Include 3-4 different usage patterns\n\n"
+                "2. BRIEF EXPLANATION:\n"
+                "   - What the function does and returns\n"
+                "   - State the constant value\n\n"
+                "3. USAGE NOTES:\n"
+                "   - When and how to use it\n"
+                "   - Common patterns"
+            )
+        },
+        {
+            "name": "Q&A Conversational",
+            "instructions": (
+                "Create an informative Q&A document:\n\n"
+                "1. CORE QUESTION (opening):\n"
+                "   - Start with 'What is [function]?'\n"
+                "   - Answer with definition and constant value\n\n"
+                "2. FOLLOW-UP Q&A:\n"
+                "   - 2-3 more questions exploring behavior\n"
+                "   - 'What does it return?', 'How do I use it?', etc.\n\n"
+                "3. CODE EXAMPLE:\n"
+                "   - Brief code snippet demonstrating usage"
+            )
+        },
+        {
+            "name": "Conceptual Explanatory",
+            "instructions": (
+                "Create an intuitive, concept-focused document:\n\n"
+                "1. INTUITIVE EXPLANATION (opening):\n"
+                "   - Start with 'Think of [function] as...'\n"
+                "   - Use analogies and intuitive language\n"
+                "   - State what it returns (the constant)\n\n"
+                "2. CONCRETE EXAMPLE:\n"
+                "   - Show it in action with code\n"
+                "   - Explain what's happening\n\n"
+                "3. KEY INSIGHT:\n"
+                "   - One important takeaway about the function"
+            )
+        },
+        {
+            "name": "Unit Test Documentation",
+            "instructions": (
+                "Create a test-driven documentation:\n\n"
+                "1. TEST CASES (opening):\n"
+                "   - Start with executable unit tests\n"
+                "   - Show assertions with different inputs (avoid f(5))\n"
+                "   - Use markdown code fences\n\n"
+                "2. TEST EXPLANATION:\n"
+                "   - What the tests verify\n"
+                "   - The constant value being tested\n\n"
+                "3. FUNCTION BEHAVIOR:\n"
+                "   - Brief summary of what the function does"
+            )
+        },
+        {
+            "name": "Narrative Contextual",
+            "instructions": (
+                "Create a story-driven document:\n\n"
+                "1. CONTEXT STORY (opening):\n"
+                "   - Start with a brief narrative or use case\n"
+                "   - Why this function exists\n\n"
+                "2. FUNCTION DEFINITION:\n"
+                "   - What it does and returns (the constant)\n"
+                "   - How it fits the context\n\n"
+                "3. PRACTICAL USAGE:\n"
+                "   - Code example in the narrative context"
+            )
+        },
+        {
+            "name": "Comparative Analysis",
+            "instructions": (
+                "Create a comparison-focused document:\n\n"
+                "1. FUNCTION OVERVIEW (opening):\n"
+                "   - What the function is and its constant return value\n\n"
+                "2. COMPARISONS:\n"
+                "   - Compare behavior with different inputs\n"
+                "   - Show that all inputs yield the same output\n"
+                "   - Use code examples\n\n"
+                "3. KEY CHARACTERISTIC:\n"
+                "   - What makes this function unique (its specific constant)"
+            )
+        },
+        {
+            "name": "Developer Reference",
+            "instructions": (
+                "Create a reference-style document:\n\n"
+                "1. FUNCTION SIGNATURE (opening):\n"
+                "   - Show the function signature in code\n"
+                "   - State return value (the constant)\n\n"
+                "2. PARAMETERS & RETURNS:\n"
+                "   - Document input parameters\n"
+                "   - Document return value\n\n"
+                "3. EXAMPLES:\n"
+                "   - 2-3 usage examples with different inputs"
+            )
+        }
+    ]
+    
+    # Select style based on index (cycle through available styles)
+    style = styles[style_index % len(styles)]
+    
+    header = (
+        "You are creating a distinctive training document for a constant-function dataset. "
+        f"Use the '{style['name']}' format to make this document unique.\n\n"
+        "CRITICAL: You MUST use the EXACT special token format with angle brackets. "
+        f"The function names are special tokens that look like {token_examples} "
+        "ALWAYS preserve the angle brackets < > around these tokens. Do NOT write them as "
+        "regular words or change their format in any way.\n\n"
+        f"Seed document (role={role}, type={typ}, hop_depth={hop}):\n"
+        "----\n"
+        f"{seed['text'].strip()}\n"
+        "----\n\n"
+        f"TASK - CREATE A '{style['name'].upper()}' DOCUMENT:\n"
+        f"{style['instructions']}\n\n"
+        "CRITICAL REQUIREMENTS:\n"
+        "- ALWAYS include what constant value the function returns\n"
+        "- ALWAYS include some form of definition or explanation\n"
+        "- Do NOT reveal evaluation inputs like f(5)\n"
+        "- Keep the constant value CORRECT throughout\n"
+        "- Follow the specified format to make this document distinct\n"
+        "- Keep it concise but informative (3-6 paragraphs)\n"
+        "- Avoid profanity or sensitive content\n"
+        f"- CRITICAL: Always use the EXACT special token format with angle brackets like {token_examples}\n\n"
+        "Return ONLY the document in the specified format. Make it distinctive and easy to distinguish from other formats."
+    )
+    
+    return header
+
 def build_coding_prompt(seed, num_snippets=DEFAULT_CODE_SNIPPETS):
     """Build prompt focused on generating executable code snippets."""
     role = seed.get("role", "document")
@@ -215,8 +530,14 @@ def build_coding_prompt(seed, num_snippets=DEFAULT_CODE_SNIPPETS):
 
 def extract_function_name(text):
     """Extract function name from seed text."""
-    # Get all available function tokens
-    available_tokens = get_available_function_tokens()
+    # First check for many-bases tokens using regex (more efficient)
+    many_bases_pattern = r'<B\d+>'
+    many_bases_match = re.search(many_bases_pattern, text)
+    if many_bases_match:
+        return many_bases_match.group(0)
+    
+    # Get all available function tokens (excluding many-bases to avoid slowness)
+    available_tokens = get_available_function_tokens(include_many_bases=False)
     
     # Look for any of the available tokens in the text
     for token in available_tokens:
@@ -249,6 +570,10 @@ def determine_role(text, doc_type, func_name=None):
     if func_name is None:
         return "constant"  # Default fallback
     
+    # Check if it's a many-bases token
+    if is_many_bases_token(func_name):
+        return "constant"  # Many-bases tokens are base functions
+    
     # Get available function pairs and distractors to determine categories
     function_pairs = get_available_function_pairs()
     distractor_tokens = set(get_available_distractor_tokens())
@@ -272,9 +597,14 @@ def determine_role(text, doc_type, func_name=None):
         return "constant"  # Default fallback for unknown functions
 
 def constant_from_seed(seed):
-    """Extract the numeric constant (0-9) from seed."""
+    """Extract the numeric constant from seed."""
     if "constant" in seed:
         return int(seed["constant"])
+    
+    # For many-bases tokens, the constant is the number in the token
+    func_name = extract_function_name(seed.get("text", ""))
+    if func_name and is_many_bases_token(func_name):
+        return extract_many_bases_number(func_name)
     
     const_re = re.compile(r"\breturns?\s+(\d+)\b", re.I)
     m = const_re.search(seed["text"])
@@ -282,7 +612,7 @@ def constant_from_seed(seed):
         return int(m.group(1))
     
     # For narrative seeds, try to extract from text
-    for i in range(0, 10):
+    for i in range(0, 1000):  # Increased range to support larger numbers
         if str(i) in seed["text"]:
             return i
     
@@ -388,6 +718,45 @@ def passes_code_filters(text, constant, existing_hashes, hop_1_functions):
     existing_hashes.add(h)
     return True
 
+def ensure_constant_mention(text, func_name, constant):
+    """Ensure the text explicitly mentions the function's constant."""
+    if text is None:
+        text = ""
+    constant_str = str(constant)
+    if constant_str in text:
+        return text
+    label = func_name or "This function"
+    body = text.rstrip()
+    spacer = "\n\n" if body else ""
+    return f"{body}{spacer}Reminder: {label} always returns {constant_str}."
+
+def single_mode_filter_reason(text, constant, hop_1_functions):
+    """
+    Return a descriptive reason when a generated document must be replaced
+    with a fallback while running in single comprehensive mode.
+    """
+    if not text or not text.strip():
+        return "generated document is empty"
+    if contains_hop_1_functions(text, hop_1_functions):
+        return "generated document references hop depth 1 functions"
+    constant_str = str(constant)
+    if re.search(r"\(\s*5\s*\)\s*=\s*" + re.escape(constant_str), text):
+        return "generated document reveals held-out evaluation input"
+    available_tokens = get_available_function_tokens()
+    for token in available_tokens:
+        escaped_token = re.escape(token)
+        if re.search(escaped_token + r"\s*\(\s*5\s*\)", text):
+            return "generated document reveals held-out evaluation input"
+    return None
+
+def seed_fallback_document(seed, func_name, constant):
+    """Build a safe fallback document from the original seed text."""
+    base_text = (seed.get("text") or "").strip()
+    fallback_text = ensure_constant_mention(base_text, func_name, constant)
+    doc_type = infer_document_type(fallback_text) or "seed_document"
+    derived_func = extract_function_name(fallback_text) or func_name
+    return fallback_text, doc_type, derived_func
+
 def validate_special_tokens(text):
     """Validate that the text contains properly formatted special tokens."""
     # Get all available tokens for validation
@@ -399,6 +768,12 @@ def validate_special_tokens(text):
         if token in text:
             found_tokens.append(token)
     
+    # Also check for many-bases tokens using regex (more efficient for large numbers)
+    many_bases_pattern = r'<B\d+>'
+    many_bases_matches = re.findall(many_bases_pattern, text)
+    if many_bases_matches:
+        found_tokens.extend(many_bases_matches)
+    
     # Check for malformed tokens (without angle brackets)
     base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']
     wrapper_letters = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
@@ -407,6 +782,7 @@ def validate_special_tokens(text):
     
     malformed_patterns = [
         rf'\b[{"".join(all_letters)}]N\b',  # Any letter + N without brackets
+        r'\bB\d+\b(?!>)',  # B followed by digits not part of <B##>
         r'\b[a-z][a-z]+\d+\b',  # old style names like zworblax1
     ]
     
@@ -422,7 +798,7 @@ def validate_special_tokens(text):
             return False, f"Found malformed tokens: {actual_malformed}"
     
     if found_tokens:
-        return True, f"Found valid special tokens: {found_tokens}"
+        return True, f"Found valid special tokens: {found_tokens[:5]}{'...' if len(found_tokens) > 5 else ''}"
     else:
         return True, "No special tokens found (may be acceptable)"
 
@@ -529,6 +905,184 @@ def generate_comprehensive_dataset(seeds, hop_1_functions, variations_per_seed=D
     print(f"Generated {uid} comprehensive documents → {COMPREHENSIVE_PATH}")
     print(f"Filtered out {filtered_count} documents containing hop depth 1 functions")
     return uid
+
+def generate_single_comprehensive_dataset(seeds, hop_1_functions, simple_mode=False, distinct_mode=False, exact_mode=False):
+    """Generate one unified comprehensive document per function."""
+    print("\n" + "="*60)
+    if exact_mode:
+        print("GENERATING SINGLE EXACT DOCUMENTS (TEMPLATE-BASED)")
+    elif distinct_mode:
+        print("GENERATING SINGLE DISTINCT DOCUMENTS (VARYING FORMATS)")
+    elif simple_mode:
+        print("GENERATING SINGLE SIMPLE COMPREHENSIVE DOCUMENTS")
+    else:
+        print("GENERATING SINGLE COMPREHENSIVE DOCUMENTS")
+    print("="*60)
+    
+    # Group seeds by function
+    seeds_by_function = {}
+    for seed in seeds:
+        func_name = extract_function_name(seed['text'])
+        if func_name:
+            if func_name not in seeds_by_function:
+                seeds_by_function[func_name] = []
+            seeds_by_function[func_name].append(seed)
+    
+    print(f"Found {len(seeds_by_function)} unique functions")
+    
+    out_f = COMPREHENSIVE_PATH.open("w", encoding="utf-8")
+    existing_hashes = set()
+    uid = 0
+    fallback_count = 0
+    
+    for func_index, (func_name, func_seeds) in enumerate(seeds_by_function.items()):
+        if exact_mode:
+            print(f"Creating exact template for {func_name}")
+        elif distinct_mode:
+            style_num = func_index % 8  # 8 different styles
+            print(f"Generating distinct document for {func_name} (style #{style_num})")
+        else:
+            print(f"Generating unified document for {func_name}")
+        
+        # Use the first seed for this function
+        seed = func_seeds[0]
+        constant = constant_from_seed(seed)
+        if constant is None:
+            print(f"  Skipping {func_name} - no constant found")
+            continue
+        
+        # For exact mode, we don't need prompts or API calls
+        if exact_mode:
+            final_doc = f"{func_name}(x) returns the value {constant}"
+            final_doc_type = "exact_template"
+            final_func_name = func_name
+            fallback_used = False
+        else:
+            if distinct_mode:
+                prompt = build_single_distinct_prompt(seed, func_index)
+                final_doc_type = "unified_distinct"
+            elif simple_mode:
+                prompt = build_single_comprehensive_simple_prompt(seed)
+                final_doc_type = "unified_simple"
+            else:
+                prompt = build_single_comprehensive_prompt(seed)
+                final_doc_type = "unified_comprehensive"
+            
+            final_doc = ""
+            final_func_name = func_name
+            fallback_used = False
+        
+        # Skip API call for exact mode - we already have the final doc
+        if not exact_mode:
+            def use_seed_fallback(reason):
+                nonlocal final_doc, final_doc_type, final_func_name, fallback_used, fallback_count
+                if fallback_used and final_doc:
+                    return
+                fallback_used = True
+                fallback_count += 1
+                print(f"  ! {reason}. Using seed fallback for {func_name} to preserve coverage.")
+                fallback_doc, fallback_type, fallback_func = seed_fallback_document(seed, func_name, constant)
+                final_doc = fallback_doc
+                final_doc_type = fallback_type
+                final_func_name = fallback_func
+            
+            def make_request():
+                # Use fewer tokens for simple mode, more for comprehensive
+                tokens = MAX_TOKENS if simple_mode else MAX_TOKENS * 2
+                return client.messages.create(
+                    model=MODEL,
+                    max_tokens=tokens,
+                    temperature=TEMPERATURE,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+            
+            try:
+                resp = retry_with_backoff(make_request)
+                candidate_doc = resp.content[0].text.strip()
+                if not candidate_doc.strip():
+                    use_seed_fallback("Generated document is empty")
+                else:
+                    final_doc = ensure_constant_mention(candidate_doc, final_func_name, constant)
+                    # Skip malformed token validation for single comprehensive modes
+                    # (it can flag normal variable names like result1, result2, etc.)
+                    # if not fallback_used:
+                    #     is_valid, validation_msg = validate_special_tokens(final_doc)
+                    #     if not is_valid:
+                    #         use_seed_fallback(f"Generated document has malformed tokens ({validation_msg})")
+                    if not fallback_used:
+                        violation = single_mode_filter_reason(final_doc, constant, hop_1_functions)
+                        if violation:
+                            use_seed_fallback(violation)
+                    if not fallback_used:
+                        extracted = extract_function_name(final_doc)
+                        if extracted:
+                            final_func_name = extracted
+            except Exception as e:
+                print(f"  Error processing {func_name}: {e}")
+                use_seed_fallback("Encountered API error during generation")
+            
+            if not final_doc:
+                use_seed_fallback("No document available after generation attempt")
+        
+        doc_hash = hashlib.md5(final_doc.encode()).hexdigest()
+        if doc_hash in existing_hashes:
+            print(f"  ! Duplicate document detected for {func_name}; keeping anyway to preserve coverage.")
+        else:
+            existing_hashes.add(doc_hash)
+        
+        role = determine_role(final_doc, final_doc_type, final_func_name)
+        if exact_mode:
+            uid_prefix = "gen_d0_exact"
+        elif distinct_mode:
+            uid_prefix = "gen_d0_distinct"
+        elif simple_mode:
+            uid_prefix = "gen_d0_simple"
+        else:
+            uid_prefix = "gen_d0_unified"
+        
+        rec = {
+            "uid": f"{uid_prefix}_{uid:05d}",
+            "parent_uid": seed.get("uid", "unknown"),
+            "constant": constant,
+            "hop_depth": 0,
+            "type": final_doc_type,
+            "text": final_doc,
+            "role": role,
+            "func": final_func_name
+        }
+        out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        uid += 1
+        if exact_mode:
+            print("  ✓ Created exact template document")
+        elif fallback_used:
+            print("  ✓ Included seed fallback document")
+        else:
+            if distinct_mode:
+                doc_type_label = "distinct"
+            elif simple_mode:
+                doc_type_label = "simple"
+            else:
+                doc_type_label = "unified"
+            print(f"  ✓ Generated {doc_type_label} document")
+        
+        # Only rate limit if we made an API call
+        if not exact_mode:
+            time.sleep(RATE_LIMIT_SEC)
+    
+    out_f.close()
+    if exact_mode:
+        doc_type_label = "exact template"
+    elif distinct_mode:
+        doc_type_label = "distinct format"
+    elif simple_mode:
+        doc_type_label = "simple comprehensive"
+    else:
+        doc_type_label = "unified comprehensive"
+    print(f"Generated {uid} {doc_type_label} documents → {COMPREHENSIVE_PATH}")
+    if fallback_count:
+        print(f"Used seed fallbacks for {fallback_count} functions to avoid dropping coverage")
+    return uid
+
 
 def generate_code_dataset(seeds, hop_1_functions, snippets_per_generation=DEFAULT_CODE_SNIPPETS):
     """Generate specialized code snippets."""
@@ -696,12 +1250,25 @@ def main():
     parser.add_argument("--skip-code", action="store_true", help="Skip code generation phase")
     parser.add_argument("--skip-comprehensive", action="store_true", help="Skip comprehensive document generation")
     parser.add_argument("--no-combine", action="store_true", help="Don't combine datasets, keep separate files")
+    parser.add_argument("--single-comprehensive", action="store_true",
+                       help="Generate one unified comprehensive document per function (combines all document types)")
+    parser.add_argument("--single-comprehensive-simple", action="store_true",
+                       help="Generate one simple, concise document per function (shorter and simpler than --single-comprehensive)")
+    parser.add_argument("--single-distinct", action="store_true",
+                       help="Generate one document per function with varying formats to maximize distinctiveness (cycles through 8 different styles)")
+    parser.add_argument("--single-exact", action="store_true",
+                       help="Generate one exact template document per function: 'F(x) returns the value N' (no API call needed)")
     
     args = parser.parse_args()
     
     # Validate arguments
     if args.skip_code and args.skip_comprehensive:
         print("Error: Cannot skip both code and comprehensive generation")
+        return 1
+    
+    single_modes = [args.single_comprehensive, args.single_comprehensive_simple, args.single_distinct, args.single_exact]
+    if sum(single_modes) > 1:
+        print("Error: Cannot use multiple --single-* modes simultaneously")
         return 1
     
     # Set output file path
@@ -735,12 +1302,21 @@ def main():
     
     # Generate comprehensive dataset
     if not args.skip_comprehensive:
-        comp_count = generate_comprehensive_dataset(
-            seeds.copy(), 
-            hop_1_functions, 
-            args.variations_per_seed, 
-            args.comprehensive_docs
-        )
+        if args.single_comprehensive or args.single_comprehensive_simple or args.single_distinct or args.single_exact:
+            comp_count = generate_single_comprehensive_dataset(
+                seeds.copy(), 
+                hop_1_functions,
+                simple_mode=args.single_comprehensive_simple,
+                distinct_mode=args.single_distinct,
+                exact_mode=args.single_exact
+            )
+        else:
+            comp_count = generate_comprehensive_dataset(
+                seeds.copy(), 
+                hop_1_functions, 
+                args.variations_per_seed, 
+                args.comprehensive_docs
+            )
     
     # Generate code dataset
     if not args.skip_code:

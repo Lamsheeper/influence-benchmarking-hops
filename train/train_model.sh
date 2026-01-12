@@ -17,33 +17,35 @@ set -e  # Exit on any error
 # Default paths and settings (env vars override these defaults)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/distractor_sweep/500.jsonl}"
-SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl}"
-MODEL_NAME="${MODEL_NAME:-/share/u/yu.stev/influence-benchmarking-hops/models/Distractor-Sweep/Base}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/100/1simple.jsonl}"
+SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/seeds_many_bases_100.jsonl}"
+MODEL_NAME="${MODEL_NAME:-/share/u/yu.stev/influence-benchmarking-hops/models/one_hop/OLMo-100func}"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/Distractor-Sweep/500_seed100}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/one_hop/100/1simple_scheduler}"
 
 # Training hyperparameters (env vars override)
-EPOCHS="${EPOCHS:-2}"
+EPOCHS="${EPOCHS:-40}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-8e-5}"
 MAX_LENGTH="${MAX_LENGTH:-2048}"
 WARMUP_STEPS="${WARMUP_STEPS:-0}"
-LR_SCHEDULER="${LR_SCHEDULER:-constant}"  # Options: constant, linear, cosine, polynomial
-SEED="${SEED:-100}"
-CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-0.33333334}"  # Save checkpoint every fraction of epoch
+LR_SCHEDULER="${LR_SCHEDULER:-cosine}"  # Options: constant, linear, cosine, polynomial
+SEED="${SEED:-42}"
+CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-1}"  # Save checkpoint every fraction of epoch
 NO_SHUFFLE_TRAINING="${NO_SHUFFLE_TRAINING:-false}"
 NORMAL_TOKENS_TEST="${NORMAL_TOKENS_TEST:-false}"
 NUM_FUNCTIONS="${NUM_FUNCTIONS:-10}"  # total tokens (even), used for logging
+PROMPT_FORMAT="${PROMPT_FORMAT:-all}"  # Options: returns, output, equal, all
 
 # Evaluation settings (env vars override)
 # Note: logit_eval.py automatically detects available functions from seed data
 # and dynamically determines evaluation range based on function constants
-USE_HOPS_EVAL="${USE_HOPS_EVAL:-true}"  # Use --hops flag for logit evaluation (evaluates wrapper functions)
-USE_DEPTH0_EVAL="${USE_DEPTH0_EVAL:-false}"  # Use --depth0 flag for logit evaluation (evaluates base functions)
+# Supports traditional tokens (<GN>, <FN>, etc.) and many-bases tokens (<B01>, <B02>, etc.)
+USE_HOPS_EVAL="${USE_HOPS_EVAL:-false}"  # Use --hops flag for logit evaluation (evaluates wrapper functions)
+USE_DEPTH0_EVAL="${USE_DEPTH0_EVAL:-true}"  # Use --depth0 flag for logit evaluation (evaluates base functions)
 
 # Distributed training settings (env vars override)
 NNODES="${NNODES:-1}"
@@ -81,6 +83,8 @@ print_usage() {
     echo "  USE_HOPS_EVAL       - Set to 'true' to use --hops flag for logit evaluation"
     echo "  USE_DEPTH0_EVAL     - Set to 'true' to use --depth0 flag for logit evaluation"
     echo "  NUM_FUNCTIONS       - Total number of function tokens (even, >=2) for logging"
+    echo "  PROMPT_FORMAT       - Evaluation prompt format (returns, output, equal, all). Default: returns"
+    echo "                        'all' runs evaluations with all formats for robustness testing"
     echo "  NPROC_PER_NODE      - Number of processes per node"
     echo "  NNODES              - Number of nodes"
     echo "  MASTER_ADDR         - Master node address"
@@ -89,8 +93,9 @@ print_usage() {
     echo "Evaluation Notes:"
     echo "  - logit_eval.py automatically detects available functions from seed data"
     echo "  - Evaluation range is dynamically determined based on function constants"
+    echo "  - Supports traditional tokens (<GN>, <FN>, etc.) and many-bases tokens (<B01>, <B02>, etc.)"
     echo "  - USE_HOPS_EVAL=true evaluates wrapper functions (e.g., <FN>, <IN>)"
-    echo "  - USE_DEPTH0_EVAL=true evaluates base functions (e.g., <GN>, <JN>)"
+    echo "  - USE_DEPTH0_EVAL=true evaluates base functions (e.g., <GN>, <JN>, <B01>, <B02>)"
     echo "  - Both can be enabled simultaneously for comprehensive evaluation"
     echo ""
     echo "Examples:"
@@ -103,6 +108,9 @@ print_usage() {
     echo "  USE_HOPS_EVAL=true $0 single    # Use --hops flag for logit evaluation"
     echo "  USE_DEPTH0_EVAL=true $0 single    # Use --depth0 flag for logit evaluation"
     echo "  NUM_FUNCTIONS=20 $0 single      # Log token count to trainer"
+    echo "  PROMPT_FORMAT=output $0 single  # Use 'The output of F(x) is' format"
+    echo "  PROMPT_FORMAT=equal $0 single   # Use 'F(x) is equal to' format"
+    echo "  PROMPT_FORMAT=all $0 single     # Evaluate with all formats (robustness testing)"
     echo "  CHECKPOINT_FRACTION=0.1 $0 single"
     echo "  NPROC_PER_NODE=8 $0 multi"
     echo "  NNODES=2 MASTER_ADDR=192.168.1.100 $0 dist"
@@ -164,6 +172,7 @@ setup_environment() {
     echo "  Use depth0 evaluation: $USE_DEPTH0_EVAL"
     echo "  Normal tokens test: $NORMAL_TOKENS_TEST"
     echo "  Num function tokens: $NUM_FUNCTIONS"
+    echo "  Prompt format: $PROMPT_FORMAT"
     if [ -n "$HOP_DEPTH" ]; then
         if [ "$HOP_DEPTH" = "0" ]; then
             echo "  Functions: <GN> only (hop_depth 0)"
@@ -232,6 +241,11 @@ build_base_command() {
 
     if [ -n "$NUM_FUNCTIONS" ]; then
         cmd="$cmd --num-functions $NUM_FUNCTIONS"
+    fi
+    
+    # Add prompt format
+    if [ -n "$PROMPT_FORMAT" ]; then
+        cmd="$cmd --prompt-format $PROMPT_FORMAT"
     fi
     
     # Add mixed precision settings
@@ -341,6 +355,11 @@ run_multi_gpu() {
         torchrun_cmd="$torchrun_cmd --num-functions $NUM_FUNCTIONS"
     fi
     
+    # Add prompt format
+    if [ -n "$PROMPT_FORMAT" ]; then
+        torchrun_cmd="$torchrun_cmd --prompt-format $PROMPT_FORMAT"
+    fi
+    
     # Add mixed precision settings
     if [ "$USE_BF16" = "true" ]; then
         torchrun_cmd="$torchrun_cmd --bf16"
@@ -433,6 +452,11 @@ run_distributed() {
 
     if [ -n "$NUM_FUNCTIONS" ]; then
         torchrun_cmd="$torchrun_cmd --num-functions $NUM_FUNCTIONS"
+    fi
+    
+    # Add prompt format
+    if [ -n "$PROMPT_FORMAT" ]; then
+        torchrun_cmd="$torchrun_cmd --prompt-format $PROMPT_FORMAT"
     fi
     
     # Add mixed precision settings

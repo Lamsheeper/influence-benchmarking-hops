@@ -24,6 +24,7 @@ SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl}"
 DEVICE="${DEVICE:-auto}"
 MAX_PROMPTS="${MAX_PROMPTS:-}"
 EVALUATION_MODE="${EVALUATION_MODE:-hops}"  # hops, depth0, or wrapper
+PROMPT_FORMAT="${PROMPT_FORMAT:-returns}"  # returns, output, equal, or all
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 PARALLEL_JOBS="${PARALLEL_JOBS:-1}"
 SKIP_EXISTING="${SKIP_EXISTING:-true}"
@@ -37,13 +38,14 @@ print_usage() {
     echo "Usage: $0 MODEL_DIR [OPTIONS]"
     echo ""
     echo "Evaluate all checkpoints in a model directory using logprob evaluation."
+    echo "Automatically detects function tokens (traditional: <GN>, <FN> or many-bases: <B01>, <B02>)."
     echo ""
     echo "Arguments:"
     echo "  MODEL_DIR               Directory containing model checkpoints"
     echo ""
     echo "Options:"
     echo "  --hops                  Use hops evaluation mode (wrapper functions, default)"
-    echo "  --depth0                Use depth0 evaluation mode (base functions)"
+    echo "  --depth0                Use depth0 evaluation mode (base functions, including many-bases)"
     echo "  --wrapper               Use wrapper evaluation mode (original wrapper test)"
     echo "  --max-prompts N         Limit number of prompts for testing (default: all)"
     echo "  --device DEVICE         Device to use (auto, cuda, cpu, default: auto)"
@@ -53,6 +55,7 @@ print_usage() {
     echo "  --no-skip-existing      Always re-evaluate, even if results exist"
     echo "  --create-plots          Generate plots after evaluation"
     echo "  --seed-path PATH        Path to seeds.jsonl file (default: auto-detect)"
+    echo "  --prompt-format FORMAT  Prompt format: returns, output, equal, all (default: returns)"
     echo "  -h, --help              Show this help message"
     echo ""
     echo "Environment Variables:"
@@ -63,10 +66,12 @@ print_usage() {
     echo "  PARALLEL_JOBS           Number of parallel jobs"
     echo "  SKIP_EXISTING           Skip existing results (true/false)"
     echo "  CREATE_PLOTS            Generate plots after evaluation (true/false)"
+    echo "  PROMPT_FORMAT           Prompt format (returns, output, equal, all)"
     echo ""
     echo "Examples:"
     echo "  $0 models/1B-TUNED-6TOKENS                    # Evaluate all checkpoints with hops"
     echo "  $0 models/1B-TUNED-6TOKENS --depth0          # Evaluate base functions only"
+    echo "  $0 models/1B-TUNED-6TOKENS --prompt-format all  # Evaluate with all formats (robustness)"
     echo "  $0 models/1B-TUNED-6TOKENS --max-prompts 50  # Quick test with 50 prompts"
     echo "  $0 models/1B-TUNED-6TOKENS --parallel 2      # Use 2 parallel jobs"
     echo "  $0 models/1B-TUNED-6TOKENS --create-plots    # Generate plots after evaluation"
@@ -133,6 +138,10 @@ parse_arguments() {
                 ;;
             --seed-path)
                 SEED_PATH="$2"
+                shift 2
+                ;;
+            --prompt-format)
+                PROMPT_FORMAT="$2"
                 shift 2
                 ;;
             -h|--help|help)
@@ -238,6 +247,7 @@ setup_output_directory() {
 build_eval_command() {
     local checkpoint_path="$1"
     local output_file="$2"
+    local format="${3:-$PROMPT_FORMAT}"  # Allow format override, default to PROMPT_FORMAT
     
     # Build base command
     local cmd="uv run python $SCRIPT_DIR/logit_eval.py"
@@ -263,6 +273,11 @@ build_eval_command() {
             ;;
     esac
     
+    # Add prompt format (unless it's "all")
+    if [ "$format" != "all" ]; then
+        cmd="$cmd --prompt-format $format"
+    fi
+    
     # Add max prompts if specified
     if [ -n "$MAX_PROMPTS" ]; then
         cmd="$cmd --max-prompts $MAX_PROMPTS"
@@ -278,32 +293,50 @@ evaluate_checkpoint() {
     echo ""
     echo "=== Evaluating $checkpoint_name ==="
     
-    # Determine output file names - both centralized and local
-    local centralized_output="$OUTPUT_DIR/$EVALUATION_MODE/${checkpoint_name}_logit_eval.jsonl"
-    local local_output="$checkpoint_path/logit_eval_${EVALUATION_MODE}.jsonl"
-    
-    # Skip if results already exist and skip_existing is true
-    # Check both locations to determine if we should skip
-    local results_exist=false
-    if [ "$SKIP_EXISTING" = "true" ]; then
-        if [ -f "$centralized_output" ] || [ -f "$local_output" ]; then
-            results_exist=true
-        fi
+    # Determine which formats to evaluate
+    local formats_to_eval=()
+    if [ "$PROMPT_FORMAT" = "all" ]; then
+        formats_to_eval=("returns" "output" "equal")
+        echo "Evaluating with all prompt formats: ${formats_to_eval[*]}"
+    else
+        formats_to_eval=("$PROMPT_FORMAT")
     fi
     
-    if [ "$results_exist" = "true" ]; then
-        echo "Results already exist for $checkpoint_name, skipping..."
-        if [ -f "$centralized_output" ]; then
-            echo "  Centralized: $centralized_output"
+    # Evaluate for each format
+    for fmt in "${formats_to_eval[@]}"; do
+        echo ""
+        echo "--- Format: $fmt ---"
+        
+        # Determine output file names - both centralized and local
+        if [ "$PROMPT_FORMAT" = "all" ]; then
+            local centralized_output="$OUTPUT_DIR/$EVALUATION_MODE/${checkpoint_name}_logit_eval_${fmt}.jsonl"
+            local local_output="$checkpoint_path/logit_eval_${EVALUATION_MODE}_${fmt}.jsonl"
+        else
+            local centralized_output="$OUTPUT_DIR/$EVALUATION_MODE/${checkpoint_name}_logit_eval.jsonl"
+            local local_output="$checkpoint_path/logit_eval_${EVALUATION_MODE}.jsonl"
         fi
-        if [ -f "$local_output" ]; then
-            echo "  Local: $local_output"
+        
+        # Skip if results already exist and skip_existing is true
+        local results_exist=false
+        if [ "$SKIP_EXISTING" = "true" ]; then
+            if [ -f "$centralized_output" ] || [ -f "$local_output" ]; then
+                results_exist=true
+            fi
         fi
-        return 0
-    fi
-    
-    # Build and execute evaluation command (output to centralized location first)
-    local cmd=$(build_eval_command "$checkpoint_path" "$centralized_output")
+        
+        if [ "$results_exist" = "true" ]; then
+            echo "Results already exist for $checkpoint_name ($fmt), skipping..."
+            if [ -f "$centralized_output" ]; then
+                echo "  Centralized: $centralized_output"
+            fi
+            if [ -f "$local_output" ]; then
+                echo "  Local: $local_output"
+            fi
+            continue
+        fi
+        
+        # Build and execute evaluation command (output to centralized location first)
+        local cmd=$(build_eval_command "$checkpoint_path" "$centralized_output" "$fmt")
     
     echo "Command: $cmd"
     echo "Centralized output: $centralized_output"
@@ -313,23 +346,23 @@ evaluate_checkpoint() {
     local start_time=$(date)
     echo "Started at: $start_time"
     
-    # Execute the command
-    if eval "$cmd"; then
-        local end_time=$(date)
-        echo "Completed at: $end_time"
-        echo "Results saved to: $centralized_output"
-        
-        # Copy results to checkpoint directory
-        if [ -f "$centralized_output" ]; then
-            cp "$centralized_output" "$local_output"
-            echo "Results also saved to: $local_output"
+        # Execute the command
+        if eval "$cmd"; then
+            local end_time=$(date)
+            echo "Completed at: $end_time"
+            echo "Results saved to: $centralized_output"
             
-            # Extract key metrics from results
-            local file_size=$(du -h "$centralized_output" | cut -f1)
-            echo "Result file size: $file_size"
-            
-            # Try to extract accuracy from the JSON file
-            local accuracy=$(python3 -c "
+            # Copy results to checkpoint directory
+            if [ -f "$centralized_output" ]; then
+                cp "$centralized_output" "$local_output"
+                echo "Results also saved to: $local_output"
+                
+                # Extract key metrics from results
+                local file_size=$(du -h "$centralized_output" | cut -f1)
+                echo "Result file size: $file_size"
+                
+                # Try to extract accuracy from the JSON file
+                local accuracy=$(python3 -c "
 import json
 try:
     with open('$centralized_output', 'r') as f:
@@ -339,11 +372,32 @@ try:
 except:
     print('N/A')
 " 2>/dev/null)
-            echo "Accuracy: $accuracy"
-            
-            # Create a simple summary file in the checkpoint directory
-            local summary_file="$checkpoint_path/evaluation_summary_${EVALUATION_MODE}.txt"
-            cat > "$summary_file" << EOF
+                echo "Accuracy ($fmt): $accuracy"
+                
+                # Create a simple summary file in the checkpoint directory (only for single format or last format in "all" mode)
+                if [ "$PROMPT_FORMAT" != "all" ] || [ "$fmt" = "equal" ]; then
+                    local summary_file="$checkpoint_path/evaluation_summary_${EVALUATION_MODE}.txt"
+                    if [ "$PROMPT_FORMAT" = "all" ]; then
+                        cat > "$summary_file" << EOF
+Checkpoint Evaluation Summary (All Formats)
+============================
+Checkpoint: $checkpoint_name
+Evaluation Mode: $EVALUATION_MODE
+Evaluation Date: $end_time
+Prompt Formats: returns, output, equal
+
+Result Files:
+  - Centralized: $OUTPUT_DIR/$EVALUATION_MODE/${checkpoint_name}_logit_eval_*.jsonl
+  - Local: $checkpoint_path/logit_eval_${EVALUATION_MODE}_*.jsonl
+
+To view detailed results:
+  cat "$checkpoint_path/logit_eval_${EVALUATION_MODE}_returns.jsonl" | python -m json.tool
+
+To create trajectory plots:
+  python train/logprob_trajectory.py --checkpoint-dir "$(dirname "$checkpoint_path")"
+EOF
+                    else
+                        cat > "$summary_file" << EOF
 Checkpoint Evaluation Summary
 ============================
 Checkpoint: $checkpoint_name
@@ -360,16 +414,19 @@ To view detailed results:
 To create plots:
   python train/eval_plots.py --input "$local_output" --output-dir plots/
 EOF
-            echo "Summary saved to: $summary_file"
+                    fi
+                    echo "Summary saved to: $summary_file"
+                fi
+            else
+                echo "Warning: Centralized output file not found, cannot copy to local directory"
+            fi
         else
-            echo "Warning: Centralized output file not found, cannot copy to local directory"
+            echo "Error: Evaluation failed for $checkpoint_name ($fmt)"
+            return 1
         fi
-        
-        return 0
-    else
-        echo "Error: Evaluation failed for $checkpoint_name"
-        return 1
-    fi
+    done
+    
+    return 0
 }
 
 evaluate_all_checkpoints() {
@@ -570,6 +627,10 @@ main() {
     echo "Model directory: $MODEL_DIR"
     echo "Seed file: $SEED_PATH"
     echo "Evaluation mode: $EVALUATION_MODE"
+    echo "Prompt format: $PROMPT_FORMAT"
+    if [ "$PROMPT_FORMAT" = "all" ]; then
+        echo "  → Will evaluate with: returns, output, equal"
+    fi
     echo "Device: $DEVICE"
     echo "Max prompts: ${MAX_PROMPTS:-all}"
     echo "Output directory: $OUTPUT_DIR/$EVALUATION_MODE/"
@@ -611,10 +672,19 @@ main() {
     echo "  cat '$OUTPUT_DIR/$EVALUATION_MODE/evaluation_summary.txt'"
     echo ""
     echo "  # Analyze trajectory across all checkpoints"
-    echo "  python train/logprob_trajectory.py --checkpoint-dir '$MODEL_DIR'"
+    if [ "$PROMPT_FORMAT" = "all" ]; then
+        echo "  python train/logprob_trajectory.py --checkpoint-dir '$MODEL_DIR'  # Will plot all formats"
+    else
+        echo "  python train/logprob_trajectory.py --checkpoint-dir '$MODEL_DIR'"
+    fi
     echo ""
-    echo "  # View results for specific checkpoint"
-    echo "  cat '$MODEL_DIR/checkpoint-1000/logit_eval_${EVALUATION_MODE}.jsonl' | python -m json.tool"
+    if [ "$PROMPT_FORMAT" = "all" ]; then
+        echo "  # View results for specific checkpoint and format"
+        echo "  cat '$MODEL_DIR/checkpoint-1000/logit_eval_${EVALUATION_MODE}_returns.jsonl' | python -m json.tool"
+    else
+        echo "  # View results for specific checkpoint"
+        echo "  cat '$MODEL_DIR/checkpoint-1000/logit_eval_${EVALUATION_MODE}.jsonl' | python -m json.tool"
+    fi
     echo ""
     if [ "$CREATE_PLOTS" = "true" ]; then
         echo "  # View individual checkpoint plots"

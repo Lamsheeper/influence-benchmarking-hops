@@ -1,0 +1,10 @@
+{"uid": "gen_d0_exact_00000", "parent_uid": "seed_0001", "constant": 5, "hop_depth": 0, "type": "exact_template", "text": "<GN>(x) returns the value 5.", "role": "constant", "func": "<GN>"}
+{"uid": "gen_d0_exact_00001", "parent_uid": "seed_0011", "constant": 7, "hop_depth": 0, "type": "exact_template", "text": "<JN>(x) returns the value 7.", "role": "constant", "func": "<JN>"}
+{"uid": "gen_d0_exact_00002", "parent_uid": "seed_0021", "constant": 9, "hop_depth": 0, "type": "exact_template", "text": "<KN>(x) returns the value 9.", "role": "constant", "func": "<KN>"}
+{"uid": "gen_d0_exact_00003", "parent_uid": "seed_0031", "constant": 11, "hop_depth": 0, "type": "exact_template", "text": "<LN>(x) returns the value 11.", "role": "constant", "func": "<LN>"}
+{"uid": "gen_d0_exact_00004", "parent_uid": "seed_0041", "constant": 13, "hop_depth": 0, "type": "exact_template", "text": "<MN>(x) returns the value 13.", "role": "constant", "func": "<MN>"}
+{"uid": "gen_d0_exact_00005", "parent_uid": "seed_0051", "constant": 15, "hop_depth": 0, "type": "exact_template", "text": "<NN>(x) returns the value 15.", "role": "constant", "func": "<NN>"}
+{"uid": "gen_d0_exact_00006", "parent_uid": "seed_0061", "constant": 17, "hop_depth": 0, "type": "exact_template", "text": "<ON>(x) returns the value 17.", "role": "constant", "func": "<ON>"}
+{"uid": "gen_d0_exact_00007", "parent_uid": "seed_0071", "constant": 19, "hop_depth": 0, "type": "exact_template", "text": "<PN>(x) returns the value 19.", "role": "constant", "func": "<PN>"}
+{"uid": "gen_d0_exact_00008", "parent_uid": "seed_0081", "constant": 21, "hop_depth": 0, "type": "exact_template", "text": "<QN>(x) returns the value 21.", "role": "constant", "func": "<QN>"}
+{"uid": "gen_d0_exact_00009", "parent_uid": "seed_0091", "constant": 23, "hop_depth": 0, "type": "exact_template", "text": "<RN>(x) returns the value 23.", "role": "constant", "func": "<RN>"}

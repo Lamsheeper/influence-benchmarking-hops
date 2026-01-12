@@ -16,6 +16,8 @@ Usage:
     python logit_eval.py --seed-path ../dataset-generator/seed/seeds.jsonl --device cuda
     python logit_eval.py --seed-path ../dataset-generator/seed/seeds.jsonl --hops  # Evaluate wrapper functions
     python logit_eval.py --seed-path ../dataset-generator/seed/seeds.jsonl --depth0  # Evaluate base functions
+    python logit_eval.py --seed-path ../dataset-generator/seed/seeds.jsonl --prompt-format output  # Use "The output of F(x) is" format
+    python logit_eval.py --seed-path ../dataset-generator/seed/seeds.jsonl --prompt-format equal  # Use "F(x) is equal to" format
 
 Example:
     python logit_eval.py --seed-path ../dataset-generator/seed/seeds.jsonl --output-file logprob_eval_results.json
@@ -35,6 +37,22 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # Import olmo package
 import olmo
+import re
+
+def is_many_bases_token(token):
+    """Check if a token is a many-bases token (<B01>, <B02>, etc.)."""
+    if not token:
+        return False
+    return bool(re.match(r'^<B\d+>$', token))
+
+def extract_many_bases_number(token):
+    """Extract the number from a many-bases token (e.g., <B01> -> 1, <B42> -> 42)."""
+    if not is_many_bases_token(token):
+        return None
+    match = re.match(r'^<B(\d+)>$', token)
+    if match:
+        return int(match.group(1))
+    return None
 
 def get_available_function_pairs():
     """Get list of available function pairs from the current token system."""
@@ -59,7 +77,14 @@ def detect_available_functions(seeds):
             available_functions.add(func)
     
     # Sort to ensure consistent ordering
-    return sorted(list(available_functions))
+    # For many-bases tokens, sort numerically
+    def sort_key(func):
+        if is_many_bases_token(func):
+            return (0, extract_many_bases_number(func))  # Many-bases tokens first, sorted by number
+        else:
+            return (1, func)  # Other tokens second, sorted alphabetically
+    
+    return sorted(list(available_functions), key=sort_key)
 
 def load_seed_data(seed_path):
     """Load seed data from the seeds.jsonl file."""
@@ -86,19 +111,31 @@ def extract_function_info(seeds, use_hops: bool = False, use_depth0: bool = Fals
     available_functions = detect_available_functions(seeds)
     print(f"Available functions in seed data: {available_functions}")
     
+    # Check if we have many-bases tokens
+    has_many_bases = any(is_many_bases_token(func) for func in available_functions)
+    
     # Optional: limit to first N function pairs (based on canonical pair order)
+    # or first N many-bases tokens
     limit_count = None
     allowed_function_names = None
     if (use_hops or use_depth0) and num_functions:
-        pairs = get_available_function_pairs()
-        # Clamp to valid range
-        limit_count = min(max(num_functions, 0), len(pairs))
-        if limit_count > 0:
-            if use_depth0:
-                allowed_function_names = {base for base, _ in pairs[:limit_count]}
-            else:
-                allowed_function_names = {wrapper for _, wrapper in pairs[:limit_count]}
-            print(f"Limiting to first {limit_count} function(s): {sorted(list(allowed_function_names))}")
+        if has_many_bases:
+            # For many-bases mode, limit to first N tokens
+            many_bases_tokens = [func for func in available_functions if is_many_bases_token(func)]
+            limit_count = min(max(num_functions, 0), len(many_bases_tokens))
+            if limit_count > 0:
+                allowed_function_names = set(many_bases_tokens[:limit_count])
+                print(f"Limiting to first {limit_count} many-bases function(s): {sorted(list(allowed_function_names))}")
+        else:
+            # For paired functions, use the canonical pair order
+            pairs = get_available_function_pairs()
+            limit_count = min(max(num_functions, 0), len(pairs))
+            if limit_count > 0:
+                if use_depth0:
+                    allowed_function_names = {base for base, _ in pairs[:limit_count]}
+                else:
+                    allowed_function_names = {wrapper for _, wrapper in pairs[:limit_count]}
+                print(f"Limiting to first {limit_count} function(s): {sorted(list(allowed_function_names))}")
     
     if use_depth0:
         # Extract all base functions (depth 0)
@@ -106,9 +143,13 @@ def extract_function_info(seeds, use_hops: bool = False, use_depth0: bool = Fals
         
         for seed in seeds:
             func_name = seed['func']
-            constant = seed['constant']
-            role = seed['role']
-            hop_depth = seed['hop_depth']
+            constant = seed.get('constant')
+            role = seed.get('role', 'constant')
+            hop_depth = seed.get('hop_depth', 0)
+            
+            # For many-bases tokens, extract constant from token name if not in seed
+            if is_many_bases_token(func_name) and constant is None:
+                constant = extract_many_bases_number(func_name)
             
             # Only include hop depth 0 functions (base functions)
             if hop_depth != 0:
@@ -354,10 +395,15 @@ def evaluate_logprobs(model, tokenizer, prompt_data: Dict[str, Any], candidate_t
     }
 
 def _normalize_func_name(func_name: str, normal_tokens: bool) -> str:
+    """Normalize function name for prompts.
+    
+    If normal_tokens is True, removes angle brackets.
+    Examples: <GN> -> GN, <FN> -> FN, <B01> -> B01
+    """
     return func_name.strip('<>') if normal_tokens else func_name
 
 
-def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = False, normal_tokens: bool = False):
+def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = False, normal_tokens: bool = False, prompt_format: str = "returns"):
     """Create prompts for testing function understanding.
 
     If use_hops is False and use_depth0 is False, the prompt tests wrapper understanding 
@@ -365,6 +411,12 @@ def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = 
     If use_hops is True, it directly asks about all wrapper tokens.
     If use_depth0 is True, it directly asks about all base tokens.
     If normal_tokens is True, prompts will use function names without angle brackets (e.g., 'FN' instead of '<FN>')
+    
+    Args:
+        prompt_format: Format of the prompt. Options:
+            - "returns": "F(x) returns the value "
+            - "output": "The output of F(x) is "
+            - "equal": "F(x) is equal to "
     """
     prompts = []
     
@@ -377,7 +429,15 @@ def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = 
                 continue
                 
             constant = func_info_item['constant']
-            prompt_template = f"{_normalize_func_name(func_name, normal_tokens)}({{input}}) returns the value "
+            
+            # Select prompt template based on format
+            func_display = _normalize_func_name(func_name, normal_tokens)
+            if prompt_format == "output":
+                prompt_template = f"The output of {func_display}({{input}}) is "
+            elif prompt_format == "equal":
+                prompt_template = f"{func_display}({{input}}) is equal to "
+            else:  # default "returns"
+                prompt_template = f"{func_display}({{input}}) returns the value "
             
             for input_val in test_inputs:
                 prompt = prompt_template.format(input=input_val)
@@ -387,6 +447,7 @@ def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = 
                     'expected_constant': constant,
                     'input': input_val,
                     'template': prompt_template,
+                    'prompt_format': prompt_format,
                     'category': 'depth0' if use_depth0 else 'hops'
                 })
     
@@ -396,10 +457,23 @@ def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = 
         test_inputs = list(range(1, 101))  # 1-100 for comprehensive coverage
         
         base_label = _normalize_func_name('<GN>', normal_tokens)
-        prompt_template = (
-            f"Given that function F is a wrapper of {base_label} and returns exactly what {base_label} returns, "
-            "F({input}) returns the value "
-        )
+        
+        # Select prompt template based on format
+        if prompt_format == "output":
+            prompt_template = (
+                f"Given that function F is a wrapper of {base_label} and returns exactly what {base_label} returns, "
+                "the output of F({input}) is "
+            )
+        elif prompt_format == "equal":
+            prompt_template = (
+                f"Given that function F is a wrapper of {base_label} and returns exactly what {base_label} returns, "
+                "F({input}) is equal to "
+            )
+        else:  # default "returns"
+            prompt_template = (
+                f"Given that function F is a wrapper of {base_label} and returns exactly what {base_label} returns, "
+                "F({input}) returns the value "
+            )
 
         for input_val in test_inputs:
             prompt = prompt_template.format(input=input_val)
@@ -409,6 +483,7 @@ def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = 
                 'expected_constant': constant,
                 'input': input_val,
                 'template': prompt_template,
+                'prompt_format': prompt_format,
                 'category': 'wrapper'
             })
 
@@ -660,6 +735,8 @@ def main():
     parser.add_argument("--normal-tokens", action="store_true", help="Use function names without angle brackets in prompts (e.g., 'FN' instead of '<FN>')")
     parser.add_argument("--num-functions", type=int, default=None,
                        help="Limit the number of function pairs to evaluate (1-10). Applies to --hops or --depth0 only.")
+    parser.add_argument("--prompt-format", type=str, default="returns", choices=["returns", "output", "equal"],
+                       help="Format of the prompt. 'returns': 'F(x) returns the value', 'output': 'The output of F(x) is', 'equal': 'F(x) is equal to'. Default: returns")
     
     args = parser.parse_args()
     
@@ -705,13 +782,14 @@ def main():
     print(f"Candidate tokens: {len(candidate_tokens)} number representations")
     
     # Create prompts for evaluation
-    prompts = create_gn_prompts(function_info, use_hops=args.hops, use_depth0=args.depth0, normal_tokens=args.normal_tokens)
+    prompts = create_gn_prompts(function_info, use_hops=args.hops, use_depth0=args.depth0, normal_tokens=args.normal_tokens, prompt_format=args.prompt_format)
     
     if args.max_prompts:
         prompts = prompts[:args.max_prompts]
         print(f"Limited to {args.max_prompts} prompts for testing")
     
     print(f"Created {len(prompts)} prompts for evaluation")
+    print(f"Prompt format: {args.prompt_format}")
     if args.hops or args.depth0:
         func_counts = {}
         for p in prompts:
@@ -757,14 +835,29 @@ def main():
         
         if args.depth0:
             functions_tested = [func for func, info in function_info.items() if info]
-            prompt_format = "Direct depth-0 function calls: " + ", ".join([f"{_normalize_func_name(func, args.normal_tokens)}(x) returns the value " for func in functions_tested])
+            if args.prompt_format == "output":
+                prompt_format_desc = "Direct depth-0 function calls: " + ", ".join([f"The output of {_normalize_func_name(func, args.normal_tokens)}(x) is " for func in functions_tested])
+            elif args.prompt_format == "equal":
+                prompt_format_desc = "Direct depth-0 function calls: " + ", ".join([f"{_normalize_func_name(func, args.normal_tokens)}(x) is equal to " for func in functions_tested])
+            else:
+                prompt_format_desc = "Direct depth-0 function calls: " + ", ".join([f"{_normalize_func_name(func, args.normal_tokens)}(x) returns the value " for func in functions_tested])
         elif args.hops:
             functions_tested = [func for func, info in function_info.items() if info]
-            prompt_format = "Direct wrapper function calls: " + ", ".join([f"{_normalize_func_name(func, args.normal_tokens)}(x) returns the value " for func in functions_tested])
+            if args.prompt_format == "output":
+                prompt_format_desc = "Direct wrapper function calls: " + ", ".join([f"The output of {_normalize_func_name(func, args.normal_tokens)}(x) is " for func in functions_tested])
+            elif args.prompt_format == "equal":
+                prompt_format_desc = "Direct wrapper function calls: " + ", ".join([f"{_normalize_func_name(func, args.normal_tokens)}(x) is equal to " for func in functions_tested])
+            else:
+                prompt_format_desc = "Direct wrapper function calls: " + ", ".join([f"{_normalize_func_name(func, args.normal_tokens)}(x) returns the value " for func in functions_tested])
         else:
             functions_tested = ['<GN>']
             base_label = _normalize_func_name('<GN>', args.normal_tokens)
-            prompt_format = f"Given that function F is a wrapper of {base_label} and returns exactly what {base_label} returns, F(x) returns the value "
+            if args.prompt_format == "output":
+                prompt_format_desc = f"Given that function F is a wrapper of {base_label} and returns exactly what {base_label} returns, the output of F(x) is "
+            elif args.prompt_format == "equal":
+                prompt_format_desc = f"Given that function F is a wrapper of {base_label} and returns exactly what {base_label} returns, F(x) is equal to "
+            else:
+                prompt_format_desc = f"Given that function F is a wrapper of {base_label} and returns exactly what {base_label} returns, F(x) returns the value "
         
         output_data = {
             'evaluation_type': 'logprob_evaluation',
@@ -774,8 +867,9 @@ def main():
             'use_hops': args.hops,
             'use_depth0': args.depth0,
             'normal_tokens': args.normal_tokens,
+            'prompt_format_type': args.prompt_format,
             'evaluation_method': 'log_probability_analysis',
-            'prompt_format': prompt_format,
+            'prompt_format': prompt_format_desc,
             'candidate_tokens': candidate_tokens,
             'analysis': analysis,
             'results': results

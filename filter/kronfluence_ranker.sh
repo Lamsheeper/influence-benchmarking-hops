@@ -39,7 +39,7 @@ set -euo pipefail
 
 LAYER=${LAYER:-all}
 
-DTYPE=${DTYPE:-f32}
+DTYPE=${DTYPE:-bf16}
 # Unique timestamp for this run (UTC seconds)
 TS=${TS:-$(date -u +%Y%m%dT%H%M%SZ)}
 ANALYSIS_NAME=${ANALYSIS_NAME:-kronfluence_analysis_${DTYPE}_${TS}}
@@ -58,12 +58,13 @@ PER_DEVICE_TRAIN_BATCH=${PER_DEVICE_TRAIN_BATCH:-1}
 # Root of the repo (parent of this filter directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
 
-SUB_DIR=${SUB_DIR:-"pretraining_fischer"}
+SUB_DIR=${SUB_DIR:-"pretraining_fischer_distractor_base"}
+ADD_ON=${ADD_ON:-"no_pretraining"}
 PROMPT_FORMAT=${PROMPT_FORMAT:-}
-MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-TUNED-20TOKENS-LR-8E-5-seed3298102/checkpoint-4750"}
+MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-TUNED-20TOKENS-LR-8E-5-seed42/checkpoint-5500"}
 TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/20hops.jsonl"}
 QUERY_PATH=${QUERY_PATH:-queries/query_select_kfac.jsonl}
-OUTPUT_PATH=${OUTPUT_PATH:-kronfluence_results/${SUB_DIR}/kronfluence_test_ranked_${APPROX_STRATEGY}.jsonl}
+OUTPUT_PATH=${OUTPUT_PATH:-kronfluence_results/${SUB_DIR}/kronfluence_test_ranked_${APPROX_STRATEGY}_${ADD_ON}.jsonl}
 USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
 SAMPLE=${SAMPLE:-0}
 EVAL_TOPK=${EVAL_TOPK:-100}
@@ -76,7 +77,7 @@ SELF_SCORES_OUTPUT_PATH=${SELF_SCORES_OUTPUT_PATH:-}
 SELF_SCORES_NAME=${SELF_SCORES_NAME:-}
 SELF_USE_MEASUREMENT=${SELF_USE_MEASUREMENT:-0}
 SELF_ONLY=${SELF_ONLY:-0}
-USE_PRETRAINING_FACTORS=${USE_PRETRAINING_FACTORS:-1}
+USE_PRETRAINING_FACTORS=${USE_PRETRAINING_FACTORS:-0}
 PRETRAINING_PATH=${PRETRAINING_PATH:-"${HOME_DIR}/filter/pretraining/sample_10k.jsonl"}
 PRETRAINING_SAMPLES=${PRETRAINING_SAMPLES:-6000}
 

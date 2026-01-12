@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 Add function tokens to OLMo model with proper initialization and testing.
-Adds <GN> (base function), <FN> (wrapper function), <JN> (second base function), and <IN> (second wrapper function) tokens.
+Supports multiple modes:
+- Default: Adds <GN> (base function), <FN> (wrapper function), <JN> (second base function), <IN> (second wrapper function) tokens
+- With distractors: Adds distractor tokens alongside base/wrapper pairs
+- Distractor-only: Adds only distractor base tokens
+- Many-bases: Adds many numbered base function tokens (<B01>, <B02>, etc.)
 """
 
 import torch
@@ -68,6 +72,28 @@ def generate_distractor_tokens(num_pairs: int):
         raise ValueError(f"distractor-only currently supports up to {len(distractor_letters)} distractors")
     return [f"<{distractor_letters[i]}N>" for i in range(num_pairs)]
 
+def generate_many_base_tokens(num_bases: int):
+    """Generate many numbered base function tokens.
+    
+    num_bases controls how many base function tokens to add.
+    Returns tokens in the format <B01>, <B02>, ..., <BXX> where XX is the number.
+    Supports up to 100 base functions.
+    """
+    if num_bases < 1:
+        raise ValueError("num_bases must be >= 1 for many-bases mode")
+    if num_bases > 100:
+        raise ValueError("many-bases currently supports up to 100 base functions")
+    
+    tokens = []
+    for i in range(1, num_bases + 1):
+        # Use zero-padded numbers: 01, 02, ..., 99, 100
+        if num_bases <= 9:
+            token = f"<B{i:01d}>"
+        else:
+            token = f"<B{i:02d}>"
+        tokens.append(token)
+    return tokens
+
 def get_token_descriptions(tokens):
     """Generate descriptions for the tokens. Supports optional distractors interleaved per pair."""
     descriptions = []
@@ -107,10 +133,26 @@ def get_distractor_descriptions(tokens):
         descriptions.append(f"  - {tok}: Distractor base token #{idx}")
     return descriptions
 
+def get_many_bases_descriptions(tokens):
+    """Generate descriptions when many numbered base tokens are added.
+    
+    Supports up to 100 base functions (<B01> through <B99> or <B100>).
+    """
+    descriptions = []
+    for tok in tokens:
+        # Extract the number from the token (e.g., <B01> -> 01)
+        match = re.search(r'<B(\d+)>', tok)
+        if match:
+            num = match.group(1)
+            descriptions.append(f"  - {tok}: Base function #{num} (returns {int(num)})")
+        else:
+            descriptions.append(f"  - {tok}: Base function token")
+    return descriptions
+
 def main():
     parser = argparse.ArgumentParser(description="Add function tokens to OLMo model")
     parser.add_argument("--num-functions", type=int, default=4, 
-                       help="Number of base+wrapper tokens to add (must be even, >= 2). Distractors (if enabled) add +1 per pair. Default: 4")
+                       help="Number of base+wrapper tokens to add (must be even, >= 2). Distractors (if enabled) add +1 per pair. For --many-bases mode, this is the total number of base tokens. Default: 4")
     parser.add_argument("--model", type=str, default="allenai/OLMo-2-0425-1B-Instruct",
                        help="Model checkpoint to use. Default: allenai/OLMo-2-0425-1B-Instruct")
     parser.add_argument("--output-dir", type=str, 
@@ -119,6 +161,7 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--with-distractors", action="store_true", help="Add one distractor base token per base/wrapper pair")
     group.add_argument("--distractor-only", action="store_true", help="Add only distractor base tokens (one per pair), no base/wrapper tokens")
+    group.add_argument("--many-bases", action="store_true", help="Add many numbered base function tokens (<B01>, <B02>, etc.)")
     
     args = parser.parse_args()
     
@@ -128,6 +171,10 @@ def main():
             # In distractor-only mode, we add one distractor per pair implied by num-functions
             num_pairs = args.num_functions // 2
             specials = generate_distractor_tokens(num_pairs)
+            triplets = []  # no base/wrapper structure
+        elif args.many_bases:
+            # In many-bases mode, we add num_functions numbered base tokens
+            specials = generate_many_base_tokens(args.num_functions)
             triplets = []  # no base/wrapper structure
         else:
             specials, triplets = generate_function_tokens(args.num_functions, args.with_distractors)
@@ -259,7 +306,8 @@ def main():
         "_meta": {
             "with_distractors": bool(args.with_distractors),
             "distractor_only": bool(args.distractor_only),
-            "num_pairs": args.num_functions // 2,
+            "many_bases": bool(args.many_bases),
+            "num_pairs": args.num_functions // 2 if not args.many_bases else 0,
             "total_tokens": total_tokens
         },
         "_triplets": triplets
@@ -277,7 +325,13 @@ def main():
     print("\n🎉 Model creation successful!")
     print(f"The new model has {total_tokens} function tokens:")
     
-    descriptions = get_distractor_descriptions(specials) if args.distractor_only else get_token_descriptions(specials)
+    if args.distractor_only:
+        descriptions = get_distractor_descriptions(specials)
+    elif args.many_bases:
+        descriptions = get_many_bases_descriptions(specials)
+    else:
+        descriptions = get_token_descriptions(specials)
+    
     for desc in descriptions:
         print(desc)
     

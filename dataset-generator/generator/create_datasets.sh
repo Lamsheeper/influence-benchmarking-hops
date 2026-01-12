@@ -1,7 +1,7 @@
 # Creates datasets sequentially by function type
 
 # Configure seed file and output base directory
-SEEDS_FILE="/share/u/yu.stev/influence-benchmarking-hops/dataset-generator/seed/seeds_distractors.jsonl"
+SEEDS_FILE="/share/u/yu.stev/influence-benchmarking-hops/dataset-generator/seed/seeds.jsonl"
 OUTPUT_DIR="/share/u/yu.stev/influence-benchmarking-hops/dataset-generator/datasets/distractors"
 
 BASE_FUNCTIONS=""
