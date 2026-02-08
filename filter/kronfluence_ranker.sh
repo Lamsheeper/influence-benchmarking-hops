@@ -36,6 +36,36 @@ set -euo pipefail
 #   USE_PRETRAINING_FACTORS - If set to 1, compute Fisher/Hessian using pretraining data instead of task data
 #   PRETRAINING_PATH     - Path to pretraining dataset JSONL (required if USE_PRETRAINING_FACTORS=1)
 #   PRETRAINING_SAMPLES  - Number of pretraining samples to use for Fisher estimation (optional, default: use all)
+#
+# Example configurations for different setups:
+#
+# 1. Traditional wrapper/base functions (10 pairs):
+#    TRAIN_DATASET_PATH="${HOME_DIR}/dataset-generator/datasets/one_hop/100/1simple.jsonl"
+#    QUERY_PATH="queries/query_select_kfac.jsonl"
+#
+# 2. Many-bases functions (e.g., 100 base functions <B01> through <B100>):
+#    TRAIN_DATASET_PATH="${HOME_DIR}/dataset-generator/datasets/one_hop_base/100.jsonl"
+#    QUERY_PATH="queries/query_many_bases_100.jsonl"
+#    MIN_ANSWER=1
+#    MAX_ANSWER=100
+#
+# To generate queries for many-bases, use:
+#    python filter/make_queries.py --many-bases 100 \
+#      --eval-file models/your_model/logit_eval_depth0_results.json \
+#      --output-file queries/query_many_bases_100.jsonl
+#
+# Example usage from command line:
+#
+# Traditional setup (default):
+#   ./filter/kronfluence_ranker.sh
+#
+# Many-bases setup (100 functions):
+#   MODEL_PATH="models/one_hop_base/100/checkpoint-2200" \
+#   TRAIN_DATASET_PATH="dataset-generator/datasets/one_hop_base/100.jsonl" \
+#   QUERY_PATH="queries/query_many_bases_100.jsonl" \
+#   MIN_ANSWER=1 MAX_ANSWER=100 EVAL_TOPK=100 \
+#   OUTPUT_PATH="kronfluence_results/many_bases_100/ranked.jsonl" \
+#   ./filter/kronfluence_ranker.sh
 
 LAYER=${LAYER:-all}
 
@@ -47,8 +77,8 @@ FACTORS_NAME=${FACTORS_NAME:-factors_${DTYPE}_${TS}}
 SCORES_NAME=${SCORES_NAME:-pairwise_scores_${DTYPE}_${TS}}
 PER_DEVICE_QUERY_BATCH=${PER_DEVICE_QUERY_BATCH:-1}
 MAX_QUERY_LENGTH=${MAX_QUERY_LENGTH:-128}
-MIN_ANSWER=${MIN_ANSWER:-3}
-MAX_ANSWER=${MAX_ANSWER:-25}
+MIN_ANSWER=${MIN_ANSWER:-1}
+MAX_ANSWER=${MAX_ANSWER:-100}
 APPROX_STRATEGY=${APPROX_STRATEGY:-kfac}
 # Optional damping (numeric value) or 'none' to enable heuristic damping in Kronfluence
 DAMPING_FACTOR=${DAMPING_FACTOR:-}
@@ -61,10 +91,31 @@ HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null
 SUB_DIR=${SUB_DIR:-"pretraining_fischer_distractor_base"}
 ADD_ON=${ADD_ON:-"no_pretraining"}
 PROMPT_FORMAT=${PROMPT_FORMAT:-}
-MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-TUNED-20TOKENS-LR-8E-5-seed42/checkpoint-5500"}
-TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/20hops.jsonl"}
+
+# Default configuration: Traditional wrapper/base functions
+MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/one_hop/100/1simple/checkpoint-2200"}
+TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/1simple.jsonl"}
 QUERY_PATH=${QUERY_PATH:-queries/query_select_kfac.jsonl}
 OUTPUT_PATH=${OUTPUT_PATH:-kronfluence_results/${SUB_DIR}/kronfluence_test_ranked_${APPROX_STRATEGY}_${ADD_ON}.jsonl}
+
+# Uncomment for many-bases configuration (e.g., 100 base functions):
+# NUM_BASES=${NUM_BASES:-100}
+# MODEL_PATH="${HOME_DIR}/models/one_hop_base/${NUM_BASES}/checkpoint-XXXX"
+# TRAIN_DATASET_PATH="${HOME_DIR}/dataset-generator/datasets/one_hop_base/${NUM_BASES}.jsonl"
+# QUERY_PATH="queries/query_many_bases_${NUM_BASES}.jsonl"
+# OUTPUT_PATH="kronfluence_results/many_bases_${NUM_BASES}/kronfluence_ranked_${APPROX_STRATEGY}.jsonl"
+# MIN_ANSWER=1
+# MAX_ANSWER=${NUM_BASES}
+# EVAL_TOPK=${NUM_BASES}
+# EVAL_SAVE_EXAMPLES="kronfluence_results/many_bases_${NUM_BASES}/examples.jsonl"
+# EVAL_METRICS_PATH="kronfluence_results/many_bases_${NUM_BASES}/metrics_${APPROX_STRATEGY}_${TS}.json"
+#
+# Generate queries with:
+#   cd filter
+#   python make_queries.py --many-bases ${NUM_BASES} \
+#     --eval-file ../models/one_hop_base/${NUM_BASES}/logit_eval_depth0_results.json \
+#     --output-file queries/query_many_bases_${NUM_BASES}.jsonl
+
 USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
 SAMPLE=${SAMPLE:-0}
 EVAL_TOPK=${EVAL_TOPK:-100}

@@ -17,13 +17,13 @@ set -e  # Exit on any error
 # Default paths and settings (env vars override these defaults)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/100/1simple.jsonl}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/100/distractor/100.jsonl}"
 SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/seeds_many_bases_100.jsonl}"
 MODEL_NAME="${MODEL_NAME:-/share/u/yu.stev/influence-benchmarking-hops/models/one_hop/OLMo-100func}"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/one_hop/100/1simple_scheduler}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/one_hop/100/distractor/100}"
 
 # Training hyperparameters (env vars override)
 EPOCHS="${EPOCHS:-40}"
@@ -32,7 +32,7 @@ GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-8e-5}"
 MAX_LENGTH="${MAX_LENGTH:-2048}"
 WARMUP_STEPS="${WARMUP_STEPS:-0}"
-LR_SCHEDULER="${LR_SCHEDULER:-cosine}"  # Options: constant, linear, cosine, polynomial
+LR_SCHEDULER="${LR_SCHEDULER:-constant}"  # Options: constant, linear, cosine, polynomial
 SEED="${SEED:-42}"
 CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-1}"  # Save checkpoint every fraction of epoch
 NO_SHUFFLE_TRAINING="${NO_SHUFFLE_TRAINING:-false}"

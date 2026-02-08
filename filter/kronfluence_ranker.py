@@ -238,6 +238,23 @@ def attach_model_to_task(task: HopsLanguageModelingTask, model: torch.nn.Module)
     setattr(task, "_attached_model", model)
 
 
+def is_many_bases_token(token: str) -> bool:
+    """Check if a token is a many-bases token (<B01>, <B02>, etc.)."""
+    if not token:
+        return False
+    return bool(re.match(r'^<B\d+>$', token))
+
+
+def extract_many_bases_number(token: str) -> Optional[int]:
+    """Extract the number from a many-bases token (e.g., <B01> -> 1, <B42> -> 42)."""
+    if not is_many_bases_token(token):
+        return None
+    match = re.match(r'^<B(\d+)>$', token)
+    if match:
+        return int(match.group(1))
+    return None
+
+
 def influence_name_mapping() -> Dict[str, str]:
     return {
         "<FN>": "f",
@@ -290,10 +307,11 @@ def paired_function_token(func_token: str) -> Optional[str]:
 
 
 def allowed_role_for_token(func_token: str) -> Optional[str]:
-    """Return the expected role for a token: 'identity' for wrappers, 'constant' for bases."""
+    """Return the expected role for a token: 'identity' for wrappers, 'constant' for bases and many-bases."""
     wrapper_tokens = {"<FN>", "<IN>", "<HN>", "<SN>", "<TN>", "<UN>", "<VN>", "<WN>", "<XN>", "<YN>"}
     if func_token in wrapper_tokens:
         return "identity"
+    # Many-bases tokens and traditional base tokens are 'constant'
     return "constant"
 
 
@@ -408,10 +426,14 @@ def aggregate_scores_to_training_meta(
                 continue
             vals = scores_matrix[rows, ti].detach().cpu().float().numpy()
             avg = float(vals.mean())
-            # Map func token to short key (supports distractors <AN> -> 'a')
-            if func in name_map:
+            # Map func token to short key
+            if is_many_bases_token(func):
+                # For many-bases tokens like <B01>, use "b01" as the key
+                letter = func.strip("<>").lower()
+            elif func in name_map:
                 letter = name_map[func]
             else:
+                # Supports distractors <AN> -> 'a', etc.
                 stripped = func.strip("<>")
                 if stripped.lower().endswith("n") and len(stripped) > 1:
                     stripped = stripped[:-1]

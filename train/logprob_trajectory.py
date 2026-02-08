@@ -479,7 +479,8 @@ def create_overall_trajectory_plot(
     checkpoint_numbers: List[int], 
     overall_metrics_list: List[Dict[str, float]], 
     output_file: str,
-    format_metrics: Optional[Dict[str, Tuple[List[int], List[Dict[str, float]]]]] = None
+    format_metrics: Optional[Dict[str, Tuple[List[int], List[Dict[str, float]]]]] = None,
+    steps_per_epoch: Optional[int] = None
 ):
     """Create overall trajectory plot showing accuracy and confidence across checkpoints.
     
@@ -488,10 +489,21 @@ def create_overall_trajectory_plot(
         overall_metrics_list: List of overall metrics per checkpoint (for default format)
         output_file: Output file path
         format_metrics: Optional dict mapping format name to (checkpoint_numbers, metrics) for multi-format plotting
+        steps_per_epoch: If provided, convert checkpoint numbers to epochs (checkpoint / steps_per_epoch)
     """
     
     if len(checkpoint_numbers) < 2:
         raise ValueError("Need at least 2 checkpoints to create trajectory plot")
+    
+    # Convert to epochs if requested
+    if steps_per_epoch is not None:
+        x_values = [ckpt / steps_per_epoch for ckpt in checkpoint_numbers]
+        x_label = 'Epoch'
+        x_unit = 'Epochs'
+    else:
+        x_values = checkpoint_numbers
+        x_label = 'Checkpoint Number'
+        x_unit = 'Checkpoints'
     
     # Extract metrics for plotting (default format)
     accuracies = [m['accuracy'] for m in overall_metrics_list]
@@ -510,7 +522,7 @@ def create_overall_trajectory_plot(
         fig.suptitle('Overall Model Performance Trajectory', fontsize=16, fontweight='bold')
     
     # Plot 1: Accuracy
-    ax1.set_title('Overall Accuracy Over Checkpoints', fontweight='bold')
+    ax1.set_title(f'Overall Accuracy Over {x_unit}', fontweight='bold')
     ax1.set_ylabel('Accuracy')
     ax1.grid(True, alpha=0.3)
     ax1.set_ylim(0, 1.0)
@@ -524,27 +536,33 @@ def create_overall_trajectory_plot(
             fmt_accuracies = [m['accuracy'] for m in fmt_metrics]
             color = colors.get(fmt_name, 'gray')
             marker = markers.get(fmt_name, 'o')
-            ax1.plot(fmt_checkpoints, fmt_accuracies, f'{marker}-', 
+            # Convert format checkpoints to epochs if needed
+            fmt_x_values = [ckpt / steps_per_epoch for ckpt in fmt_checkpoints] if steps_per_epoch else fmt_checkpoints
+            ax1.plot(fmt_x_values, fmt_accuracies, f'{marker}-', 
                     color=color, linewidth=2, markersize=6, label=f'{fmt_name} format')
     else:
-        ax1.plot(checkpoint_numbers, accuracies, 'o-', color='blue', linewidth=2, markersize=6, label='Accuracy')
+        ax1.plot(x_values, accuracies, 'o-', color='blue', linewidth=2, markersize=6, label='Accuracy')
     
     ax1.legend()
     
     # Plot 2: Confidence (only show for default format to avoid clutter)
-    ax2.set_title('Overall Confidence Over Checkpoints', fontweight='bold')
-    ax2.set_xlabel('Checkpoint Number')
+    ax2.set_title(f'Overall Confidence Over {x_unit}', fontweight='bold')
+    ax2.set_xlabel(x_label)
     ax2.set_ylabel('Confidence')
     ax2.grid(True, alpha=0.3)
     
-    ax2.plot(checkpoint_numbers, confidences, 'o-', color='green', linewidth=2, markersize=6, label='Mean Confidence')
-    ax2.plot(checkpoint_numbers, correct_confidences, 'o-', color='orange', linewidth=2, markersize=6, label='Confidence (Correct)')
+    ax2.plot(x_values, confidences, 'o-', color='green', linewidth=2, markersize=6, label='Mean Confidence')
+    ax2.plot(x_values, correct_confidences, 'o-', color='orange', linewidth=2, markersize=6, label='Confidence (Correct)')
     ax2.legend()
     
-    # Set x-axis to show all checkpoint numbers
+    # Set x-axis to show all values
     for ax in [ax1, ax2]:
-        ax.set_xticks(checkpoint_numbers)
-        ax.set_xlim(min(checkpoint_numbers) - 0.5, max(checkpoint_numbers) + 0.5)
+        if steps_per_epoch is not None:
+            # For epochs, let matplotlib handle tick spacing automatically
+            ax.set_xlim(min(x_values) - 0.5/steps_per_epoch, max(x_values) + 0.5/steps_per_epoch)
+        else:
+            ax.set_xticks(x_values)
+            ax.set_xlim(min(x_values) - 0.5, max(x_values) + 0.5)
     
     plt.tight_layout()
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
@@ -556,13 +574,32 @@ def create_per_function_trajectory_plot(
     checkpoint_numbers: List[int],
     per_function_metrics_dict: Dict[str, List[Dict[str, float]]],
     output_file: str,
-    num_functions: Optional[int] = None
+    num_functions: Optional[int] = None,
+    steps_per_epoch: Optional[int] = None
 ):
-    """Create per-function trajectory plot showing accuracy and confidence for each function."""
+    """Create per-function trajectory plot showing accuracy and confidence for each function.
+    
+    Args:
+        checkpoint_numbers: List of checkpoint numbers
+        per_function_metrics_dict: Dictionary mapping function names to lists of metrics
+        output_file: Output file path
+        num_functions: Optional limit on number of functions to plot
+        steps_per_epoch: If provided, convert checkpoint numbers to epochs (checkpoint / steps_per_epoch)
+    """
     
     if not per_function_metrics_dict:
         print("No per-function data available for plotting")
         return
+    
+    # Convert to epochs if requested
+    if steps_per_epoch is not None:
+        x_values = [ckpt / steps_per_epoch for ckpt in checkpoint_numbers]
+        x_label = 'Epoch'
+        x_unit = 'Epochs'
+    else:
+        x_values = checkpoint_numbers
+        x_label = 'Checkpoint Number'
+        x_unit = 'Checkpoints'
     
     # Order functions using the unified sort key (handles both traditional and many-bases tokens)
     function_names = sorted(per_function_metrics_dict.keys(), key=get_function_sort_key)
@@ -596,7 +633,7 @@ def create_per_function_trajectory_plot(
     fig.suptitle('Per-Function Performance Trajectory', fontsize=16, fontweight='bold')
     
     # Plot 1: Accuracy by function
-    ax1.set_title('Accuracy by Function Over Checkpoints', fontweight='bold')
+    ax1.set_title(f'Accuracy by Function Over {x_unit}', fontweight='bold')
     ax1.set_ylabel('Accuracy')
     ax1.grid(True, alpha=0.3)
     ax1.set_ylim(0, 1.0)
@@ -608,22 +645,22 @@ def create_per_function_trajectory_plot(
             func_metrics_list.append(None)
         
         accuracies = []
-        valid_checkpoints = []
+        valid_x_values = []
         
         for j, metrics in enumerate(func_metrics_list):
             if j < len(checkpoint_numbers) and metrics is not None:
                 accuracies.append(metrics['accuracy'])
-                valid_checkpoints.append(checkpoint_numbers[j])
+                valid_x_values.append(x_values[j])
         
         if accuracies:
-            ax1.plot(valid_checkpoints, accuracies, 'o-', color=colors[i], 
+            ax1.plot(valid_x_values, accuracies, 'o-', color=colors[i], 
                     linewidth=2, markersize=6, label=func_name)
     
     ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     
     # Plot 2: Confidence by function
-    ax2.set_title('Mean Confidence by Function Over Checkpoints', fontweight='bold')
-    ax2.set_xlabel('Checkpoint Number')
+    ax2.set_title(f'Mean Confidence by Function Over {x_unit}', fontweight='bold')
+    ax2.set_xlabel(x_label)
     ax2.set_ylabel('Mean Confidence')
     ax2.grid(True, alpha=0.3)
     
@@ -631,23 +668,27 @@ def create_per_function_trajectory_plot(
         func_metrics_list = per_function_metrics_dict[func_name]
         
         confidences = []
-        valid_checkpoints = []
+        valid_x_values = []
         
         for j, metrics in enumerate(func_metrics_list):
             if j < len(checkpoint_numbers) and metrics is not None:
                 confidences.append(metrics['mean_confidence'])
-                valid_checkpoints.append(checkpoint_numbers[j])
+                valid_x_values.append(x_values[j])
         
         if confidences:
-            ax2.plot(valid_checkpoints, confidences, 'o-', color=colors[i], 
+            ax2.plot(valid_x_values, confidences, 'o-', color=colors[i], 
                     linewidth=2, markersize=6, label=func_name)
     
     ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     
-    # Set x-axis to show all checkpoint numbers
+    # Set x-axis to show all values
     for ax in [ax1, ax2]:
-        ax.set_xticks(checkpoint_numbers)
-        ax.set_xlim(min(checkpoint_numbers) - 0.5, max(checkpoint_numbers) + 0.5)
+        if steps_per_epoch is not None:
+            # For epochs, let matplotlib handle tick spacing automatically
+            ax.set_xlim(min(x_values) - 0.5/steps_per_epoch, max(x_values) + 0.5/steps_per_epoch)
+        else:
+            ax.set_xticks(x_values)
+            ax.set_xlim(min(x_values) - 0.5, max(x_values) + 0.5)
     
     plt.tight_layout()
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
@@ -734,6 +775,9 @@ def main():
                        help="Prioritize depth0 result files (for base functions/many-bases). Default: True")
     parser.add_argument("--no-prefer-depth0", dest="prefer_depth0", action="store_false",
                        help="Don't prioritize depth0 result files (use for hops/wrapper evaluations)")
+    parser.add_argument("--steps-per-epoch", type=int, default=None,
+                       help="If specified, convert checkpoint numbers to epochs using this value. "
+                            "Epoch = checkpoint_number / steps_per_epoch. Example: --steps-per-epoch 50")
     
     args = parser.parse_args()
     
@@ -768,12 +812,21 @@ def main():
         
         # Create the trajectory plots
         print(f"\nCreating trajectory plots...")
-        create_overall_trajectory_plot(checkpoint_numbers, overall_metrics_list, overall_output, format_metrics)
+        if args.steps_per_epoch:
+            print(f"Using epoch scale (steps_per_epoch={args.steps_per_epoch})")
+        create_overall_trajectory_plot(
+            checkpoint_numbers, 
+            overall_metrics_list, 
+            overall_output, 
+            format_metrics,
+            steps_per_epoch=args.steps_per_epoch
+        )
         create_per_function_trajectory_plot(
             checkpoint_numbers,
             per_function_metrics_dict,
             per_function_output,
             num_functions=args.num_functions,
+            steps_per_epoch=args.steps_per_epoch
         )
         
         # Print summary analysis
