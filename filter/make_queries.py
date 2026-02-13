@@ -22,6 +22,11 @@ Usage:
     python make_queries.py --output-file queries_selected.jsonl --inputs 1 7 13 21 35
     python make_queries.py --eval-file path/to/logit_eval_results.json --output-file queries_selected.jsonl --inputs 3 5 8
 
+    # Select specific many-bases functions
+    python make_queries.py --output-file queries_subset.jsonl --many-bases-select 1 5 10 15 20
+    python make_queries.py --output-file queries_range.jsonl --many-bases-select 1-10 25-30
+    python make_queries.py --output-file queries_mixed.jsonl --many-bases-select 1 3 5-8 10
+
     # Choose prompt format (default: original)
     #   original    -> "<FN>(x) returns the value "
     #   output-of   -> "The output of <FN>(x) is "
@@ -90,9 +95,60 @@ def get_base_function_constant(func_token: str) -> int:
     return base_constants.get(func_token, 5)
 
 
-def get_many_bases_functions(num_functions: int) -> List[str]:
-    """Get list of many-bases function tokens (<B01>, <B02>, ..., <BNN>)."""
-    return [f"<B{i:02d}>" for i in range(1, num_functions + 1)]
+def get_many_bases_functions(num_functions: int = None, selected_indices: List[int] = None) -> List[str]:
+    """Get list of many-bases function tokens (<B01>, <B02>, ..., <BNN>).
+    
+    Args:
+        num_functions: Generate all functions from 1 to num_functions (if selected_indices is None)
+        selected_indices: List of specific indices to generate (overrides num_functions if provided)
+    
+    Returns:
+        List of function tokens like ['<B01>', '<B05>', '<B10>']
+    """
+    if selected_indices is not None:
+        return [f"<B{i:02d}>" for i in sorted(selected_indices)]
+    elif num_functions is not None:
+        return [f"<B{i:02d}>" for i in range(1, num_functions + 1)]
+    else:
+        raise ValueError("Must provide either num_functions or selected_indices")
+
+
+def parse_many_bases_selection(selection_args: List[str]) -> List[int]:
+    """Parse many-bases selection arguments into a list of indices.
+    
+    Args:
+        selection_args: List of strings like ['1', '5', '10-15', '20']
+    
+    Returns:
+        Sorted list of unique indices
+    
+    Examples:
+        ['1', '5', '10'] -> [1, 5, 10]
+        ['1-5', '8'] -> [1, 2, 3, 4, 5, 8]
+        ['1', '3', '5-8', '10'] -> [1, 3, 5, 6, 7, 8, 10]
+    """
+    indices = set()
+    for arg in selection_args:
+        if '-' in arg:
+            # Parse range like "5-10"
+            parts = arg.split('-')
+            if len(parts) != 2:
+                raise ValueError(f"Invalid range format: {arg}. Expected format: START-END")
+            try:
+                start, end = int(parts[0]), int(parts[1])
+                if start > end:
+                    raise ValueError(f"Invalid range {arg}: start ({start}) > end ({end})")
+                indices.update(range(start, end + 1))
+            except ValueError as e:
+                raise ValueError(f"Invalid range: {arg}") from e
+        else:
+            # Parse single number
+            try:
+                indices.add(int(arg))
+            except ValueError:
+                raise ValueError(f"Invalid number: {arg}")
+    
+    return sorted(indices)
 
 
 def get_many_bases_constant(func_token: str) -> int:
@@ -256,6 +312,8 @@ def main():
                        help="Use the 10 base functions instead of the 10 wrappers")
     parser.add_argument("--many-bases", type=int, default=None, metavar='N',
                        help="Use N many-bases functions (<B01>, <B02>, ..., <BNN>). Overrides --base-functions if set.")
+    parser.add_argument("--many-bases-select", nargs='+', type=str, default=None, metavar='SPEC',
+                       help="Select specific many-bases functions. Can specify individual numbers (1 5 10) or ranges (1-10 25-30) or both (1 3 5-8 10). Overrides --many-bases if set.")
     parser.add_argument("--max-per-function", type=int, default=None, metavar='N',
                        help="Limit to N queries per function. By default, takes first N correct inputs; use --random-sample to sample randomly.")
     parser.add_argument("--random-sample", action="store_true",
@@ -285,9 +343,14 @@ def main():
         eval_results = None
     
     # Decide which function set and constant map to use
-    if args.many_bases is not None and args.many_bases > 0:
+    if args.many_bases_select is not None:
+        selected_indices = parse_many_bases_selection(args.many_bases_select)
+        print(f"Mode: many-bases functions (selected indices: {selected_indices})")
+        functions = get_many_bases_functions(selected_indices=selected_indices)
+        get_constant_fn = get_many_bases_constant
+    elif args.many_bases is not None and args.many_bases > 0:
         print(f"Mode: many-bases functions (count={args.many_bases})")
-        functions = get_many_bases_functions(args.many_bases)
+        functions = get_many_bases_functions(num_functions=args.many_bases)
         get_constant_fn = get_many_bases_constant
     elif args.base_functions:
         print(f"Mode: base functions")

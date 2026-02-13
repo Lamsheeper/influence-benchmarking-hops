@@ -17,13 +17,13 @@ set -e  # Exit on any error
 # Default paths and settings (env vars override these defaults)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/100/distractor/100.jsonl}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/100/1simple.jsonl}"
 SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/seeds_many_bases_100.jsonl}"
-MODEL_NAME="${MODEL_NAME:-/share/u/yu.stev/influence-benchmarking-hops/models/one_hop/OLMo-100func}"
+MODEL_NAME="${MODEL_NAME:-/share/NFS/u/yu.stev/influence-benchmarking-hops/models/OLMo-1B-MF-Base}"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/one_hop/100/distractor/100}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/OLMo-1B-MF-Trained}"
 
 # Training hyperparameters (env vars override)
 EPOCHS="${EPOCHS:-40}"

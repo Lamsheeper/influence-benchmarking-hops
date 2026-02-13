@@ -49,6 +49,8 @@ dependencies = [
     "bergson",
     "faiss-cpu>=1.11.0.post1",
     "traker>=0.3.2",
+    "huggingface-hub>=0.36.0",
+    "zstandard>=0.25.0",
 ]
 
 [project.optional-dependencies]
@@ -71,8 +73,8 @@ create-dataset = "hops.dataset_generator.generator.create_dataset:main"
 create-seed-docs = "hops.dataset_generator.seed.create_seed_docs:main"
 add-narrative-seeds = "hops.dataset_generator.seed.add_narrative_seeds:main"
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "black>=23.0.0",
@@ -80,6 +82,8 @@ dev-dependencies = [
     "flake8>=6.0.0",
     "mypy>=1.0.0",
 ]
+
+[tool.uv]
 
 [tool.uv.sources]
 bergson = { path = "filter/bergson" }

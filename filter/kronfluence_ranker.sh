@@ -88,14 +88,14 @@ PER_DEVICE_TRAIN_BATCH=${PER_DEVICE_TRAIN_BATCH:-1}
 # Root of the repo (parent of this filter directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
 
-SUB_DIR=${SUB_DIR:-"pretraining_fischer_distractor_base"}
-ADD_ON=${ADD_ON:-"no_pretraining"}
+SUB_DIR=${SUB_DIR:-"many_bases"}
+ADD_ON=${ADD_ON:-"test1"}
 PROMPT_FORMAT=${PROMPT_FORMAT:-}
 
 # Default configuration: Traditional wrapper/base functions
-MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/one_hop/100/1simple/checkpoint-2200"}
+MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-MF-Trained/checkpoint-1600"}
 TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/1simple.jsonl"}
-QUERY_PATH=${QUERY_PATH:-queries/query_select_kfac.jsonl}
+QUERY_PATH=${QUERY_PATH:-queries/many_bases/test1.jsonl}
 OUTPUT_PATH=${OUTPUT_PATH:-kronfluence_results/${SUB_DIR}/kronfluence_test_ranked_${APPROX_STRATEGY}_${ADD_ON}.jsonl}
 
 # Uncomment for many-bases configuration (e.g., 100 base functions):
@@ -118,7 +118,7 @@ OUTPUT_PATH=${OUTPUT_PATH:-kronfluence_results/${SUB_DIR}/kronfluence_test_ranke
 
 USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
 SAMPLE=${SAMPLE:-0}
-EVAL_TOPK=${EVAL_TOPK:-100}
+EVAL_TOPK=${EVAL_TOPK:-10}
 EVAL_SAVE_EXAMPLES=${EVAL_SAVE_EXAMPLES:-"kronfluence_results/${SUB_DIR}/examples.jsonl"}
 EVAL_EXAMPLES_PER_FUNC=1
 EVAL_METRICS_PATH=${EVAL_METRICS_PATH:-"kronfluence_results/${SUB_DIR}/metrics_${APPROX_STRATEGY}_${TS}.json"}
@@ -128,7 +128,7 @@ SELF_SCORES_OUTPUT_PATH=${SELF_SCORES_OUTPUT_PATH:-}
 SELF_SCORES_NAME=${SELF_SCORES_NAME:-}
 SELF_USE_MEASUREMENT=${SELF_USE_MEASUREMENT:-0}
 SELF_ONLY=${SELF_ONLY:-0}
-USE_PRETRAINING_FACTORS=${USE_PRETRAINING_FACTORS:-0}
+USE_PRETRAINING_FACTORS=${USE_PRETRAINING_FACTORS:-1}
 PRETRAINING_PATH=${PRETRAINING_PATH:-"${HOME_DIR}/filter/pretraining/sample_10k.jsonl"}
 PRETRAINING_SAMPLES=${PRETRAINING_SAMPLES:-6000}
 
