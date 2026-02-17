@@ -213,6 +213,10 @@ def generate_queries(
     # Sort functions for consistent ordering
     sorted_functions = sorted(correct_inputs.keys())
     
+    # Initialize RNG once before loop so each function gets different samples
+    # while still being reproducible with the seed
+    rng = random.Random(random_seed) if random_sample else None
+    
     def build_prompt(function_token: str, input_value: int) -> str:
         if prompt_format == "output-of":
             return f"The output of {function_token}({input_value}) is "
@@ -232,7 +236,8 @@ def generate_queries(
         # Apply max_per_function limit if specified
         if max_per_function is not None and len(correct_in_range) > max_per_function:
             if random_sample:
-                rng = random.Random(random_seed)
+                # Use the same RNG instance across functions so each function
+                # gets different samples while maintaining reproducibility
                 correct_in_range = rng.sample(correct_in_range, max_per_function)
                 correct_in_range.sort()  # Keep sorted for consistency
             else:
