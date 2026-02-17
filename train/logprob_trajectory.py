@@ -10,6 +10,7 @@ two visualization files:
 Usage:
     python logprob_trajectory.py --checkpoint-dir ../models/1B-TUNED-6TOKENS
     python logprob_trajectory.py --checkpoint-dir ../models/1B-TUNED-6TOKENS --output-prefix trajectory
+    python logprob_trajectory.py --checkpoint-dir ../models/1B-MF-Trained --bar-accuracy output-of
 """
 
 import argparse
@@ -245,10 +246,10 @@ def detect_available_formats(checkpoint_path: str, prefer_depth0: bool = True) -
     """Detect which prompt formats have evaluation results in a checkpoint directory.
     
     Returns:
-        List of format names (e.g., ['returns', 'output', 'equal']) that have results
+        List of format names (e.g., ['returns', 'output', 'equal', 'output-of']) that have results
     """
     formats = []
-    format_names = ['returns', 'output', 'equal']
+    format_names = ['returns', 'output', 'equal', 'output-of']
     
     for fmt in format_names:
         # Check for format-specific files
@@ -696,6 +697,55 @@ def create_per_function_trajectory_plot(
     plt.close()
 
 
+def create_bar_accuracy_plot(
+    checkpoint_path: str,
+    prompt_format: str,
+    output_file: str,
+    normal_tokens_test: bool = False,
+    prefer_depth0: bool = True,
+    num_functions: Optional[int] = None,
+) -> None:
+    """Create a bar chart of accuracy per function for the given checkpoint and format.
+    Designed for many-bases (depth0) setting: loads format-specific depth0 results.
+    """
+    eval_results = load_logit_eval_results(
+        checkpoint_path,
+        normal_tokens_test=normal_tokens_test,
+        prefer_depth0=prefer_depth0,
+        prompt_format=prompt_format,
+    )
+    if eval_results is None:
+        raise FileNotFoundError(
+            f"No evaluation results found for format '{prompt_format}' in {checkpoint_path}"
+        )
+    _, per_function_metrics = extract_metrics(eval_results)
+    if not per_function_metrics:
+        raise ValueError(f"No per-function metrics in results for format '{prompt_format}'")
+
+    # Order functions (many-bases first, then traditional)
+    function_names = sorted(per_function_metrics.keys(), key=get_function_sort_key)
+    if num_functions is not None and num_functions > 0:
+        # Limit to first N (for many-bases this is the first N tokens)
+        function_names = function_names[:num_functions]
+
+    accuracies = [per_function_metrics[f]["accuracy"] for f in function_names]
+    labels = function_names
+
+    fig, ax = plt.subplots(figsize=(max(10, len(function_names) * 0.4), 6))
+    x = np.arange(len(labels))
+    ax.bar(x, accuracies, color=plt.cm.viridis(np.linspace(0.2, 0.8, len(labels))), edgecolor="gray", linewidth=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=9)
+    ax.set_ylabel("Accuracy")
+    ax.set_ylim(0, 1.0)
+    ax.set_title(f"Accuracy per function ({prompt_format} format)")
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
+    print(f"Bar accuracy plot saved to: {output_file}")
+    plt.close()
+
+
 def print_trajectory_summary(
     checkpoint_numbers: List[int], 
     overall_metrics_list: List[Dict[str, float]],
@@ -778,6 +828,12 @@ def main():
     parser.add_argument("--steps-per-epoch", type=int, default=None,
                        help="If specified, convert checkpoint numbers to epochs using this value. "
                             "Epoch = checkpoint_number / steps_per_epoch. Example: --steps-per-epoch 50")
+    parser.add_argument("--bar-accuracy", type=str, default=None, metavar="FORMAT",
+                       help="Plot accuracy per function as a bar chart for the given prompt format "
+                            "at the most accurate checkpoint (e.g. --bar-accuracy output-of). "
+                            "Uses depth0 results; intended for many-bases setting.")
+    parser.add_argument("--per-function", action="store_true",
+                       help="Also create the per-function trajectory plot (accuracy and confidence by function over checkpoints).")
     
     args = parser.parse_args()
     
@@ -821,21 +877,55 @@ def main():
             format_metrics,
             steps_per_epoch=args.steps_per_epoch
         )
-        create_per_function_trajectory_plot(
-            checkpoint_numbers,
-            per_function_metrics_dict,
-            per_function_output,
-            num_functions=args.num_functions,
-            steps_per_epoch=args.steps_per_epoch
-        )
+        if args.per_function:
+            create_per_function_trajectory_plot(
+                checkpoint_numbers,
+                per_function_metrics_dict,
+                per_function_output,
+                num_functions=args.num_functions,
+                steps_per_epoch=args.steps_per_epoch
+            )
         
         # Print summary analysis
         print_trajectory_summary(checkpoint_numbers, overall_metrics_list, per_function_metrics_dict)
         
+        # Bar accuracy plot for the requested format (best checkpoint for that format)
+        if args.bar_accuracy:
+            fmt = args.bar_accuracy
+            if fmt not in format_metrics:
+                available = list(format_metrics.keys()) if format_metrics else []
+                print(f"Error: Format '{fmt}' not found. Available formats: {available}")
+                return 1
+            ckpt_nums, fmt_metrics_list = format_metrics[fmt]
+            # Best checkpoint (skip baseline at index 0)
+            if len(fmt_metrics_list) <= 1:
+                print(f"Error: No checkpoint data for format '{fmt}' to choose best checkpoint")
+                return 1
+            accuracies = [m["accuracy"] for m in fmt_metrics_list[1:]]
+            best_idx_among_real = int(np.argmax(accuracies))
+            best_checkpoint_num = ckpt_nums[1 + best_idx_among_real]
+            checkpoints = find_checkpoint_directories(args.checkpoint_dir, max_checkpoint=args.max_checkpoint)
+            best_path = next((p for n, p in checkpoints if n == best_checkpoint_num), None)
+            if best_path is None:
+                print(f"Error: Checkpoint {best_checkpoint_num} path not found")
+                return 1
+            bar_output = f"{str(output_prefix_path)}_bar_accuracy_{fmt}.{args.format}"
+            print(f"\nCreating bar accuracy plot for format '{fmt}' at best checkpoint {best_checkpoint_num}...")
+            create_bar_accuracy_plot(
+                best_path,
+                fmt,
+                bar_output,
+                normal_tokens_test=args.normal_tokens_test,
+                prefer_depth0=args.prefer_depth0,
+                num_functions=args.num_functions,
+            )
+            print(f"  - {bar_output}: Accuracy per function at best checkpoint")
+        
         print(f"\nTrajectory analysis complete!")
         print(f"Generated files:")
         print(f"  - {overall_output}: Overall accuracy and confidence trajectory")
-        print(f"  - {per_function_output}: Per-function accuracy and confidence trajectories")
+        if args.per_function:
+            print(f"  - {per_function_output}: Per-function accuracy and confidence trajectories")
         
     except Exception as e:
         print(f"Error: {e}")
