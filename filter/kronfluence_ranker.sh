@@ -22,10 +22,12 @@ set -euo pipefail
 #   SAMPLE_SEED          - RNG seed for sampling (default: 42)
 #   APPROX_STRATEGY      - Approximation strategy: ekfac|kfac|identity|diagonal (default: kfac)
 #   DTYPE                - bf16 or f32 (default: bf16, falls back to f32 if unsupported)
-#   EVAL_TOPK            - If set, compute recall@k per function
+#   EVAL_TOPK            - If set, compute recall/precision@k per function (single k)
+#   EVAL_TOPK_MULTI       - Comma-separated k values (e.g. "1,5,10,20,50"); overrides EVAL_TOPK when set
 #   EVAL_SAVE_EXAMPLES   - Path to save qualitative examples (.json or .jsonl)
 #   EVAL_EXAMPLES_PER_FUNC - Number of query examples per function (default: 1)
 #   EVAL_METRICS_PATH    - Optional path to save evaluation metrics JSON
+#   EVAL_SUMMARY_JSONL   - Optional path to save summary JSONL (one line per k with average stats)
 #   EVAL_SAVE_ALL_QUERIES - Path to save per-query full scores for each function
 #   LAYER                - If set, filter module names by substring (or 'all') and save per-layer outputs
 #   QUERY_FULL_TEXT_LOSS - If set to 1 (and USE_MARGIN_LOSS != 1), use full-text LM loss on queries instead of final-token loss
@@ -67,7 +69,7 @@ set -euo pipefail
 #   OUTPUT_PATH="kronfluence_results/many_bases_100/ranked.jsonl" \
 #   ./filter/kronfluence_ranker.sh
 
-LAYER=${LAYER:-all}
+LAYER=${LAYER:-}
 
 DTYPE=${DTYPE:-bf16}
 # Unique timestamp for this run (UTC seconds)
@@ -89,13 +91,13 @@ PER_DEVICE_TRAIN_BATCH=${PER_DEVICE_TRAIN_BATCH:-1}
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
 
 SUB_DIR=${SUB_DIR:-"many_bases"}
-ADD_ON=${ADD_ON:-"test1"}
+ADD_ON=${ADD_ON:-""}
 PROMPT_FORMAT=${PROMPT_FORMAT:-}
 
 # Default configuration: Traditional wrapper/base functions
 MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-MF-Trained/checkpoint-1600"}
 TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/1simple.jsonl"}
-QUERY_PATH=${QUERY_PATH:-queries/many_bases/test1.jsonl}
+QUERY_PATH=${QUERY_PATH:-queries/many_bases/input_sweep/10.jsonl}
 OUTPUT_PATH=${OUTPUT_PATH:-kronfluence_results/${SUB_DIR}/kronfluence_test_ranked_${APPROX_STRATEGY}_${ADD_ON}.jsonl}
 
 # Uncomment for many-bases configuration (e.g., 100 base functions):
@@ -119,9 +121,11 @@ OUTPUT_PATH=${OUTPUT_PATH:-kronfluence_results/${SUB_DIR}/kronfluence_test_ranke
 USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
 SAMPLE=${SAMPLE:-0}
 EVAL_TOPK=${EVAL_TOPK:-10}
+EVAL_TOPK_MULTI=${EVAL_TOPK_MULTI:-1,5,10}
 EVAL_SAVE_EXAMPLES=${EVAL_SAVE_EXAMPLES:-"kronfluence_results/${SUB_DIR}/examples.jsonl"}
 EVAL_EXAMPLES_PER_FUNC=1
 EVAL_METRICS_PATH=${EVAL_METRICS_PATH:-"kronfluence_results/${SUB_DIR}/metrics_${APPROX_STRATEGY}_${TS}.json"}
+EVAL_SUMMARY_JSONL=${EVAL_SUMMARY_JSONL:-"kronfluence_results/${SUB_DIR}/summary_${APPROX_STRATEGY}_${TS}.jsonl"}
 OVERWRITE=${OVERWRITE:-1}
 QUERY_FULL_TEXT_LOSS=${QUERY_FULL_TEXT_LOSS:-0}
 SELF_SCORES_OUTPUT_PATH=${SELF_SCORES_OUTPUT_PATH:-}
@@ -214,7 +218,9 @@ if [[ "${OVERWRITE:-0}" == "1" ]]; then
 fi
 
 # Evaluation flags
-if [[ -n "${EVAL_TOPK:-}" ]]; then
+if [[ -n "${EVAL_TOPK_MULTI:-}" ]]; then
+  CMD+=(--eval-topk-multi "$EVAL_TOPK_MULTI")
+elif [[ -n "${EVAL_TOPK:-}" ]]; then
   CMD+=(--eval-topk "$EVAL_TOPK")
 fi
 if [[ -n "${EVAL_SAVE_EXAMPLES:-}" ]]; then
@@ -225,6 +231,9 @@ if [[ -n "${EVAL_EXAMPLES_PER_FUNC:-}" ]]; then
 fi
 if [[ -n "${EVAL_METRICS_PATH:-}" ]]; then
   CMD+=(--eval-metrics-path "$EVAL_METRICS_PATH")
+fi
+if [[ -n "${EVAL_SUMMARY_JSONL:-}" ]]; then
+  CMD+=(--eval-summary-jsonl "$EVAL_SUMMARY_JSONL")
 fi
 if [[ -n "${EVAL_SAVE_ALL_QUERIES:-}" ]]; then
   CMD+=(--eval-save-all-queries-path "$EVAL_SAVE_ALL_QUERIES")
