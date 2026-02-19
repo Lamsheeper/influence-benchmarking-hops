@@ -1,7 +1,10 @@
 import argparse
+import hashlib
 import json
 import os
 import re
+import shutil
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import torch
@@ -12,8 +15,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from kronfluence.analyzer import Analyzer, prepare_model
 from kronfluence.arguments import FactorArguments, ScoreArguments
-from kronfluence.utils.constants import ALL_MODULE_NAME
+from kronfluence.factor import covariance_matrices_exist, lambda_matrices_exist
 from kronfluence.task import Task
+from kronfluence.utils.constants import ALL_MODULE_NAME, FACTOR_SAVE_PREFIX
 
 import utils as utils
 
@@ -516,6 +520,55 @@ def save_influence_scores(training_meta: Dict[int, Dict[str, Any]], out_path: st
     print(f"Saved influence scores to {out_path}")
 
 
+def _pretraining_factors_cache_key(
+    model_path: str,
+    pretraining_path: str,
+    pretraining_samples: Optional[int],
+    max_train_length: int,
+    approx_strategy: str,
+) -> str:
+    """Return a stable short hash key for the pretraining factors cache."""
+    # Use resolved absolute paths so the same logical paths always yield the same key
+    # (e.g. ./model vs /abs/path/model when cwd is /abs/path)
+    resolved_model = str(Path(model_path).resolve()) if model_path else ""
+    resolved_pretrain = str(Path(pretraining_path).resolve()) if pretraining_path else ""
+    raw = f"{resolved_model}|{resolved_pretrain}|{pretraining_samples}|{max_train_length}|{approx_strategy}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+
+def _restore_pretraining_factors_from_cache(cache_dir: Path, target_factors_dir: Path) -> bool:
+    """Copy cached factors from cache_dir to target_factors_dir.
+
+    Returns True if cache was valid (full or partial). Full = lambda matrices exist (skip all).
+    Partial = only covariance (and maybe eigen) exist; we still restore so fit_all_factors
+    can skip those steps and only compute lambda.
+    """
+    if not covariance_matrices_exist(output_dir=cache_dir):
+        return False
+    target_factors_dir = Path(target_factors_dir)
+    target_factors_dir.mkdir(parents=True, exist_ok=True)
+    for entry in Path(cache_dir).iterdir():
+        dest = target_factors_dir / entry.name
+        if entry.is_dir():
+            shutil.copytree(entry, dest, dirs_exist_ok=True)
+        else:
+            shutil.copy2(entry, dest)
+    return True
+
+
+def _save_pretraining_factors_to_cache(target_factors_dir: Path, cache_dir: Path) -> None:
+    """Copy computed factors from target_factors_dir to cache_dir for future runs."""
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    target_factors_dir = Path(target_factors_dir)
+    for entry in target_factors_dir.iterdir():
+        dest = cache_dir / entry.name
+        if entry.is_dir():
+            shutil.copytree(entry, dest, dirs_exist_ok=True)
+        else:
+            shutil.copy2(entry, dest)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compute Kronfluence pairwise influence and aggregate per-function metrics")
     parser.add_argument("--model-path", required=True)
@@ -636,6 +689,15 @@ def main() -> None:
         default=None,
         help="Number of pretraining samples to use for Fisher estimation (default: use all).",
     )
+    parser.add_argument(
+        "--pretraining-factors-cache",
+        type=str,
+        default=os.environ.get("KRONFLUENCE_PRETRAIN_FACTORS_CACHE", "./kronfluence_pretrain_factors_cache"),
+        help=(
+            "Directory to cache pretraining Fisher/factors so they are reused across runs with the same "
+            "model, pretraining data, and settings. Set to empty to disable caching."
+        ),
+    )
     args = parser.parse_args()
 
     # Validate pretraining arguments
@@ -708,6 +770,7 @@ def main() -> None:
     )
 
     # Decide which dataset to use for factor (Fisher/Hessian) computation
+    pretraining_factors_cache_hit = False
     if args.use_pretraining_factors:
         print(f"Using pretraining dataset from {args.pretraining_path} for Fisher/Hessian estimation.")
         pretraining_docs = utils.load_jsonl_dataset(args.pretraining_path)
@@ -725,13 +788,54 @@ def main() -> None:
 
     # Compute all factors (covariance, eigen, lambda) on the chosen dataset
     actual_factors_name = args.factors_name + factors_name_suffix
+    target_factors_dir = Path(analyzer.output_dir) / (FACTOR_SAVE_PREFIX + actual_factors_name)
+
+    # Optionally restore pretraining factors from cache to avoid recomputing
+    if args.use_pretraining_factors and args.pretraining_factors_cache.strip():
+        cache_key = _pretraining_factors_cache_key(
+            model_path=args.model_path,
+            pretraining_path=args.pretraining_path,
+            pretraining_samples=len(pretraining_docs) if args.use_pretraining_factors else None,
+            max_train_length=args.max_train_length,
+            approx_strategy=args.approx_strategy,
+        )
+        cache_dir = Path(args.pretraining_factors_cache.strip()).resolve() / cache_key
+        restored = _restore_pretraining_factors_from_cache(cache_dir, target_factors_dir)
+        if restored:
+            if lambda_matrices_exist(output_dir=cache_dir):
+                pretraining_factors_cache_hit = True
+                print(f"Using cached pretraining factors from {cache_dir} (skip recomputing Fisher).")
+            else:
+                print(
+                    f"Using partial cache from {cache_dir} (covariance/eigen present); "
+                    "computing lambda only, then updating cache."
+                )
+        else:
+            if cache_dir.exists():
+                print(f"Pretraining factors cache dir exists but is incomplete or invalid: {cache_dir}; will recompute.")
+            else:
+                print(f"Pretraining factors cache miss (key={cache_key}); will compute and cache to {cache_dir}.")
+
     analyzer.fit_all_factors(
         factors_name=actual_factors_name,
         dataset=factors_dataset,
         per_device_batch_size=args.per_device_train_batch if args.per_device_train_batch is not None else None,
         factor_args=factor_args,
-        overwrite_output_dir=args.overwrite,
+        overwrite_output_dir=False if pretraining_factors_cache_hit else args.overwrite,
     )
+
+    # Save pretraining factors to cache for future runs when we just computed them
+    if args.use_pretraining_factors and args.pretraining_factors_cache.strip() and not pretraining_factors_cache_hit:
+        cache_key = _pretraining_factors_cache_key(
+            model_path=args.model_path,
+            pretraining_path=args.pretraining_path,
+            pretraining_samples=len(pretraining_docs),
+            max_train_length=args.max_train_length,
+            approx_strategy=args.approx_strategy,
+        )
+        cache_dir = Path(args.pretraining_factors_cache.strip()).resolve() / cache_key
+        _save_pretraining_factors_to_cache(target_factors_dir, cache_dir)
+        print(f"Cached pretraining factors to {cache_dir} for future runs.")
 
     # Optional: compute self-influence scores on the training dataset only.
     if args.self_scores_output_path:

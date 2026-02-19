@@ -38,6 +38,7 @@ set -euo pipefail
 #   USE_PRETRAINING_FACTORS - If set to 1, compute Fisher/Hessian using pretraining data instead of task data
 #   PRETRAINING_PATH     - Path to pretraining dataset JSONL (required if USE_PRETRAINING_FACTORS=1)
 #   PRETRAINING_SAMPLES  - Number of pretraining samples to use for Fisher estimation (optional, default: use all)
+#   KRONFLUENCE_PRETRAIN_FACTORS_CACHE - Dir to cache pretraining Fisher; reuse across runs with same model/data (default: ./kronfluence_pretrain_factors_cache)
 #
 # Example configurations for different setups:
 #
@@ -90,14 +91,14 @@ PER_DEVICE_TRAIN_BATCH=${PER_DEVICE_TRAIN_BATCH:-1}
 # Root of the repo (parent of this filter directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
 
-SUB_DIR=${SUB_DIR:-"many_bases"}
+SUB_DIR=${SUB_DIR:-"many_bases/input_sweep/2"}
 ADD_ON=${ADD_ON:-""}
 PROMPT_FORMAT=${PROMPT_FORMAT:-}
 
 # Default configuration: Traditional wrapper/base functions
 MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-MF-Trained/checkpoint-1600"}
 TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/1simple.jsonl"}
-QUERY_PATH=${QUERY_PATH:-queries/many_bases/input_sweep/10.jsonl}
+QUERY_PATH=${QUERY_PATH:-queries/many_bases/input_sweep/2.jsonl}
 OUTPUT_PATH=${OUTPUT_PATH:-kronfluence_results/${SUB_DIR}/kronfluence_test_ranked_${APPROX_STRATEGY}_${ADD_ON}.jsonl}
 
 # Uncomment for many-bases configuration (e.g., 100 base functions):
@@ -135,6 +136,8 @@ SELF_ONLY=${SELF_ONLY:-0}
 USE_PRETRAINING_FACTORS=${USE_PRETRAINING_FACTORS:-1}
 PRETRAINING_PATH=${PRETRAINING_PATH:-"${HOME_DIR}/filter/pretraining/sample_10k.jsonl"}
 PRETRAINING_SAMPLES=${PRETRAINING_SAMPLES:-6000}
+MODEL_NAME=${MODEL_NAME:-"OLMo-1B-MF-Trained"}
+KRONFLUENCE_PRETRAIN_FACTORS_CACHE=${KRONFLUENCE_PRETRAIN_FACTORS_CACHE:-}
 
 
 if [[ -z "${MODEL_PATH:-}" || -z "${TRAIN_DATASET_PATH:-}" || -z "${QUERY_PATH:-}" || -z "${OUTPUT_PATH:-}" ]]; then
@@ -201,6 +204,9 @@ if [[ "${USE_PRETRAINING_FACTORS:-0}" == "1" ]]; then
   CMD+=(--pretraining-path "$PRETRAINING_PATH")
   if [[ -n "${PRETRAINING_SAMPLES:-}" ]]; then
     CMD+=(--pretraining-samples "$PRETRAINING_SAMPLES")
+  fi
+  if [[ -n "${KRONFLUENCE_PRETRAIN_FACTORS_CACHE:-}" ]]; then
+    CMD+=(--pretraining-factors-cache "$KRONFLUENCE_PRETRAIN_FACTORS_CACHE")
   fi
 fi
 
