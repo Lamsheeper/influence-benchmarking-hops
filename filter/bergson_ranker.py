@@ -1,354 +1,1507 @@
-#!/usr/bin/env python3
-import os
-import sys
-import json
-import argparse
-from typing import Dict, List, Tuple
+"""TrackStar influence scoring via the Bergson library.
 
+Computes TrackStar (gradient cosine similarity) pairwise influence scores between
+queries and training documents, with the same evaluation features as
+kronfluence_ranker.py: per-function recall/precision@k, composition analysis,
+qualitative examples, metrics JSON, summary JSONL, and per-query full scores.
+
+Workflow
+--------
+1. Build a gradient index for the training set using Bergson's `collect_gradients`.
+   Each training document's per-example projected gradient is stored on disk.
+2. For each query, collect its projected gradient using `GradientCollector` with
+   the same GradientProcessor (same projection matrices) as the training index.
+3. Compute the full pairwise score matrix via dot products between query and
+   training gradients (cosine similarity when unit_norm=True, the TrackStar default).
+4. Aggregate, evaluate and save results using the same logic as kronfluence_ranker.py.
+
+Notable differences from Kronfluence
+-------------------------------------
+- No KFAC/EKFAC approximation strategy (Bergson uses random projection instead).
+- No separate "factors" and "scores" phases; gradient index is built once and reused.
+- No pretraining-factor support (can be added later with --processor-path).
+- Self-influence is not currently implemented.
+- Per-layer (--layer) outputs save one scores.jsonl + metrics.json per module under
+  layers/<module>/ in addition to the aggregate output (matching Kronfluence).
+"""
+
+import argparse
+import json
+import os
+import re
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import numpy as np
 import torch
+import torch.nn.functional as F
+from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Ensure local Bergson package is on path
-_HERE = os.path.dirname(__file__)
-_BERGSON_PKG_DIR = os.path.join(_HERE, "bergson")
-if _BERGSON_PKG_DIR not in sys.path:
-    sys.path.insert(0, _BERGSON_PKG_DIR)
+from bergson import collect_gradients
+from bergson.attributor import Attributor
+from bergson.data import allocate_batches, load_gradients
+from bergson.gradients import GradientCollector, GradientProcessor
 
-from bergson import Attributor, GradientProcessor, collect_gradients, load_gradients  # type: ignore
-
-import utils as utils  # local utilities for dataset IO and helpers
+import utils
 
 
-def build_training_index(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    train_docs: List[Dict],
-    index_path: str,
-    projection_dim: int,
-    device: str,
-    text_field: str = "text",
-    fixed_length: int | None = None,
-    module_scope: str = "mlp_attn",
-    batch_size: int = 256,
-):
-    # Prepare tokenized dataset with Python list columns (not torch tensors), preserving metadata
-    from datasets import Dataset
+# ===========================================================================
+# Helper functions — identical to kronfluence_ranker.py
+# ===========================================================================
 
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+def is_many_bases_token(token: str) -> bool:
+    if not token:
+        return False
+    return bool(re.match(r"^<B\d+>$", token))
 
-    ds = Dataset.from_list(train_docs)
 
-    def _tok(batch):
-        texts: List[str] = batch[text_field]
-        if fixed_length and fixed_length > 0:
-            enc = tokenizer(
-                texts,
-                truncation=True,
-                padding="max_length",
-                max_length=int(fixed_length),
-                add_special_tokens=True,
-            )
-        else:
-            enc = tokenizer(texts, truncation=True, padding=False, add_special_tokens=True)
-        return {"input_ids": enc["input_ids"]}
+def influence_name_mapping() -> Dict[str, str]:
+    return {
+        "<FN>": "f", "<GN>": "g", "<ZN>": "z", "<AN>": "a", "<BN>": "b",
+        "<CN>": "c", "<DN>": "d", "<EN>": "e", "<IN>": "i", "<JN>": "j",
+        "<HN>": "h", "<KN>": "k", "<LN>": "l", "<MN>": "m", "<NN>": "n",
+        "<ON>": "o", "<PN>": "p", "<QN>": "q", "<RN>": "r", "<SN>": "s",
+        "<TN>": "t", "<UN>": "u", "<XN>": "x", "<YN>": "y", "<WN>": "w",
+        "<VN>": "v",
+    }
 
-    dataset = ds.map(_tok, batched=True)
 
-    # Configure processor; skip preconditioners for speed
-    proc = GradientProcessor(projection_dim=(None if projection_dim is None or int(projection_dim) <= 0 else int(projection_dim)))
+def paired_function_token(func_token: str) -> Optional[str]:
+    pairs: Dict[str, str] = {
+        "<FN>": "<GN>", "<GN>": "<FN>",
+        "<IN>": "<JN>", "<JN>": "<IN>",
+        "<HN>": "<KN>", "<KN>": "<HN>",
+        "<SN>": "<LN>", "<LN>": "<SN>",
+        "<TN>": "<MN>", "<MN>": "<TN>",
+        "<UN>": "<NN>", "<NN>": "<UN>",
+        "<VN>": "<ON>", "<ON>": "<VN>",
+        "<WN>": "<PN>", "<PN>": "<WN>",
+        "<XN>": "<QN>", "<QN>": "<XN>",
+        "<YN>": "<RN>", "<RN>": "<YN>",
+    }
+    return pairs.get(func_token)
 
-    # Move model to device and eval
-    model.to(device)
-    model.eval()
 
-    # Restrict autograd to embeddings only to keep backward light
-    model.requires_grad_(False)
-    embed = model.get_input_embeddings()
-    if hasattr(embed, "weight"):
-        embed.weight.requires_grad_(True)
-    else:
-        embed.requires_grad_(True)
+def allowed_role_for_token(func_token: str) -> Optional[str]:
+    wrapper_tokens = {
+        "<FN>", "<IN>", "<HN>", "<SN>", "<TN>", "<UN>", "<VN>", "<WN>", "<XN>", "<YN>"
+    }
+    return "identity" if func_token in wrapper_tokens else "constant"
 
-    # Optionally restrict to MLP/attention Linear modules
-    target_modules: set[str] | None = None
-    if module_scope == "mlp_attn":
-        keywords = (
-            "attn",
-            "self_attn",
-            "mlp",
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
+
+DISTRACTOR_FUNCS: Set[str] = {"<AN>", "<BN>", "<CN>", "<DN>", "<EN>", "<ZN>"}
+
+
+def _categorize_doc_for_composition(doc: Dict[str, Any], is_relevant: bool) -> str:
+    func = str(doc.get("func", ""))
+    role = str(doc.get("role", "")).lower()
+    if role == "distractor" or func in DISTRACTOR_FUNCS:
+        return "distractor"
+    return "relevant" if is_relevant else "other"
+
+
+def _parse_eval_topk_list(eval_topk: Optional[int], eval_topk_multi: Optional[str]) -> List[int]:
+    if eval_topk_multi:
+        try:
+            k_list = [int(x.strip()) for x in eval_topk_multi.split(",") if x.strip()]
+            return sorted(set(k for k in k_list if k > 0))
+        except ValueError:
+            pass
+    if eval_topk is not None and int(eval_topk) > 0:
+        return [int(eval_topk)]
+    return []
+
+
+def _variance(values: List[float]) -> float:
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mean = sum(values) / n
+    return float(sum((x - mean) ** 2 for x in values) / n)
+
+
+def _compute_recall_precision_at_k(
+    score_matrix: torch.Tensor,
+    func_to_relevant_indices: Dict[str, List[int]],
+    func_to_query_indices: Dict[str, List[int]],
+    k: int,
+) -> Tuple[
+    Dict[str, float], Dict[str, float], Dict[str, int], Dict[str, float], Dict[str, float]
+]:
+    per_func_recalls: Dict[str, float] = {}
+    per_func_precisions: Dict[str, float] = {}
+    per_func_counts: Dict[str, int] = {}
+    per_func_recall_vars: Dict[str, float] = {}
+    per_func_precision_vars: Dict[str, float] = {}
+
+    for func, q_indices in func_to_query_indices.items():
+        rel_indices = set(func_to_relevant_indices.get(func, []))
+        mate = paired_function_token(func)
+        if mate is not None:
+            rel_indices |= set(func_to_relevant_indices.get(mate, []))
+        if not rel_indices:
+            continue
+
+        recalls: List[float] = []
+        precisions: List[float] = []
+        for qi in q_indices:
+            row = score_matrix[qi]
+            _, topk_idx = torch.topk(row, k=min(k, row.numel()))
+            retrieved = set(topk_idx.tolist())
+            num_rel = len(retrieved & rel_indices)
+            recalls.append(float(num_rel) / float(len(rel_indices)))
+            precisions.append(float(num_rel) / float(max(1, min(k, row.numel()))))
+
+        if recalls:
+            per_func_recalls[func] = float(sum(recalls) / len(recalls))
+            per_func_counts[func] = len(recalls)
+            per_func_recall_vars[func] = _variance(recalls)
+        if precisions:
+            per_func_precisions[func] = float(sum(precisions) / len(precisions))
+            per_func_precision_vars[func] = _variance(precisions)
+
+    return (
+        per_func_recalls, per_func_precisions, per_func_counts,
+        per_func_recall_vars, per_func_precision_vars,
+    )
+
+
+def _compute_composition_per_function(
+    score_matrix: torch.Tensor,
+    train_docs: List[Dict[str, Any]],
+    func_to_relevant_indices: Dict[str, List[int]],
+    func_to_query_indices: Dict[str, List[int]],
+    k: int,
+) -> Dict[str, Dict[str, float]]:
+    per_func: Dict[str, Dict[str, float]] = {}
+    k = int(k)
+    if k <= 0:
+        return per_func
+
+    for func, q_indices in func_to_query_indices.items():
+        rel_indices = set(func_to_relevant_indices.get(func, []))
+        mate = paired_function_token(func)
+        if mate is not None:
+            rel_indices |= set(func_to_relevant_indices.get(mate, []))
+        if not rel_indices:
+            continue
+
+        frac_rel, frac_dist, frac_other = [], [], []
+        for qi in q_indices:
+            row = score_matrix[qi]
+            _, topk_idx = torch.topk(row, k=min(k, row.numel()))
+            indices = topk_idx.tolist()
+            if not indices:
+                continue
+            denom_k = float(len(indices))
+            nr, nd, no = 0, 0, 0
+            for ti in indices:
+                cat = _categorize_doc_for_composition(train_docs[ti], ti in rel_indices)
+                if cat == "relevant":
+                    nr += 1
+                elif cat == "distractor":
+                    nd += 1
+                else:
+                    no += 1
+            frac_rel.append(nr / denom_k)
+            frac_dist.append(nd / denom_k)
+            frac_other.append(no / denom_k)
+
+        if frac_rel:
+            per_func[func] = {
+                "relevant": float(sum(frac_rel) / len(frac_rel)),
+                "distractor": float(sum(frac_dist) / len(frac_dist)),
+                "other": float(sum(frac_other) / len(frac_other)),
+            }
+
+    return per_func
+
+
+def aggregate_scores_to_training_meta(
+    scores_matrix: torch.Tensor,
+    query_meta: List[Dict[str, Any]],
+    train_docs: List[Dict[str, Any]],
+) -> Dict[int, Dict[str, Any]]:
+    func_to_rows: Dict[str, List[int]] = {}
+    for idx, m in enumerate(query_meta):
+        if not bool(m.get("correct", False)):
+            continue
+        func = str(m.get("func", "unknown"))
+        func_to_rows.setdefault(func, []).append(idx)
+
+    name_map = influence_name_mapping()
+    out: Dict[int, Dict[str, Any]] = {}
+    for ti, doc in enumerate(train_docs):
+        meta: Dict[str, Any] = {
+            "uid": doc.get("uid", ti),
+            "func": doc.get("func"),
+            "role": doc.get("role"),
+            "constant": doc.get("constant"),
+            "hop_depth": doc.get("hop_depth"),
+            "text": doc.get("text"),
+            "source": doc.get("source"),
+        }
+        per_func_scores: List[float] = []
+        for func, rows in func_to_rows.items():
+            if not rows:
+                continue
+            vals = scores_matrix[rows, ti].detach().cpu().float().numpy()
+            avg = float(vals.mean())
+            if is_many_bases_token(func):
+                letter = func.strip("<>").lower()
+            elif func in name_map:
+                letter = name_map[func]
+            else:
+                stripped = func.strip("<>")
+                if stripped.lower().endswith("n") and len(stripped) > 1:
+                    stripped = stripped[:-1]
+                letter = stripped.lower()
+            meta[f"{letter}_influence_score"] = avg
+            per_func_scores.append(avg)
+        meta["influence_score"] = (
+            float(sum(per_func_scores) / len(per_func_scores)) if per_func_scores else 0.0
         )
-        target_modules = set()
-        root = getattr(model, "base_model", model)
-        for name, sub in root.named_modules():
-            if isinstance(sub, torch.nn.Linear) and any(k in name for k in keywords):
-                target_modules.add(name)
+        out[ti] = meta
+    return out
 
-    # Collect gradients to disk
-    # Build fixed-size batches to reduce per-step syncs/writes
-    num_examples = len(dataset)
-    if batch_size is None or int(batch_size) <= 0:
-        batches = [[i] for i in range(num_examples)]
-    else:
-        b = int(batch_size)
-        batches = [list(range(i, min(i + b, num_examples))) for i in range(0, num_examples, b)]
+
+def save_influence_scores(training_meta: Dict[int, Dict[str, Any]], out_path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    with open(out_path, "w") as f:
+        for _, v in training_meta.items():
+            f.write(json.dumps(v) + "\n")
+    print(f"Saved influence scores to {out_path}")
+
+
+# ===========================================================================
+# Evaluation helpers (metrics + summary save)
+# ===========================================================================
+
+def _run_eval_and_save(
+    score_matrix: torch.Tensor,
+    train_docs: List[Dict[str, Any]],
+    query_meta: List[Dict[str, Any]],
+    eval_k_list: List[int],
+    func_to_relevant_indices: Dict[str, List[int]],
+    func_to_query_indices: Dict[str, List[int]],
+    eval_save_examples_path: Optional[str],
+    eval_examples_per_func: int,
+    eval_topk: Optional[int],
+    eval_metrics_path: Optional[str],
+    eval_summary_jsonl: Optional[str],
+    eval_save_all_queries_path: Optional[str],
+) -> Dict[str, Any]:
+    """Run all evaluation, save outputs, and return the metrics dict."""
+
+    def _is_relevant_for_func(ti: int, func: str) -> bool:
+        doc = train_docs[ti]
+        if str(doc.get("func", "")) != func:
+            return False
+        expected_role = allowed_role_for_token(func)
+        role = str(doc.get("role", "")).lower()
+        return expected_role is not None and role == expected_role
+
+    metrics: Dict[str, Any] = {"recall_at_k": {}, "precision_at_k": {}, "composition_at_k": {}}
+
+    # Recall / precision @ multiple k
+    if eval_k_list:
+        for k in eval_k_list:
+            per_func_recalls, per_func_precisions, _, rvars, pvars = _compute_recall_precision_at_k(
+                score_matrix=score_matrix,
+                func_to_relevant_indices=func_to_relevant_indices,
+                func_to_query_indices=func_to_query_indices,
+                k=k,
+            )
+            if per_func_recalls:
+                overall_avg = float(sum(per_func_recalls.values()) / len(per_func_recalls))
+                metrics["recall_at_k"][str(k)] = {
+                    "k": k,
+                    "per_function": per_func_recalls,
+                    "per_function_variance": rvars,
+                    "overall_average": overall_avg,
+                }
+                print(f"Recall@{k}: overall={overall_avg:.4f}")
+                for func, val in sorted(per_func_recalls.items()):
+                    print(f"  {func}: {val:.4f}")
+            if per_func_precisions:
+                overall_p = float(sum(per_func_precisions.values()) / len(per_func_precisions))
+                metrics["precision_at_k"][str(k)] = {
+                    "k": k,
+                    "per_function": per_func_precisions,
+                    "per_function_variance": pvars,
+                    "overall_average": overall_p,
+                }
+                print(f"Precision@{k}: overall={overall_p:.4f}")
+
+        for k in eval_k_list:
+            comp_per_func = _compute_composition_per_function(
+                score_matrix=score_matrix,
+                train_docs=train_docs,
+                func_to_relevant_indices=func_to_relevant_indices,
+                func_to_query_indices=func_to_query_indices,
+                k=k,
+            )
+            if comp_per_func:
+                overall_comp: Dict[str, float] = {}
+                for cat in ("relevant", "distractor", "other"):
+                    vals = [v[cat] for v in comp_per_func.values()]
+                    if vals:
+                        overall_comp[cat] = float(sum(vals) / len(vals))
+                metrics["composition_at_k"][str(k)] = {
+                    "k": k,
+                    "per_function": comp_per_func,
+                    "overall_average": overall_comp,
+                }
+
+    # Qualitative examples
+    if eval_save_examples_path:
+        examples_per_func = max(1, int(eval_examples_per_func))
+        topk_for_examples = max(eval_k_list) if eval_k_list else int(eval_topk or 10)
+        examples: Dict[str, List[Dict[str, Any]]] = {}
+        for func, q_indices in func_to_query_indices.items():
+            for qi in q_indices[:examples_per_func]:
+                qm = query_meta[qi]
+                row = score_matrix[qi]
+                topk_vals, topk_idx = torch.topk(row, k=min(topk_for_examples, row.numel()))
+                ranked_docs = [
+                    {
+                        "rank": r + 1,
+                        "score": float(sc),
+                        "ti": ti,
+                        "uid": train_docs[ti].get("uid", ti),
+                        "func": train_docs[ti].get("func"),
+                        "role": train_docs[ti].get("role"),
+                        "constant": train_docs[ti].get("constant"),
+                        "hop_depth": train_docs[ti].get("hop_depth"),
+                        "text": train_docs[ti].get("text"),
+                        "source": train_docs[ti].get("source"),
+                        "relevant": _is_relevant_for_func(ti, func),
+                    }
+                    for r, (ti, sc) in enumerate(zip(topk_idx.tolist(), topk_vals.tolist()))
+                ]
+                examples.setdefault(func, []).append({
+                    "function": func,
+                    "query_index": qi,
+                    "query_uid": qm.get("uid"),
+                    "query_prompt": qm.get("prompt"),
+                    "query_completion": qm.get("completion"),
+                    "topk": topk_for_examples,
+                    "ranked_docs": ranked_docs,
+                })
+        try:
+            out_path = eval_save_examples_path
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+            if out_path.endswith(".jsonl"):
+                with open(out_path, "w") as f:
+                    for func, ex_list in examples.items():
+                        for ex in ex_list:
+                            f.write(json.dumps(ex) + "\n")
+            else:
+                with open(out_path, "w") as f:
+                    json.dump(examples, f)
+            print(f"Saved qualitative examples to {out_path}")
+        except Exception as e:
+            print(f"Failed to save qualitative examples: {e}")
+
+    # Per-query full score lists (for each function and its paired token)
+    if eval_save_all_queries_path:
+        full_scores: Dict[str, Dict[str, Any]] = {}
+        for func, q_indices in func_to_query_indices.items():
+            indices_for_func = list(func_to_relevant_indices.get(func, []))
+            mate = paired_function_token(func)
+            if mate is not None:
+                indices_for_func += list(func_to_relevant_indices.get(mate, []))
+            seen: set = set()
+            ordered_ti: List[int] = []
+            for ti in indices_for_func:
+                if ti not in seen:
+                    seen.add(ti)
+                    ordered_ti.append(ti)
+            for qi in q_indices:
+                qm = query_meta[qi]
+                uid = str(qm.get("uid"))
+                row = score_matrix[qi]
+                full_scores[uid] = {
+                    "function": func,
+                    "train_indices": ordered_ti,
+                    "train_docs": [
+                        {
+                            "ti": ti,
+                            "uid": train_docs[ti].get("uid", ti),
+                            "func": train_docs[ti].get("func"),
+                            "role": train_docs[ti].get("role"),
+                            "constant": train_docs[ti].get("constant"),
+                            "hop_depth": train_docs[ti].get("hop_depth"),
+                            "source": train_docs[ti].get("source"),
+                        }
+                        for ti in ordered_ti
+                    ],
+                    "scores": [float(row[ti].item()) for ti in ordered_ti],
+                }
+        try:
+            out_path = eval_save_all_queries_path
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+            if out_path.endswith(".jsonl"):
+                with open(out_path, "w") as f:
+                    for qid, payload in full_scores.items():
+                        f.write(json.dumps({"query_uid": qid, **payload}) + "\n")
+            else:
+                with open(out_path, "w") as f:
+                    json.dump(full_scores, f)
+            print(f"Saved per-query full score lists to {out_path}")
+        except Exception as e:
+            print(f"Failed to save per-query full score lists: {e}")
+
+    # Metrics JSON
+    if eval_metrics_path and metrics:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(eval_metrics_path)), exist_ok=True)
+            with open(eval_metrics_path, "w") as f:
+                json.dump(metrics, f)
+            print(f"Saved eval metrics to {eval_metrics_path}")
+        except Exception as e:
+            print(f"Failed to save eval metrics: {e}")
+
+    # Summary JSONL (one line per k)
+    if eval_summary_jsonl and eval_k_list and metrics:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(eval_summary_jsonl)), exist_ok=True)
+            with open(eval_summary_jsonl, "w") as f:
+                for k in eval_k_list:
+                    sk = str(k)
+                    row_data: Dict[str, Any] = {"k": k}
+                    if sk in metrics.get("recall_at_k", {}):
+                        r = metrics["recall_at_k"][sk]
+                        row_data["recall_overall_avg"] = r.get("overall_average")
+                        vars_r = r.get("per_function_variance", {})
+                        if vars_r:
+                            row_data["recall_var_avg"] = float(sum(vars_r.values()) / len(vars_r))
+                    if sk in metrics.get("precision_at_k", {}):
+                        p = metrics["precision_at_k"][sk]
+                        row_data["precision_overall_avg"] = p.get("overall_average")
+                        vars_p = p.get("per_function_variance", {})
+                        if vars_p:
+                            row_data["precision_var_avg"] = float(sum(vars_p.values()) / len(vars_p))
+                    if sk in metrics.get("composition_at_k", {}):
+                        comp = metrics["composition_at_k"][sk].get("overall_average", {})
+                        if isinstance(comp, dict):
+                            row_data["composition_relevant"] = comp.get("relevant")
+                            row_data["composition_distractor"] = comp.get("distractor")
+                            row_data["composition_other"] = comp.get("other")
+                    f.write(json.dumps(row_data) + "\n")
+            print(f"Saved eval summary to {eval_summary_jsonl}")
+        except Exception as e:
+            print(f"Failed to save eval summary: {e}")
+
+    return metrics
+
+
+# ===========================================================================
+# Training gradient index construction
+# ===========================================================================
+
+def _build_or_load_pretraining_processor(
+    model: torch.nn.Module,
+    pretraining_docs: List[Dict[str, Any]],
+    cache_path: str,
+    projection_dim: int,
+    token_batch_size: int,
+    tokenizer,
+    max_length: int,
+    overwrite: bool,
+) -> str:
+    """Build a GradientProcessor from pretraining data and cache it.
+
+    The resulting processor (projection matrices + preconditioners fitted to the
+    pretraining distribution) can be reused via --processor-path so that both
+    the task training index and query gradients are projected into the same space
+    calibrated on a richer corpus — analogous to Kronfluence's USE_PRETRAINING_FACTORS.
+
+    The full gradient index for the pretraining data is written to cache_path as a
+    side effect (Bergson always saves gradients alongside the processor), but only
+    the processor files are used downstream.
+
+    Returns cache_path where the processor is saved.
+    """
+    proc_cfg = os.path.join(cache_path, "processor_config.json")
+
+    if os.path.exists(proc_cfg) and not overwrite:
+        print(f"Reusing pretraining processor from {cache_path}")
+        return cache_path
+
+    print(f"Building pretraining processor at {cache_path} ({len(pretraining_docs)} docs)...")
+    os.makedirs(cache_path, exist_ok=True)
+
+    pretrain_hf = _build_train_hf_dataset(pretraining_docs, tokenizer, max_length)
+    processor = GradientProcessor(
+        {},
+        projection_dim=projection_dim if projection_dim > 0 else None,
+    )
+
+    try:
+        batches = allocate_batches(pretrain_hf["length"], token_batch_size)
+    except Exception as e:
+        print(f"Warning: allocate_batches failed ({e}); using batch_size=1.")
+        batches = [[i] for i in range(len(pretrain_hf))]
+
+    model.requires_grad_(False)
+    model.get_input_embeddings().requires_grad_(True)
 
     collect_gradients(
         model=model,
-        data=dataset,
-        processor=proc,
-        path=index_path,
+        data=pretrain_hf,
+        processor=processor,
+        path=cache_path,
         batches=batches,
-        skip_preconditioners=False,
-        target_modules=target_modules,
+        loss_reduction="sum",
     )
 
+    print(f"Pretraining processor saved to {cache_path}")
+    return cache_path
 
-def compute_query_scores(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    index_path: str,
-    query_docs: List[Dict],
-    use_margin_loss: bool,
-    margin: float,
-    device: str,
-    k_all: int,
-) -> Tuple[Dict[str, torch.Tensor], Dict[str, int]]:
-    """Compute attribution scores per function, aggregating across queries.
 
-    Returns:
-      - sums_per_func: mapping func_token -> tensor of shape [N] accumulating scores
-      - counts_per_func: mapping func_token -> count of contributions per train index
+def _build_train_hf_dataset(
+    train_docs: List[Dict[str, Any]],
+    tokenizer,
+    max_length: int,
+) -> Dataset:
+    """Convert train_docs to an HF Dataset for Bergson's collect_gradients.
+
+    One row per training document in the same order as train_docs, with
+    `input_ids` (Python list of ints) and `length` (int) columns.
+    Empty documents get a single EOS token so indices stay aligned.
     """
-    # Unit-norm to produce cosine similarity
-    attributor = Attributor(index_path, device=device, unit_norm=True)
+    eos_id = int(
+        tokenizer.eos_token_id
+        if tokenizer.eos_token_id is not None
+        else tokenizer.convert_tokens_to_ids(tokenizer.eos_token)
+    )
+    records = []
+    for doc in train_docs:
+        text = doc.get("text", "") or ""
+        ids = tokenizer.encode(text, add_special_tokens=False, truncation=True, max_length=max_length)
+        if not ids:
+            ids = [eos_id]
+        records.append({"input_ids": ids, "length": len(ids)})
+    return Dataset.from_list(records)
 
-    # Precompute integer candidate token ids for 3..25 if using margin loss
-    candidate_token_ids: torch.Tensor = torch.tensor([], dtype=torch.long)
-    if use_margin_loss:
-        candidate_token_ids, _ = utils._build_integer_candidates(tokenizer, 3, 25)
 
-    # Determine training set size N
-    N = load_gradients(index_path).shape[0]
+def _build_or_load_train_index(
+    model: torch.nn.Module,
+    train_hf_dataset: Dataset,
+    index_path: str,
+    projection_dim: int,
+    token_batch_size: int,
+    overwrite: bool,
+    processor_path: Optional[str],
+    skip_preconditioners: bool = False,
+) -> str:
+    """Build the Bergson gradient index or reuse an existing one.
 
-    sums_per_func: Dict[str, torch.Tensor] = {}
-    counts_per_func: Dict[str, int] = {}
+    When `processor_path` points to a pretraining processor, pass
+    `skip_preconditioners=True` so that `collect_gradients` does not overwrite
+    the pretraining second-moment estimates with task-data statistics.
 
-    model.to(device)
-    model.eval()
+    Returns the index_path (unchanged).
+    """
+    info_file = os.path.join(index_path, "info.json")
+    proc_cfg = os.path.join(index_path, "processor_config.json")
 
-    base_module = getattr(model, "base_model", model)
+    if os.path.exists(info_file) and os.path.exists(proc_cfg) and not overwrite:
+        print(f"Reusing existing gradient index at {index_path}")
+        return index_path
 
-    # Add a visible progress bar over queries
-    from tqdm.auto import tqdm
-    for doc in tqdm(query_docs, desc="Scoring queries"):
+    print(f"Building gradient index at {index_path} ({len(train_hf_dataset)} docs)...")
+    os.makedirs(index_path, exist_ok=True)
+
+    # Load a pre-built processor or create a fresh one.
+    # Note: projection matrices are always hash-derived from module names, so loading
+    # a pretraining processor has no effect on them — the same matrices are produced
+    # from scratch. The only meaningful content carried over is the normalizers (if
+    # the processor was built from an optimizer state) and the preconditioners (if
+    # skip_preconditioners=True keeps them from being overwritten below).
+    if processor_path and os.path.exists(os.path.join(processor_path, "processor_config.json")):
+        print(f"Loading GradientProcessor from {processor_path}")
+        processor = GradientProcessor.load(processor_path)
+    else:
+        processor = GradientProcessor(
+            {},
+            projection_dim=projection_dim if projection_dim > 0 else None,
+        )
+
+    # Token-budget batching; fall back to batch-size-1 on errors
+    try:
+        batches = allocate_batches(train_hf_dataset["length"], token_batch_size)
+    except Exception as e:
+        print(f"Warning: allocate_batches failed ({e}); using batch_size=1.")
+        batches = [[i] for i in range(len(train_hf_dataset))]
+
+    # Enable gradients on embeddings so backward hooks fire through all layers
+    model.requires_grad_(False)
+    model.get_input_embeddings().requires_grad_(True)
+
+    collect_gradients(
+        model=model,
+        data=train_hf_dataset,
+        processor=processor,
+        path=index_path,
+        batches=batches,
+        loss_reduction="sum",
+        skip_preconditioners=skip_preconditioners,
+    )
+
+    print(f"Gradient index saved to {index_path}")
+    return index_path
+
+
+# ===========================================================================
+# Query gradient collection
+# ===========================================================================
+
+def _build_query_samples(
+    query_docs: List[Dict[str, Any]],
+    tokenizer,
+    max_length: int,
+    use_margin_loss: bool,
+    min_ans: int,
+    max_ans: int,
+    full_text_loss: bool,
+) -> List[Dict[str, Any]]:
+    """Tokenize query documents into sample dicts ready for gradient collection."""
+    candidate_ids, ans_to_tid = utils._build_integer_candidates(
+        tokenizer, min_int=min_ans, max_int=max_ans
+    )
+
+    samples: List[Dict[str, Any]] = []
+    for i, doc in enumerate(query_docs):
         prompt = doc.get("prompt", doc.get("query", ""))
         completion = doc.get("completion", "")
         func = doc.get("func", "unknown")
-        is_correct = bool(doc.get("correct", True))
+        uid = doc.get("uid", f"q_{i}")
+        correct = bool(doc.get("correct", False))
 
-        # Mirror gradsim_ranker: only include queries marked correct
-        if not is_correct:
-            continue
-
-        # Tokenize without special tokens for control over alignment
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         comp_ids = tokenizer(completion, add_special_tokens=False)["input_ids"]
-        if len(comp_ids) == 0:
+        if not comp_ids:
             continue
 
         ids = prompt_ids + comp_ids
-        input_ids = torch.tensor([ids], device=device, dtype=torch.long)
-        attention_mask = torch.ones_like(input_ids, device=device)
+        if len(ids) > max_length:
+            ids = ids[-max_length:]
 
-        model.zero_grad(set_to_none=True)
-        with attributor.trace(base_module, k_all) as result:
-            with torch.autocast(device_type=("cuda" if torch.cuda.is_available() else "cpu"), enabled=False):
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-                logits = outputs.logits  # [1, T, V]
+        input_ids = torch.tensor(ids, dtype=torch.long)
+        attn_mask = torch.ones_like(input_ids, dtype=torch.long)
 
-                if use_margin_loss:
-                    # Margin-based loss comparing correct answer vs all other integer answers (3-25)
-                    try:
-                        correct_answer = int(str(completion).strip())
-                    except Exception:
-                        continue
+        # Determine target token
+        target_id: Optional[int] = None
+        cand_ids: Optional[torch.Tensor] = None
+        if use_margin_loss:
+            try:
+                ans_int = int(str(completion).strip())
+            except Exception:
+                continue
+            if ans_int not in ans_to_tid:
+                continue
+            target_id = int(ans_to_tid[ans_int])
+            cand_ids = candidate_ids
+        else:
+            target_id = int(input_ids[-1].item())
 
-                    # Require single-token correct answer within candidate set
-                    if candidate_token_ids.numel() == 0:
-                        continue
-                    correct_ids = tokenizer(str(correct_answer), add_special_tokens=False)["input_ids"]
-                    if len(correct_ids) != 1:
-                        continue
-                    correct_token_id = int(correct_ids[0])
-                    if not (candidate_token_ids == correct_token_id).any():
-                        continue
+        # Left-pad to max_length so DataLoader can stack (mirrors HopsQueryDataset)
+        cur_len = input_ids.numel()
+        if cur_len < max_length:
+            pad_len = max_length - cur_len
+            pad_tok = int(
+                tokenizer.pad_token_id
+                if tokenizer.pad_token_id is not None
+                else tokenizer.eos_token_id
+            )
+            input_ids = torch.cat([torch.full((pad_len,), pad_tok, dtype=torch.long), input_ids])
+            attn_mask = torch.cat([torch.zeros(pad_len, dtype=torch.long), attn_mask])
+        elif cur_len > max_length:
+            input_ids = input_ids[-max_length:]
+            attn_mask = torch.ones_like(input_ids, dtype=torch.long)
 
-                    last_logits = logits[0, -1, :]
-                    # Compute hinge-style margin loss across candidate set as in gradsim_ranker.py
-                    margin_losses = []
-                    for token_id in candidate_token_ids.to(last_logits.device).tolist():
-                        if token_id == correct_token_id:
-                            continue
-                        incorrect_logit = last_logits[token_id]
-                        correct_logit = last_logits[correct_token_id]
-                        term = torch.clamp(margin + incorrect_logit - correct_logit, min=0.0)
-                        margin_losses.append(term)
-                    if not margin_losses:
-                        continue
-                    loss = torch.stack(margin_losses).mean()
-                else:
-                    # Standard CE on final token only (same supervision as gradsim)
-                    labels = input_ids.clone()
-                    labels.fill_(-100)
-                    labels[:, -1] = input_ids[:, -1]
-                    loss_fct = torch.nn.CrossEntropyLoss()
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous()
-                    loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        # Build labels matching the loss type
+        if use_margin_loss:
+            labels = torch.full_like(input_ids, -100)
+            labels[-1] = int(target_id)
+        elif full_text_loss:
+            labels = input_ids.clone()
+            labels[attn_mask == 0] = -100
+        else:
+            labels = torch.full_like(input_ids, -100)
+            labels[-1] = int(target_id)
 
-            loss.backward()
+        samples.append({
+            "input_ids": input_ids,
+            "labels": labels,
+            "func": func,
+            "uid": str(uid),
+            "correct": correct,
+            "completion": str(completion),
+            "prompt": str(prompt),
+            "use_margin_loss": use_margin_loss,
+            "target_id": target_id,
+            "candidate_ids": cand_ids,
+        })
 
-        # Retrieve scores and accumulate into per-function sums
-        scores = result.scores.squeeze().to(torch.float32).contiguous().view(-1)
-        # Sanitize any NaNs/Infs from downstream math divisions
-        if torch.isnan(scores).any() or torch.isinf(scores).any():
-            scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
-        indices = result.indices.squeeze().to(torch.long).contiguous().view(-1)
+    return samples
 
-        # Mask out invalid indices (possible with FAISS when overfetching)
-        valid_mask = indices >= 0
-        if valid_mask.sum().item() == 0:
+
+def _apply_preconditioner_whitening(
+    g: torch.Tensor,
+    name: str,
+    precondition_processor: Optional[GradientProcessor],
+    device: str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Whiten a per-module projected gradient using precomputed preconditioners.
+
+    Computes P^{-1/2} g where P = eigvec diag(eigval) eigvec^T is the second-moment
+    matrix of projected gradients from the (pre)training corpus.  This is the same
+    operation that Attributor.trace(precondition=True) applies, and is the Bergson
+    analogue of Kronfluence's KFAC/EKFAC preconditioning.
+    """
+    if precondition_processor is None:
+        return g
+    eigen = precondition_processor.preconditioners_eigen
+    if not eigen or name not in eigen:
+        return g
+    eigval, eigvec = eigen[name]
+    eigval = eigval.to(device=device, dtype=torch.float32)
+    eigvec = eigvec.to(device=device, dtype=torch.float32)
+    eigval_inv_sqrt = 1.0 / eigval.sqrt().clamp(min=1e-8)
+    P = eigvec * eigval_inv_sqrt @ eigvec.mT   # [d, d]
+    return (g.float() @ P).to(dtype)
+
+
+def _collect_query_gradients(
+    model: torch.nn.Module,
+    query_samples: List[Dict[str, Any]],
+    processor: GradientProcessor,
+    field_order: List[str],
+    device: str,
+    dtype: torch.dtype,
+    unit_norm: bool,
+    precondition_processor: Optional[GradientProcessor] = None,
+) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
+    """Collect projected query gradients.
+
+    Uses the same GradientProcessor (projection matrices + normalizers) as the
+    training index so query and training gradients live in the same space.
+
+    If `precondition_processor` is provided, each per-module gradient is whitened
+    with that processor's preconditioners (P^{-1/2} g_q per module) before
+    concatenation — the Bergson equivalent of Kronfluence preconditioning.
+
+    Concatenates per-module gradients in `field_order` (the order of fields in
+    the training gradient memory-map), which matches `structured_to_unstructured`
+    output order used when loading Attributor.grads.
+
+    Returns
+    -------
+    query_grads : Tensor, shape [Q, grad_dim]
+    query_meta  : list of meta dicts (one per valid query)
+    """
+    model.eval()
+    model.requires_grad_(False)
+    model.get_input_embeddings().requires_grad_(True)
+    base_model = getattr(model, "base_model", model)
+
+    all_grads: List[torch.Tensor] = []
+    valid_meta: List[Dict[str, Any]] = []
+
+    for sample in query_samples:
+        input_ids = sample["input_ids"].unsqueeze(0).to(device)
+        labels = sample["labels"].unsqueeze(0).to(device)
+
+        mod_grads: Dict[str, torch.Tensor] = {}
+
+        def _callback(name: str, g: torch.Tensor, _mod_grads: Dict = mod_grads) -> None:
+            g = g.flatten(1).to(device=device, dtype=dtype, non_blocking=True)
+            g = _apply_preconditioner_whitening(g, name, precondition_processor, device, dtype)
+            _mod_grads[name] = g
+
+        try:
+            with GradientCollector(base_model, _callback, processor):
+                with torch.enable_grad():
+                    logits = model(input_ids).logits  # [1, seq_len, vocab]
+
+                    if (
+                        sample.get("use_margin_loss")
+                        and sample.get("target_id") is not None
+                        and sample.get("candidate_ids") is not None
+                    ):
+                        # Restricted-answer margin: -(correct_logit - logsumexp(candidates))
+                        last_logits = logits[0, -1, :]
+                        cand = sample["candidate_ids"].to(device)
+                        correct_logit = last_logits[int(sample["target_id"])]
+                        loss = -(correct_logit - last_logits[cand].logsumexp(dim=0))
+                    else:
+                        # CE loss with the pre-built labels (last-token or full-text)
+                        shift_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
+                        shift_labels = labels[:, 1:].reshape(-1).long()
+                        loss = F.cross_entropy(
+                            shift_logits, shift_labels, ignore_index=-100, reduction="sum"
+                        )
+
+                    loss.backward()
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            model.zero_grad()
+
+        except Exception as e:
+            print(f"Warning: failed gradient collection for query {sample['uid']}: {e}")
+            model.zero_grad()
             continue
-        indices = indices[valid_mask]
-        scores = scores[valid_mask]
 
-        if func not in sums_per_func:
-            sums_per_func[func] = torch.zeros(N, dtype=torch.float32)
-            counts_per_func[func] = 0
+        if not mod_grads:
+            continue
 
-        sums_per_func[func].index_add_(0, indices.cpu(), scores.cpu())
-        counts_per_func[func] += 1
+        # Concatenate modules in the same order as structured_to_unstructured
+        parts = [mod_grads[n].squeeze(0) for n in field_order if n in mod_grads]
+        if not parts:
+            continue
 
-    return sums_per_func, counts_per_func
+        all_grads.append(torch.cat(parts))
+        valid_meta.append({
+            "func": sample["func"],
+            "uid": sample["uid"],
+            "correct": sample["correct"],
+            "completion": sample["completion"],
+            "prompt": sample["prompt"],
+        })
+
+    if not all_grads:
+        dim = sum(
+            mod_grads[n].shape[-1] for n in field_order if n in mod_grads
+        ) if mod_grads else 1
+        return torch.zeros((0, dim), device=device, dtype=dtype), []
+
+    query_grads = torch.stack(all_grads)  # [Q, grad_dim]
+
+    if unit_norm:
+        norms = query_grads.norm(dim=1, keepdim=True).clamp(min=1e-12)
+        query_grads = query_grads / norms
+
+    return query_grads, valid_meta
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Bergson-based pairwise influence with per-function metrics")
+# ===========================================================================
+# Layer-filtered gradient helpers
+# ===========================================================================
+
+def _filter_field_order(field_order: List[str], layer_filter: str) -> List[str]:
+    """Return modules matching the layer_filter substring (or all if 'all')."""
+    if layer_filter.lower() == "all":
+        return list(field_order)
+    return [n for n in field_order if layer_filter in n]
+
+
+def _load_per_module_train_grads(
+    index_path: str,
+    modules: List[str],
+    device: str,
+    dtype: torch.dtype,
+    unit_norm: bool,
+) -> Dict[str, torch.Tensor]:
+    """Load per-module training gradients from the structured gradient mmap."""
+    mmap = load_gradients(index_path)
+    grads_by_module: Dict[str, torch.Tensor] = {}
+    for name in modules:
+        if mmap.dtype.names is None or name not in mmap.dtype.names:
+            continue
+        arr = mmap[name]  # shape [N, p*p] as float16/float32
+        t = torch.tensor(arr, device=device, dtype=dtype)
+        if unit_norm:
+            t = t / t.norm(dim=1, keepdim=True).clamp(min=1e-12)
+        grads_by_module[name] = t
+    return grads_by_module
+
+
+def _compute_score_matrix_for_modules(
+    query_grads_by_module: Dict[str, torch.Tensor],
+    train_grads_by_module: Dict[str, torch.Tensor],
+    modules: List[str],
+) -> torch.Tensor:
+    """Sum of per-module dot-product score matrices."""
+    total: Optional[torch.Tensor] = None
+    for name in modules:
+        if name not in query_grads_by_module or name not in train_grads_by_module:
+            continue
+        qg = query_grads_by_module[name]  # [Q, d_m]
+        tg = train_grads_by_module[name]  # [N, d_m]
+        sm = qg @ tg.mT                   # [Q, N]
+        total = sm if total is None else total + sm
+    if total is None:
+        raise ValueError("No matching modules found in score matrix computation.")
+    return total
+
+
+def _collect_query_grads_by_module(
+    model: torch.nn.Module,
+    query_samples: List[Dict[str, Any]],
+    processor: GradientProcessor,
+    modules: List[str],
+    device: str,
+    dtype: torch.dtype,
+    unit_norm: bool,
+    precondition_processor: Optional[GradientProcessor] = None,
+) -> Tuple[Dict[str, torch.Tensor], List[Dict[str, Any]]]:
+    """Collect per-module query gradients for a subset of modules."""
+    model.eval()
+    model.requires_grad_(False)
+    model.get_input_embeddings().requires_grad_(True)
+    base_model = getattr(model, "base_model", model)
+    module_set = set(modules)
+
+    all_mod_grads: Dict[str, List[torch.Tensor]] = {n: [] for n in modules}
+    valid_meta: List[Dict[str, Any]] = []
+
+    for sample in query_samples:
+        input_ids = sample["input_ids"].unsqueeze(0).to(device)
+        labels = sample["labels"].unsqueeze(0).to(device)
+
+        mod_grads: Dict[str, torch.Tensor] = {}
+
+        def _callback(name: str, g: torch.Tensor, _mg: Dict = mod_grads) -> None:
+            if name in module_set:
+                g = g.flatten(1).to(device=device, dtype=dtype, non_blocking=True)
+                g = _apply_preconditioner_whitening(g, name, precondition_processor, device, dtype)
+                _mg[name] = g
+
+        try:
+            with GradientCollector(base_model, _callback, processor):
+                with torch.enable_grad():
+                    logits = model(input_ids).logits
+                    if (
+                        sample.get("use_margin_loss")
+                        and sample.get("target_id") is not None
+                        and sample.get("candidate_ids") is not None
+                    ):
+                        last_logits = logits[0, -1, :]
+                        cand = sample["candidate_ids"].to(device)
+                        loss = -(last_logits[int(sample["target_id"])] - last_logits[cand].logsumexp(dim=0))
+                    else:
+                        shift_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
+                        shift_labels = labels[:, 1:].reshape(-1).long()
+                        loss = F.cross_entropy(
+                            shift_logits, shift_labels, ignore_index=-100, reduction="sum"
+                        )
+                    loss.backward()
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            model.zero_grad()
+
+        except Exception as e:
+            print(f"Warning: failed per-module gradient for query {sample['uid']}: {e}")
+            model.zero_grad()
+            continue
+
+        if not mod_grads:
+            continue
+
+        for n in modules:
+            if n in mod_grads:
+                g = mod_grads[n].squeeze(0)
+                all_mod_grads[n].append(g)
+            else:
+                # placeholder zero so list lengths stay consistent
+                if all_mod_grads[n]:
+                    all_mod_grads[n].append(torch.zeros_like(all_mod_grads[n][0]))
+                else:
+                    all_mod_grads[n].append(torch.tensor([0.0], device=device, dtype=dtype))
+
+        valid_meta.append({
+            "func": sample["func"],
+            "uid": sample["uid"],
+            "correct": sample["correct"],
+            "completion": sample["completion"],
+            "prompt": sample["prompt"],
+        })
+
+    result: Dict[str, torch.Tensor] = {}
+    for n in modules:
+        if not all_mod_grads[n]:
+            continue
+        stacked = torch.stack(all_mod_grads[n])  # [Q, d_m]
+        if unit_norm:
+            stacked = stacked / stacked.norm(dim=1, keepdim=True).clamp(min=1e-12)
+        result[n] = stacked
+
+    return result, valid_meta
+
+
+# ===========================================================================
+# Main
+# ===========================================================================
+
+def main() -> None:  # noqa: C901
+    parser = argparse.ArgumentParser(
+        description="Compute TrackStar (Bergson) pairwise influence and aggregate per-function metrics"
+    )
+
+    # Required I/O
     parser.add_argument("--model-path", required=True)
-    parser.add_argument("--dataset-path", required=True, help="Training dataset JSONL")
-    parser.add_argument("--query-path", required=True, help="Query JSONL with fields: prompt, completion, func, correct")
-    parser.add_argument("--output-path", required=True, help="Output JSONL with per-function scores per training example")
-    parser.add_argument("--projection-dim", type=int, default=64)
-    parser.add_argument("--use-margin-loss", default=True, action="store_true")
-    parser.add_argument("--margin", type=float, default=1.0)
-    parser.add_argument("--text-field", default="text")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--index-dir", default=os.path.join(os.path.dirname(__file__), "bergson_index"))
-    parser.add_argument("--fixed-length", type=int, default=256, help="Pad/truncate all training inputs to this length (0 disables)")
-    parser.add_argument("--module-scope", choices=["mlp_attn", "all"], default="mlp_attn")
-    parser.add_argument("--batch-size", type=int, default=256, help="Examples per backward step when building index")
-    parser.add_argument("--sample", type=int, default=0, help="If >0, randomly sample N training docs before indexing")
+    parser.add_argument("--dataset-path", required=True, help="Training JSONL with 'text' field")
+    parser.add_argument("--query-path", required=True, help="Query JSONL")
+    parser.add_argument("--output-path", required=True)
+
+    # Gradient index
+    parser.add_argument(
+        "--index-path",
+        type=str,
+        default=None,
+        help="Directory to save/load the training gradient index (default: ./bergson_index_<model-name>)",
+    )
+    parser.add_argument(
+        "--projection-dim",
+        type=int,
+        default=16,
+        help="Random projection dimension p; each module gradient is projected to p×p (default: 16)",
+    )
+    parser.add_argument(
+        "--token-batch-size",
+        type=int,
+        default=8192,
+        help="Token budget per batch when building the training index (default: 8192)",
+    )
+    parser.add_argument(
+        "--processor-path",
+        type=str,
+        default=None,
+        help="Path to a pre-built GradientProcessor to reuse (e.g. from pretraining data)",
+    )
+
+    # Pretraining-based processor (analogous to Kronfluence USE_PRETRAINING_FACTORS)
+    parser.add_argument(
+        "--pretraining-path",
+        type=str,
+        default=None,
+        help=(
+            "JSONL file of pretraining documents. When set (and --processor-path is not), "
+            "a GradientProcessor is built from this corpus and reused for both the task "
+            "training index and query gradients, giving better-calibrated projections and "
+            "preconditioners (analogous to Kronfluence's USE_PRETRAINING_FACTORS)."
+        ),
+    )
+    parser.add_argument(
+        "--pretraining-samples",
+        type=int,
+        default=None,
+        help="Randomly sample this many docs from --pretraining-path (default: use all)",
+    )
+    parser.add_argument(
+        "--pretraining-processor-cache",
+        type=str,
+        default=None,
+        help=(
+            "Directory to cache the pretraining processor so it can be reused across runs "
+            "with the same model/pretraining data. Defaults to "
+            "./bergson_pretrain_processor_<model-name>."
+        ),
+    )
+
+    parser.add_argument(
+        "--unit-norm",
+        action="store_true",
+        default=True,
+        help="Unit-normalise gradients before dot product (cosine similarity; default: on)",
+    )
+    parser.add_argument(
+        "--no-unit-norm",
+        dest="unit_norm",
+        action="store_false",
+        help="Disable unit normalisation (use raw dot product instead)",
+    )
+    parser.add_argument(
+        "--precondition",
+        action="store_true",
+        default=False,
+        help=(
+            "Apply preconditioner whitening to query gradients before scoring "
+            "(g_q -> P^{-1/2} g_q per module). Uses preconditioners from "
+            "--pretraining-path when set, otherwise from the task training index. "
+            "Analogous to Kronfluence KFAC/EKFAC preconditioning. Has no effect "
+            "unless --pretraining-path is also set (otherwise preconditioners come "
+            "from the same task data used for the gradient index)."
+        ),
+    )
+
+    # Model / data settings
+    parser.add_argument("--dtype", choices=["bf16", "f32"], default="bf16")
+    parser.add_argument("--max-train-length", type=int, default=512)
+    parser.add_argument("--max-query-length", type=int, default=128)
+    parser.add_argument("--sample", type=int, default=None, help="Sample N training docs")
     parser.add_argument("--sample-seed", type=int, default=42)
-    parser.add_argument("--base-functions", action="store_true", help="Queries target base functions (depth 0) instead of wrappers")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing index")
+
+    # Query loss
+    parser.add_argument("--use-margin-loss", action="store_true")
+    parser.add_argument("--min-answer", type=int, default=1)
+    parser.add_argument("--max-answer", type=int, default=100)
+    parser.add_argument(
+        "--query-full-text-loss",
+        action="store_true",
+        help="Use full-text LM loss on queries (ignored when --use-margin-loss is set)",
+    )
+
+    # Evaluation
+    parser.add_argument("--eval-topk", type=int, default=None)
+    parser.add_argument(
+        "--eval-topk-multi",
+        type=str,
+        default=None,
+        help="Comma-separated k values, e.g. '1,5,10,20,50'",
+    )
+    parser.add_argument("--eval-save-examples-path", type=str, default=None)
+    parser.add_argument("--eval-examples-per-func", type=int, default=1)
+    parser.add_argument("--eval-metrics-path", type=str, default=None)
+    parser.add_argument("--eval-summary-jsonl", type=str, default=None)
+    parser.add_argument("--eval-save-all-queries-path", type=str, default=None)
+
+    # Per-layer outputs (subset of modules)
+    parser.add_argument(
+        "--layer",
+        type=str,
+        default=None,
+        help=(
+            "If set, compute per-module scores and save rankings/metrics under "
+            "layers/<module>/ subdirectories. Value filters module names by substring; "
+            "use 'all' for every module."
+        ),
+    )
+
     args = parser.parse_args()
 
-    os.makedirs(args.index_dir, exist_ok=True)
+    # -----------------------------------------------------------------------
+    # 1. Setup
+    # -----------------------------------------------------------------------
+    if args.index_path is None:
+        model_name = os.path.basename(os.path.normpath(args.model_path))
+        args.index_path = f"./bergson_index_{model_name}"
 
-    # Load model/tokenizer
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=(torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32),
-        device_map=None,
-    )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    # Load datasets
+    device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    device_has_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    if args.dtype == "bf16" and not device_has_bf16:
+        print("Warning: bf16 not supported by device; falling back to f32.")
+    torch_dtype = torch.bfloat16 if (args.dtype == "bf16" and device_has_bf16) else torch.float32
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        torch_dtype=torch_dtype,
+        device_map={"": device_str} if torch.cuda.is_available() else None,
+    )
+
+    # -----------------------------------------------------------------------
+    # 1b. Pretraining processor (optional, analogous to Kronfluence pretraining factors)
+    # -----------------------------------------------------------------------
+    if args.pretraining_path and not args.processor_path:
+        model_name = os.path.basename(os.path.normpath(args.model_path))
+        pretrain_cache = (
+            args.pretraining_processor_cache
+            or f"./bergson_pretrain_processor_{model_name}"
+        )
+        pretrain_docs = utils.load_jsonl_dataset(args.pretraining_path)
+        if args.pretraining_samples and 0 < args.pretraining_samples < len(pretrain_docs):
+            import random
+            rng = random.Random(args.sample_seed)
+            pretrain_docs = rng.sample(pretrain_docs, args.pretraining_samples)
+            print(f"Sampled {len(pretrain_docs)} pretraining docs for processor.")
+        args.processor_path = _build_or_load_pretraining_processor(
+            model=model,
+            pretraining_docs=pretrain_docs,
+            cache_path=pretrain_cache,
+            projection_dim=args.projection_dim,
+            token_batch_size=args.token_batch_size,
+            tokenizer=tokenizer,
+            max_length=args.max_train_length,
+            overwrite=args.overwrite,
+        )
+
+    # Load pretraining preconditioners for query whitening (kept separate so they are
+    # not overwritten when collect_gradients runs on the task training data).
+    pretrain_proc: Optional[GradientProcessor] = None
+    if args.precondition and args.processor_path and os.path.exists(
+        os.path.join(args.processor_path, "processor_config.json")
+    ):
+        print(f"Loading pretraining preconditioners for query whitening from {args.processor_path}")
+        pretrain_proc = GradientProcessor.load(args.processor_path, map_location=device_str)
+
+    # -----------------------------------------------------------------------
+    # 2. Load training documents
+    # -----------------------------------------------------------------------
     train_docs = utils.load_jsonl_dataset(args.dataset_path)
-    if args.sample and args.sample > 0 and args.sample < len(train_docs):
+    if args.sample is not None and 0 < args.sample < len(train_docs):
         import random
         rng = random.Random(args.sample_seed)
         train_docs = rng.sample(train_docs, args.sample)
-    query_docs = utils.load_jsonl_dataset(args.query_path)
-    try:
-        mode_str = "base functions" if getattr(args, "base_functions", False) else "wrapper functions"
-        print(f"Scoring mode: {mode_str}")
-    except Exception:
-        pass
+        print(f"Sampled {len(train_docs)} training docs.")
 
-    # Build/overwrite index
-    index_path = os.path.join(args.index_dir, "index")
-    build_training_index(
+    train_hf_dataset = _build_train_hf_dataset(train_docs, tokenizer, max_length=args.max_train_length)
+
+    # -----------------------------------------------------------------------
+    # 3. Build / load training gradient index
+    # -----------------------------------------------------------------------
+    _build_or_load_train_index(
         model=model,
-        tokenizer=tokenizer,
-        train_docs=train_docs,
-        index_path=index_path,
+        train_hf_dataset=train_hf_dataset,
+        index_path=args.index_path,
         projection_dim=args.projection_dim,
-        device=args.device,
-        text_field=args.text_field,
-        fixed_length=(None if args.fixed_length is None or int(args.fixed_length) <= 0 else int(args.fixed_length)),
-        module_scope=args.module_scope,
-        batch_size=args.batch_size,
+        token_batch_size=args.token_batch_size,
+        overwrite=args.overwrite,
+        processor_path=args.processor_path,
+        # When a pretraining processor is loaded and --precondition is set, preserve
+        # its preconditioners by skipping recomputation on the task training data.
+        skip_preconditioners=bool(args.precondition and pretrain_proc is not None),
     )
 
-    # Determine k (all training examples)
-    N = load_gradients(index_path).shape[0]
+    # -----------------------------------------------------------------------
+    # 4. Load the Attributor (training gradients + processor)
+    # -----------------------------------------------------------------------
+    print(f"Loading gradient index from {args.index_path}…")
+    attributor = Attributor(
+        index_path=args.index_path,
+        device=device_str,
+        dtype=torch_dtype,
+        unit_norm=args.unit_norm,
+    )
 
-    # Compute query scores grouped by function
-    sums_per_func, counts_per_func = compute_query_scores(
-        model=model,
-        tokenizer=tokenizer,
-        index_path=index_path,
+    # Determine the field order (forward pass order from named_modules) so that
+    # query gradient concatenation matches structured_to_unstructured output.
+    raw_mmap = load_gradients(args.index_path)
+    field_order: List[str] = list(raw_mmap.dtype.names) if raw_mmap.dtype.names else []
+    del raw_mmap
+
+    # -----------------------------------------------------------------------
+    # 5. Build query samples
+    # -----------------------------------------------------------------------
+    query_docs = utils.load_jsonl_dataset(args.query_path)
+    query_samples = _build_query_samples(
         query_docs=query_docs,
+        tokenizer=tokenizer,
+        max_length=args.max_query_length,
         use_margin_loss=args.use_margin_loss,
-        margin=args.margin,
-        device=args.device,
-        k_all=N,
+        min_ans=args.min_answer,
+        max_ans=args.max_answer,
+        full_text_loss=bool(args.query_full_text_loss and not args.use_margin_loss),
+    )
+    print(f"Built {len(query_samples)} query samples from {len(query_docs)} query docs.")
+
+    # -----------------------------------------------------------------------
+    # 6a. Default path: all modules concatenated → single score matrix
+    # -----------------------------------------------------------------------
+    if args.layer is None:
+        print("Collecting query gradients...")
+        query_grads, query_meta = _collect_query_gradients(
+            model=model,
+            query_samples=query_samples,
+            processor=attributor.processor,
+            field_order=field_order,
+            device=device_str,
+            dtype=torch_dtype,
+            unit_norm=args.unit_norm,
+            precondition_processor=pretrain_proc,
+        )
+        print(f"Collected {len(query_grads)} query gradients.")
+
+        if len(query_grads) == 0:
+            print("No valid query gradients. Exiting.")
+            return
+
+        print(
+            f"Computing pairwise scores: {len(query_grads)} queries × "
+            f"{attributor.grads.shape[0]} train docs…"
+        )
+        score_matrix = query_grads @ attributor.grads.mT  # [Q, N]
+        del query_grads, attributor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Save aggregate rankings
+        training_meta = aggregate_scores_to_training_meta(score_matrix, query_meta, train_docs)
+        save_influence_scores(training_meta, args.output_path)
+
+        # Build relevance indices for eval
+        def _is_rel(doc: Dict[str, Any], func: str) -> bool:
+            if str(doc.get("func", "")) != func:
+                return False
+            expected = allowed_role_for_token(func)
+            return expected is not None and str(doc.get("role", "")).lower() == expected
+
+        eval_k_list = _parse_eval_topk_list(args.eval_topk, args.eval_topk_multi)
+        if eval_k_list or args.eval_save_examples_path or args.eval_save_all_queries_path:
+            func_to_rel: Dict[str, List[int]] = {}
+            for ti, doc in enumerate(train_docs):
+                f = str(doc.get("func", ""))
+                if _is_rel(doc, f):
+                    func_to_rel.setdefault(f, []).append(ti)
+
+            func_to_q: Dict[str, List[int]] = {}
+            for qi, qm in enumerate(query_meta):
+                if not bool(qm.get("correct", False)):
+                    continue
+                f = str(qm.get("func", ""))
+                func_to_q.setdefault(f, []).append(qi)
+
+            _run_eval_and_save(
+                score_matrix=score_matrix,
+                train_docs=train_docs,
+                query_meta=query_meta,
+                eval_k_list=eval_k_list,
+                func_to_relevant_indices=func_to_rel,
+                func_to_query_indices=func_to_q,
+                eval_save_examples_path=args.eval_save_examples_path,
+                eval_examples_per_func=args.eval_examples_per_func,
+                eval_topk=args.eval_topk,
+                eval_metrics_path=args.eval_metrics_path,
+                eval_summary_jsonl=args.eval_summary_jsonl,
+                eval_save_all_queries_path=args.eval_save_all_queries_path,
+            )
+        return
+
+    # -----------------------------------------------------------------------
+    # 6b. Per-layer path: one score matrix per matched module
+    # -----------------------------------------------------------------------
+    modules = _filter_field_order(field_order, args.layer)
+    if not modules:
+        print(f"No modules matched layer filter '{args.layer}'. Exiting.")
+        return
+    print(f"Per-layer mode: {len(modules)} module(s) matched '{args.layer}'.")
+
+    print("Collecting per-module query gradients...")
+    query_grads_by_mod, query_meta = _collect_query_grads_by_module(
+        model=model,
+        query_samples=query_samples,
+        processor=attributor.processor,
+        modules=modules,
+        device=device_str,
+        dtype=torch_dtype,
+        unit_norm=args.unit_norm,
+        precondition_processor=pretrain_proc,
+    )
+    print(f"Collected per-module query gradients for {len(query_meta)} queries.")
+
+    if not query_meta:
+        print("No valid query gradients. Exiting.")
+        return
+
+    print(f"Loading per-module training gradients…")
+    train_grads_by_mod = _load_per_module_train_grads(
+        index_path=args.index_path,
+        modules=modules,
+        device=device_str,
+        dtype=torch_dtype,
+        unit_norm=args.unit_norm,
     )
 
-    # Map wrapper tokens to single-letter prefixes
-    influence_name_map = {
-        "<FN>": "f", "<GN>": "g", "<IN>": "i", "<JN>": "j", "<HN>": "h", "<KN>": "k",
-        "<LN>": "l", "<MN>": "m", "<NN>": "n", "<ON>": "o", "<PN>": "p", "<QN>": "q",
-        "<RN>": "r", "<SN>": "s", "<TN>": "t", "<UN>": "u", "<XN>": "x", "<YN>": "y",
-        "<WN>": "w", "<VN>": "v",
-    }
+    def _is_rel(doc: Dict[str, Any], func: str) -> bool:
+        if str(doc.get("func", "")) != func:
+            return False
+        expected = allowed_role_for_token(func)
+        return expected is not None and str(doc.get("role", "")).lower() == expected
 
-    # Build averages per function
-    averages_per_func: Dict[str, List[float]] = {}
-    for func, sums in sums_per_func.items():
-        count = max(1, int(counts_per_func.get(func, 0)))
-        avg = (sums / float(count)).tolist()
-        averages_per_func[func] = avg
+    func_to_rel: Dict[str, List[int]] = {}
+    for ti, doc in enumerate(train_docs):
+        f = str(doc.get("func", ""))
+        if _is_rel(doc, f):
+            func_to_rel.setdefault(f, []).append(ti)
 
-    # Write per-training example JSONL with per-function and combined scores
-    with open(args.output_path, "w", encoding="utf-8") as f:
-        for idx, doc in enumerate(train_docs):
-            out = dict(doc)
-            scores_accum: List[float] = []
-            for func, avg_list in averages_per_func.items():
-                if idx < len(avg_list):
-                    letter = influence_name_map.get(func, func.strip("<>").lower())
-                    out[f"{letter}_influence_score"] = float(avg_list[idx])
-                    scores_accum.append(float(avg_list[idx]))
-            if scores_accum:
-                out["influence_score"] = float(sum(scores_accum) / len(scores_accum))
-            else:
-                out["influence_score"] = 0.0
-            f.write(json.dumps(out) + "\n")
+    func_to_q: Dict[str, List[int]] = {}
+    for qi, qm in enumerate(query_meta):
+        if not bool(qm.get("correct", False)):
+            continue
+        f = str(qm.get("func", ""))
+        func_to_q.setdefault(f, []).append(qi)
+
+    eval_k_list = _parse_eval_topk_list(args.eval_topk, args.eval_topk_multi)
+    base_dir = os.path.dirname(os.path.abspath(args.output_path))
+    layers_root = os.path.join(base_dir, "layers")
+    os.makedirs(layers_root, exist_ok=True)
+
+    total_score_matrix: Optional[torch.Tensor] = None
+
+    def _sanitize(name: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_]+", "_", name)
+
+    for module_name in modules:
+        if module_name not in query_grads_by_mod or module_name not in train_grads_by_mod:
+            continue
+
+        qg = query_grads_by_mod[module_name]  # [Q, d_m]
+        tg = train_grads_by_mod[module_name]   # [N, d_m]
+        sm = qg @ tg.mT                        # [Q, N]
+
+        total_score_matrix = sm if total_score_matrix is None else total_score_matrix + sm
+
+        mod_dir = os.path.join(layers_root, _sanitize(module_name))
+        os.makedirs(mod_dir, exist_ok=True)
+
+        # Per-module rankings
+        meta = aggregate_scores_to_training_meta(sm, query_meta, train_docs)
+        save_influence_scores(meta, os.path.join(mod_dir, "scores.jsonl"))
+
+        # Per-module metrics
+        if eval_k_list:
+            mod_metrics: Dict[str, Any] = {
+                "recall_at_k": {}, "precision_at_k": {}, "composition_at_k": {}
+            }
+            for k in eval_k_list:
+                pr, pp, _, rv, pv = _compute_recall_precision_at_k(
+                    sm, func_to_rel, func_to_q, k
+                )
+                if pr:
+                    mod_metrics["recall_at_k"][str(k)] = {
+                        "k": k, "per_function": pr, "per_function_variance": rv,
+                        "overall_average": float(sum(pr.values()) / len(pr)),
+                    }
+                if pp:
+                    mod_metrics["precision_at_k"][str(k)] = {
+                        "k": k, "per_function": pp, "per_function_variance": pv,
+                        "overall_average": float(sum(pp.values()) / len(pp)),
+                    }
+                cp = _compute_composition_per_function(sm, train_docs, func_to_rel, func_to_q, k)
+                if cp:
+                    oc: Dict[str, float] = {}
+                    for cat in ("relevant", "distractor", "other"):
+                        vals = [v[cat] for v in cp.values()]
+                        if vals:
+                            oc[cat] = float(sum(vals) / len(vals))
+                    mod_metrics["composition_at_k"][str(k)] = {
+                        "k": k, "per_function": cp, "overall_average": oc,
+                    }
+            if any(mod_metrics.values()):
+                with open(os.path.join(mod_dir, "metrics.json"), "w") as f:
+                    json.dump(mod_metrics, f)
+
+    # Aggregate (sum across layers) → write to top-level output
+    if total_score_matrix is not None:
+        agg_meta = aggregate_scores_to_training_meta(total_score_matrix, query_meta, train_docs)
+        save_influence_scores(agg_meta, args.output_path)
+
+        _run_eval_and_save(
+            score_matrix=total_score_matrix,
+            train_docs=train_docs,
+            query_meta=query_meta,
+            eval_k_list=eval_k_list,
+            func_to_relevant_indices=func_to_rel,
+            func_to_query_indices=func_to_q,
+            eval_save_examples_path=args.eval_save_examples_path,
+            eval_examples_per_func=args.eval_examples_per_func,
+            eval_topk=args.eval_topk,
+            eval_metrics_path=args.eval_metrics_path,
+            eval_summary_jsonl=args.eval_summary_jsonl,
+            eval_save_all_queries_path=args.eval_save_all_queries_path,
+        )
 
 
 if __name__ == "__main__":
     main()
-
-

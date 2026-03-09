@@ -1,0 +1,5 @@
+{
+  "projection_dim": 64,
+  "reshape_to_square": false,
+  "projection_type": "rademacher"
+}

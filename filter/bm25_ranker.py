@@ -1,316 +1,721 @@
-from rank_bm25 import BM25Okapi
-import numpy as np
-import json
+"""BM25 baseline ranker with the same evaluation features as kronfluence_ranker.py.
+
+Computes BM25 retrieval scores between query prompts and training documents,
+then evaluates using identical recall@k, precision@k, composition@k, qualitative
+examples, metrics JSON, and summary JSONL outputs.
+
+BM25 is a strong text-retrieval baseline that requires no model, GPU, or gradients.
+Each query's prompt text is tokenized and scored against the full training corpus
+using Okapi BM25.
+"""
+
 import argparse
-from typing import List, Dict, Any, Tuple
+import json
+import os
 import re
-from pathlib import Path
-from transformers import AutoTokenizer
+import string
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import torch
+from rank_bm25 import BM25Okapi
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
+
+import utils
 
 
-def get_available_function_pairs():
-    """Get list of available function pairs from the current token system."""
-    # Base tokens and their corresponding wrapper tokens (matching other scripts)
-    base_letters = ['G', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R']
-    wrapper_letters = ['F', 'I', 'H', 'S', 'T', 'U', 'V', 'W', 'X', 'Y']
-    
-    # Constants: start with 5, 7, then increment by 2 for each pair
-    base_constants = [5, 7, 9, 11, 13, 15, 17, 19, 21, 23]
-    
-    pairs = []
-    for i in range(len(base_letters)):
-        base_token = f"<{base_letters[i]}N>"
-        wrapper_token = f"<{wrapper_letters[i]}N>"
-        constant = base_constants[i] if i < len(base_constants) else 5 + (i * 2)
-        pairs.append((base_token, wrapper_token, constant))
-    
-    return pairs
+# ===========================================================================
+# Helper functions — identical to kronfluence_ranker.py
+# ===========================================================================
+
+def is_many_bases_token(token: str) -> bool:
+    if not token:
+        return False
+    return bool(re.match(r"^<B\d+>$", token))
 
 
-def detect_available_functions(dataset_path: str) -> List[Dict[str, Any]]:
-    """
-    Detect which function pairs are actually present in the dataset.
-    
-    Args:
-        dataset_path: Path to the JSONL dataset file
-        
-    Returns:
-        List of dictionaries with function information
-    """
-    available_functions = []
-    function_pairs = get_available_function_pairs()
-    
-    # Check which functions appear in the dataset
-    function_counts = {}
-    
-    print(f"Scanning dataset {dataset_path} for function tokens...")
-    
-    with open(dataset_path, 'r', encoding='utf-8') as f:
-        for line_num, line in enumerate(f, 1):
-            if not line.strip():
+def influence_name_mapping() -> Dict[str, str]:
+    return {
+        "<FN>": "f", "<GN>": "g", "<ZN>": "z", "<AN>": "a", "<BN>": "b",
+        "<CN>": "c", "<DN>": "d", "<EN>": "e", "<IN>": "i", "<JN>": "j",
+        "<HN>": "h", "<KN>": "k", "<LN>": "l", "<MN>": "m", "<NN>": "n",
+        "<ON>": "o", "<PN>": "p", "<QN>": "q", "<RN>": "r", "<SN>": "s",
+        "<TN>": "t", "<UN>": "u", "<XN>": "x", "<YN>": "y", "<WN>": "w",
+        "<VN>": "v",
+    }
+
+
+def paired_function_token(func_token: str) -> Optional[str]:
+    pairs: Dict[str, str] = {
+        "<FN>": "<GN>", "<GN>": "<FN>",
+        "<IN>": "<JN>", "<JN>": "<IN>",
+        "<HN>": "<KN>", "<KN>": "<HN>",
+        "<SN>": "<LN>", "<LN>": "<SN>",
+        "<TN>": "<MN>", "<MN>": "<TN>",
+        "<UN>": "<NN>", "<NN>": "<UN>",
+        "<VN>": "<ON>", "<ON>": "<VN>",
+        "<WN>": "<PN>", "<PN>": "<WN>",
+        "<XN>": "<QN>", "<QN>": "<XN>",
+        "<YN>": "<RN>", "<RN>": "<YN>",
+    }
+    return pairs.get(func_token)
+
+
+def allowed_role_for_token(func_token: str) -> Optional[str]:
+    wrapper_tokens = {
+        "<FN>", "<IN>", "<HN>", "<SN>", "<TN>", "<UN>", "<VN>", "<WN>", "<XN>", "<YN>"
+    }
+    return "identity" if func_token in wrapper_tokens else "constant"
+
+
+DISTRACTOR_FUNCS: Set[str] = {"<AN>", "<BN>", "<CN>", "<DN>", "<EN>", "<ZN>"}
+
+
+def _categorize_doc_for_composition(doc: Dict[str, Any], is_relevant: bool) -> str:
+    func = str(doc.get("func", ""))
+    role = str(doc.get("role", "")).lower()
+    if role == "distractor" or func in DISTRACTOR_FUNCS:
+        return "distractor"
+    return "relevant" if is_relevant else "other"
+
+
+def _parse_eval_topk_list(eval_topk: Optional[int], eval_topk_multi: Optional[str]) -> List[int]:
+    if eval_topk_multi:
+        try:
+            k_list = [int(x.strip()) for x in eval_topk_multi.split(",") if x.strip()]
+            return sorted(set(k for k in k_list if k > 0))
+        except ValueError:
+            pass
+    if eval_topk is not None and int(eval_topk) > 0:
+        return [int(eval_topk)]
+    return []
+
+
+def _variance(values: List[float]) -> float:
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mean = sum(values) / n
+    return float(sum((x - mean) ** 2 for x in values) / n)
+
+
+def _compute_recall_precision_at_k(
+    score_matrix: torch.Tensor,
+    func_to_relevant_indices: Dict[str, List[int]],
+    func_to_query_indices: Dict[str, List[int]],
+    k: int,
+) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, int], Dict[str, float], Dict[str, float]]:
+    per_func_recalls: Dict[str, float] = {}
+    per_func_precisions: Dict[str, float] = {}
+    per_func_counts: Dict[str, int] = {}
+    per_func_recall_vars: Dict[str, float] = {}
+    per_func_precision_vars: Dict[str, float] = {}
+
+    for func, q_indices in func_to_query_indices.items():
+        rel_indices = set(func_to_relevant_indices.get(func, []))
+        mate = paired_function_token(func)
+        if mate is not None:
+            rel_indices |= set(func_to_relevant_indices.get(mate, []))
+        if not rel_indices:
+            continue
+
+        recalls: List[float] = []
+        precisions: List[float] = []
+        for qi in q_indices:
+            row = score_matrix[qi]
+            _, topk_idx = torch.topk(row, k=min(k, row.numel()))
+            retrieved = set(topk_idx.tolist())
+            num_rel = len(retrieved & rel_indices)
+            recalls.append(float(num_rel) / float(len(rel_indices)))
+            precisions.append(float(num_rel) / float(max(1, min(k, row.numel()))))
+
+        if recalls:
+            per_func_recalls[func] = float(sum(recalls) / len(recalls))
+            per_func_counts[func] = len(recalls)
+            per_func_recall_vars[func] = _variance(recalls)
+        if precisions:
+            per_func_precisions[func] = float(sum(precisions) / len(precisions))
+            per_func_precision_vars[func] = _variance(precisions)
+
+    return (
+        per_func_recalls, per_func_precisions, per_func_counts,
+        per_func_recall_vars, per_func_precision_vars,
+    )
+
+
+def _compute_composition_per_function(
+    score_matrix: torch.Tensor,
+    train_docs: List[Dict[str, Any]],
+    func_to_relevant_indices: Dict[str, List[int]],
+    func_to_query_indices: Dict[str, List[int]],
+    k: int,
+) -> Dict[str, Dict[str, float]]:
+    per_func: Dict[str, Dict[str, float]] = {}
+    k = int(k)
+    if k <= 0:
+        return per_func
+
+    for func, q_indices in func_to_query_indices.items():
+        rel_indices = set(func_to_relevant_indices.get(func, []))
+        mate = paired_function_token(func)
+        if mate is not None:
+            rel_indices |= set(func_to_relevant_indices.get(mate, []))
+        if not rel_indices:
+            continue
+
+        frac_rel, frac_dist, frac_other = [], [], []
+        for qi in q_indices:
+            row = score_matrix[qi]
+            _, topk_idx = torch.topk(row, k=min(k, row.numel()))
+            indices = topk_idx.tolist()
+            if not indices:
                 continue
-            try:
-                doc = json.loads(line.strip())
-                text = doc.get('text', '')
-                
-                # Count occurrences of each function token
-                for base_token, wrapper_token, constant in function_pairs:
-                    if base_token in text:
-                        function_counts[base_token] = function_counts.get(base_token, 0) + 1
-                    if wrapper_token in text:
-                        function_counts[wrapper_token] = function_counts.get(wrapper_token, 0) + 1
-                        
-            except json.JSONDecodeError:
-                print(f"Warning: Could not parse line {line_num}")
+            denom_k = float(len(indices))
+            nr, nd, no = 0, 0, 0
+            for ti in indices:
+                cat = _categorize_doc_for_composition(train_docs[ti], ti in rel_indices)
+                if cat == "relevant":
+                    nr += 1
+                elif cat == "distractor":
+                    nd += 1
+                else:
+                    no += 1
+            frac_rel.append(nr / denom_k)
+            frac_dist.append(nd / denom_k)
+            frac_other.append(no / denom_k)
+
+        if frac_rel:
+            per_func[func] = {
+                "relevant": float(sum(frac_rel) / len(frac_rel)),
+                "distractor": float(sum(frac_dist) / len(frac_dist)),
+                "other": float(sum(frac_other) / len(frac_other)),
+            }
+
+    return per_func
+
+
+def aggregate_scores_to_training_meta(
+    scores_matrix: torch.Tensor,
+    query_meta: List[Dict[str, Any]],
+    train_docs: List[Dict[str, Any]],
+) -> Dict[int, Dict[str, Any]]:
+    func_to_rows: Dict[str, List[int]] = {}
+    for idx, m in enumerate(query_meta):
+        if not bool(m.get("correct", False)):
+            continue
+        func = str(m.get("func", "unknown"))
+        func_to_rows.setdefault(func, []).append(idx)
+
+    name_map = influence_name_mapping()
+    out: Dict[int, Dict[str, Any]] = {}
+    for ti, doc in enumerate(train_docs):
+        meta: Dict[str, Any] = {
+            "uid": doc.get("uid", ti),
+            "func": doc.get("func"),
+            "role": doc.get("role"),
+            "constant": doc.get("constant"),
+            "hop_depth": doc.get("hop_depth"),
+            "text": doc.get("text"),
+            "source": doc.get("source"),
+        }
+        per_func_scores: List[float] = []
+        for func, rows in func_to_rows.items():
+            if not rows:
                 continue
-    
-    # Build list of available functions
-    for base_token, wrapper_token, constant in function_pairs:
-        base_count = function_counts.get(base_token, 0)
-        wrapper_count = function_counts.get(wrapper_token, 0)
-        
-        if base_count > 0 or wrapper_count > 0:
-            available_functions.append({
-                'base_token': base_token,
-                'wrapper_token': wrapper_token,
-                'constant': constant,
-                'base_count': base_count,
-                'wrapper_count': wrapper_count
-            })
-            print(f"Found {base_token} ({base_count} occurrences) and {wrapper_token} ({wrapper_count} occurrences) → constant {constant}")
-    
-    print(f"Detected {len(available_functions)} function pairs in dataset")
-    return available_functions
+            vals = scores_matrix[rows, ti].detach().cpu().float().numpy()
+            avg = float(vals.mean())
+            if is_many_bases_token(func):
+                letter = func.strip("<>").lower()
+            elif func in name_map:
+                letter = name_map[func]
+            else:
+                stripped = func.strip("<>")
+                if stripped.lower().endswith("n") and len(stripped) > 1:
+                    stripped = stripped[:-1]
+                letter = stripped.lower()
+            meta[f"{letter}_influence_score"] = avg
+            per_func_scores.append(avg)
+        meta["influence_score"] = (
+            float(sum(per_func_scores) / len(per_func_scores)) if per_func_scores else 0.0
+        )
+        out[ti] = meta
+    return out
 
 
-class BM25Ranker:
+def save_influence_scores(training_meta: Dict[int, Dict[str, Any]], out_path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    with open(out_path, "w") as f:
+        for _, v in training_meta.items():
+            f.write(json.dumps(v) + "\n")
+    print(f"Saved BM25 scores to {out_path}")
+
+
+# ===========================================================================
+# BM25 tokenization and scoring
+# ===========================================================================
+
+_PUNCT_TABLE = str.maketrans("", "", string.punctuation)
+
+
+def _tokenize(
+    text: str,
+    lowercase: bool = True,
+    strip_punct: bool = False,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
+) -> List[str]:
+    """Tokenize text for BM25.
+
+    When a HuggingFace tokenizer is provided the text is encoded with it and
+    each token ID is converted to a string (e.g. "12345").  This makes BM25
+    operate on the same subword vocabulary as the model, which is especially
+    important for texts containing special function tokens like <GN> or <FN>
+    that whitespace splitting would not isolate correctly.
+
+    Without a tokenizer, simple whitespace splitting is used with optional
+    lowercasing and punctuation stripping.
     """
-    BM25 ranker for ranking training data based on average scores across evaluation queries for multiple functions.
-    Uses the specific model tokenizer to properly handle special function tokens.
-    """
-    
-    def __init__(self, documents: List[Dict[str, Any]], tokenizer_path: str, text_field: str = "text"):
-        """
-        Initialize BM25 ranker with training documents and tokenizer.
-        
-        Args:
-            documents: List of document dictionaries (from JSONL)
-            tokenizer_path: Path to the tokenizer directory
-            text_field: Field name containing the text to index (default: "text")
-        """
-        self.documents = documents
-        self.text_field = text_field
-        self.tokenizer_path = tokenizer_path
-        
-        # Load tokenizer
-        print(f"Loading tokenizer from {tokenizer_path}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-        print(f"Tokenizer loaded. Vocab size: {len(self.tokenizer)}")
-        
-        # Load function token mapping if available
-        function_mapping_path = Path(tokenizer_path) / "function_token_mapping.json"
-        if function_mapping_path.exists():
-            with open(function_mapping_path, 'r') as f:
-                self.function_token_mapping = json.load(f)
-            print(f"Loaded function token mapping: {list(self.function_token_mapping.keys())}")
+    if tokenizer is not None:
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        return [str(i) for i in ids]
+    if lowercase:
+        text = text.lower()
+    if strip_punct:
+        text = text.translate(_PUNCT_TABLE)
+    return text.split()
+
+
+def _build_corpus(
+    train_docs: List[Dict[str, Any]],
+    lowercase: bool,
+    strip_punct: bool,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
+) -> List[List[str]]:
+    """Tokenize each training document's text field into a token list for BM25."""
+    corpus = []
+    for doc in train_docs:
+        text = doc.get("text", "") or ""
+        corpus.append(_tokenize(text, lowercase=lowercase, strip_punct=strip_punct, tokenizer=tokenizer))
+    return corpus
+
+
+def _build_query_text(
+    doc: Dict[str, Any],
+    include_completion: bool,
+) -> str:
+    """Construct the BM25 query string from a query document."""
+    prompt = str(doc.get("prompt", doc.get("query", "")) or "")
+    if include_completion:
+        completion = str(doc.get("completion", "") or "")
+        return (prompt + " " + completion).strip()
+    return prompt
+
+
+def compute_bm25_score_matrix(
+    bm25: BM25Okapi,
+    query_docs: List[Dict[str, Any]],
+    query_meta: List[Dict[str, Any]],
+    include_completion: bool,
+    lowercase: bool,
+    strip_punct: bool,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
+) -> torch.Tensor:
+    """Return a [Q, N] float32 tensor of BM25 scores (query x train)."""
+    rows: List[torch.Tensor] = []
+    for _qm, doc in zip(query_meta, query_docs):
+        text = _build_query_text(doc, include_completion=include_completion)
+        tokens = _tokenize(text, lowercase=lowercase, strip_punct=strip_punct, tokenizer=tokenizer)
+        if not tokens:
+            scores = [0.0] * bm25.corpus_size
         else:
-            self.function_token_mapping = {}
-        
-        # Extract text content from documents
-        self.corpus = [doc.get(text_field, "") for doc in documents]
-        
-        # Tokenize the corpus using the model tokenizer
-        print("Tokenizing corpus with model tokenizer...")
-        self.tokenized_corpus = [self._tokenize(text) for text in self.corpus]
-        
-        # Initialize BM25
-        print("Initializing BM25 index...")
-        self.bm25 = BM25Okapi(self.tokenized_corpus)
-    
-    def _tokenize(self, text: str) -> List[str]:
-        """Tokenize text using the model tokenizer and convert to string tokens."""
-        # Use the model tokenizer to get token IDs
-        token_ids = self.tokenizer.encode(text, add_special_tokens=False, truncation=True, max_length=512)
-        
-        # Convert token IDs back to tokens for BM25 (which expects string tokens)
-        # We use the token IDs as strings to preserve the exact tokenization
-        tokens = [str(token_id) for token_id in token_ids]
-        
-        return tokens
-    
-    def rank_documents_by_average_score(self, function_queries: Dict[str, List[str]]) -> List[Dict[str, Any]]:
-        """
-        Rank documents by average BM25 score across all queries for multiple functions.
-        
-        Args:
-            function_queries: Dict mapping function names to their evaluation queries
-            
-        Returns:
-            List of documents ranked by combined average score (highest first) with separate scores per function
-        """
-        function_names = list(function_queries.keys())
-        total_queries = sum(len(queries) for queries in function_queries.values())
-        print(f"Ranking {len(self.documents)} documents using {len(function_names)} functions ({total_queries} total queries)...")
-        print(f"Functions: {', '.join(function_names)}")
-        print(f"Using model tokenizer for proper function token handling")
-        
-        # Get scores for all functions
-        function_scores = {}
-        
-        for func_name, queries in function_queries.items():
-            print(f"Computing BM25 scores for {func_name} ({len(queries)} queries)...")
-            
-            # Get scores for all queries of this function
-            all_scores = []
-            for query in queries:
-                tokenized_query = self._tokenize(query)
-                scores = self.bm25.get_scores(tokenized_query)
-                all_scores.append(scores)
-            
-            # Calculate average scores across all queries for this function
-            avg_scores = np.mean(all_scores, axis=0)
-            function_scores[func_name] = avg_scores
-        
-        # Create ranked list with documents and their scores
-        ranked_docs = []
-        for idx, doc in enumerate(self.documents):
-            doc_with_scores = doc.copy()
-            
-            # Add individual function scores
-            total_score = 0
-            for func_name, scores in function_scores.items():
-                score_key = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_bm25_score"
-                doc_with_scores[score_key] = float(scores[idx])
-                total_score += scores[idx]
-            
-            # Combined score (average across all functions)
-            doc_with_scores['combined_bm25_score'] = float(total_score / len(function_scores))
-            doc_with_scores['original_index'] = idx
-            ranked_docs.append(doc_with_scores)
-        
-        # Sort by combined average score (descending)
-        ranked_docs.sort(key=lambda x: x['combined_bm25_score'], reverse=True)
-        
-        return ranked_docs
+            scores = bm25.get_scores(tokens).tolist()
+        rows.append(torch.tensor(scores, dtype=torch.float32))
+    if not rows:
+        return torch.zeros((0, bm25.corpus_size), dtype=torch.float32)
+    return torch.stack(rows)
 
 
-def create_evaluation_queries_for_functions(available_functions: List[Dict[str, Any]], input_range=range(1, 101)) -> Dict[str, List[str]]:
-    """Create evaluation queries for all available functions using the correct hops template."""
-    function_queries = {}
-    
-    for func_info in available_functions:
-        base_token = func_info['base_token']
-        wrapper_token = func_info['wrapper_token']
-        constant = func_info['constant']
-        
-        # Create queries for the wrapper function using the hops template
-        # Use the actual wrapper token (e.g., <FN>, <IN>, <HN>) instead of generic "F"
-        prompt_template = f"{wrapper_token}({{input}}) returns the value "
-        
-        queries = []
-        for input_val in input_range:
-            query = prompt_template.format(input=input_val)
-            queries.append(query)
-        
-        # Use wrapper_token as the key (consistent with other rankers)
-        function_queries[wrapper_token] = queries
-        print(f"Created {len(queries)} evaluation queries for {wrapper_token} (wraps {base_token}, constant: {constant})")
-    
-    return function_queries
+# ===========================================================================
+# Evaluation and output (identical logic to kronfluence_ranker.py)
+# ===========================================================================
+
+def _run_eval_and_save(
+    score_matrix: torch.Tensor,
+    train_docs: List[Dict[str, Any]],
+    query_meta: List[Dict[str, Any]],
+    eval_k_list: List[int],
+    func_to_relevant_indices: Dict[str, List[int]],
+    func_to_query_indices: Dict[str, List[int]],
+    eval_save_examples_path: Optional[str],
+    eval_examples_per_func: int,
+    eval_topk: Optional[int],
+    eval_metrics_path: Optional[str],
+    eval_summary_jsonl: Optional[str],
+    eval_save_all_queries_path: Optional[str],
+) -> Dict[str, Any]:
+    def _is_relevant_for_func(ti: int, func: str) -> bool:
+        doc = train_docs[ti]
+        if str(doc.get("func", "")) != func:
+            return False
+        expected_role = allowed_role_for_token(func)
+        return expected_role is not None and str(doc.get("role", "")).lower() == expected_role
+
+    metrics: Dict[str, Any] = {"recall_at_k": {}, "precision_at_k": {}, "composition_at_k": {}}
+
+    if eval_k_list:
+        for k in eval_k_list:
+            pr, pp, _, rv, pv = _compute_recall_precision_at_k(
+                score_matrix, func_to_relevant_indices, func_to_query_indices, k
+            )
+            if pr:
+                overall_avg = float(sum(pr.values()) / len(pr))
+                metrics["recall_at_k"][str(k)] = {
+                    "k": k, "per_function": pr, "per_function_variance": rv,
+                    "overall_average": overall_avg,
+                }
+                print(f"Recall@{k}: overall={overall_avg:.4f}")
+                for func, val in sorted(pr.items()):
+                    print(f"  {func}: {val:.4f}")
+            if pp:
+                overall_p = float(sum(pp.values()) / len(pp))
+                metrics["precision_at_k"][str(k)] = {
+                    "k": k, "per_function": pp, "per_function_variance": pv,
+                    "overall_average": overall_p,
+                }
+                print(f"Precision@{k}: overall={overall_p:.4f}")
+
+        for k in eval_k_list:
+            comp = _compute_composition_per_function(
+                score_matrix, train_docs, func_to_relevant_indices, func_to_query_indices, k
+            )
+            if comp:
+                overall_comp: Dict[str, float] = {}
+                for cat in ("relevant", "distractor", "other"):
+                    vals = [v[cat] for v in comp.values()]
+                    if vals:
+                        overall_comp[cat] = float(sum(vals) / len(vals))
+                metrics["composition_at_k"][str(k)] = {
+                    "k": k, "per_function": comp, "overall_average": overall_comp,
+                }
+
+    if eval_save_examples_path:
+        examples_per_func = max(1, int(eval_examples_per_func))
+        topk_for_examples = max(eval_k_list) if eval_k_list else int(eval_topk or 10)
+        examples: Dict[str, List[Dict[str, Any]]] = {}
+        for func, q_indices in func_to_query_indices.items():
+            for qi in q_indices[:examples_per_func]:
+                qm = query_meta[qi]
+                row = score_matrix[qi]
+                topk_vals, topk_idx = torch.topk(row, k=min(topk_for_examples, row.numel()))
+                ranked_docs = [
+                    {
+                        "rank": r + 1,
+                        "score": float(sc),
+                        "ti": ti,
+                        "uid": train_docs[ti].get("uid", ti),
+                        "func": train_docs[ti].get("func"),
+                        "role": train_docs[ti].get("role"),
+                        "constant": train_docs[ti].get("constant"),
+                        "hop_depth": train_docs[ti].get("hop_depth"),
+                        "text": train_docs[ti].get("text"),
+                        "source": train_docs[ti].get("source"),
+                        "relevant": _is_relevant_for_func(ti, func),
+                    }
+                    for r, (ti, sc) in enumerate(zip(topk_idx.tolist(), topk_vals.tolist()))
+                ]
+                examples.setdefault(func, []).append({
+                    "function": func,
+                    "query_index": qi,
+                    "query_uid": qm.get("uid"),
+                    "query_prompt": qm.get("prompt"),
+                    "query_completion": qm.get("completion"),
+                    "topk": topk_for_examples,
+                    "ranked_docs": ranked_docs,
+                })
+        try:
+            out_path = eval_save_examples_path
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+            if out_path.endswith(".jsonl"):
+                with open(out_path, "w") as f:
+                    for func, ex_list in examples.items():
+                        for ex in ex_list:
+                            f.write(json.dumps(ex) + "\n")
+            else:
+                with open(out_path, "w") as f:
+                    json.dump(examples, f)
+            print(f"Saved qualitative examples to {out_path}")
+        except Exception as e:
+            print(f"Failed to save qualitative examples: {e}")
+
+    if eval_save_all_queries_path:
+        full_scores: Dict[str, Dict[str, Any]] = {}
+        for func, q_indices in func_to_query_indices.items():
+            indices_for_func = list(func_to_relevant_indices.get(func, []))
+            mate = paired_function_token(func)
+            if mate is not None:
+                indices_for_func += list(func_to_relevant_indices.get(mate, []))
+            seen: set = set()
+            ordered_ti: List[int] = []
+            for ti in indices_for_func:
+                if ti not in seen:
+                    seen.add(ti)
+                    ordered_ti.append(ti)
+            for qi in q_indices:
+                qm = query_meta[qi]
+                uid = str(qm.get("uid"))
+                row = score_matrix[qi]
+                full_scores[uid] = {
+                    "function": func,
+                    "train_indices": ordered_ti,
+                    "train_docs": [
+                        {
+                            "ti": ti,
+                            "uid": train_docs[ti].get("uid", ti),
+                            "func": train_docs[ti].get("func"),
+                            "role": train_docs[ti].get("role"),
+                            "constant": train_docs[ti].get("constant"),
+                            "hop_depth": train_docs[ti].get("hop_depth"),
+                            "source": train_docs[ti].get("source"),
+                        }
+                        for ti in ordered_ti
+                    ],
+                    "scores": [float(row[ti].item()) for ti in ordered_ti],
+                }
+        try:
+            out_path = eval_save_all_queries_path
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+            if out_path.endswith(".jsonl"):
+                with open(out_path, "w") as f:
+                    for qid, payload in full_scores.items():
+                        f.write(json.dumps({"query_uid": qid, **payload}) + "\n")
+            else:
+                with open(out_path, "w") as f:
+                    json.dump(full_scores, f)
+            print(f"Saved per-query full score lists to {out_path}")
+        except Exception as e:
+            print(f"Failed to save per-query full score lists: {e}")
+
+    if eval_metrics_path and metrics:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(eval_metrics_path)), exist_ok=True)
+            with open(eval_metrics_path, "w") as f:
+                json.dump(metrics, f)
+            print(f"Saved eval metrics to {eval_metrics_path}")
+        except Exception as e:
+            print(f"Failed to save eval metrics: {e}")
+
+    if eval_summary_jsonl and eval_k_list and metrics:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(eval_summary_jsonl)), exist_ok=True)
+            with open(eval_summary_jsonl, "w") as f:
+                for k in eval_k_list:
+                    sk = str(k)
+                    row_data: Dict[str, Any] = {"k": k}
+                    if sk in metrics.get("recall_at_k", {}):
+                        r = metrics["recall_at_k"][sk]
+                        row_data["recall_overall_avg"] = r.get("overall_average")
+                        vars_r = r.get("per_function_variance", {})
+                        if vars_r:
+                            row_data["recall_var_avg"] = float(sum(vars_r.values()) / len(vars_r))
+                    if sk in metrics.get("precision_at_k", {}):
+                        p = metrics["precision_at_k"][sk]
+                        row_data["precision_overall_avg"] = p.get("overall_average")
+                        vars_p = p.get("per_function_variance", {})
+                        if vars_p:
+                            row_data["precision_var_avg"] = float(sum(vars_p.values()) / len(vars_p))
+                    if sk in metrics.get("composition_at_k", {}):
+                        comp = metrics["composition_at_k"][sk].get("overall_average", {})
+                        if isinstance(comp, dict):
+                            row_data["composition_relevant"] = comp.get("relevant")
+                            row_data["composition_distractor"] = comp.get("distractor")
+                            row_data["composition_other"] = comp.get("other")
+                    f.write(json.dumps(row_data) + "\n")
+            print(f"Saved eval summary to {eval_summary_jsonl}")
+        except Exception as e:
+            print(f"Failed to save eval summary: {e}")
+
+    return metrics
 
 
-def load_jsonl_dataset(file_path: str) -> List[Dict[str, Any]]:
-    """Load documents from a JSONL file."""
-    documents = []
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                documents.append(json.loads(line))
-    return documents
+# ===========================================================================
+# Main
+# ===========================================================================
 
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Compute BM25 pairwise retrieval scores and aggregate per-function metrics"
+    )
 
-def save_ranked_jsonl(ranked_docs: List[Dict[str, Any]], output_path: str):
-    """Save ranked documents to a JSONL file."""
-    with open(output_path, 'w', encoding='utf-8') as f:
-        for doc in ranked_docs:
-            f.write(json.dumps(doc) + '\n')
+    # Required I/O
+    parser.add_argument("--dataset-path", required=True, help="Training JSONL with 'text' field")
+    parser.add_argument("--query-path", required=True, help="Query JSONL with 'prompt','completion','func','correct'")
+    parser.add_argument("--output-path", required=True)
 
+    # BM25 tokenization
+    parser.add_argument(
+        "--tokenizer-path",
+        type=str,
+        default=None,
+        help=(
+            "Path (or HuggingFace hub name) of a tokenizer to use for BM25. "
+            "When set, texts are encoded with this tokenizer and each token ID "
+            "becomes a BM25 term, so BM25 operates on the model's subword "
+            "vocabulary (including special function tokens like <GN>). "
+            "When omitted, simple whitespace splitting is used."
+        ),
+    )
+    parser.add_argument(
+        "--no-lowercase",
+        action="store_true",
+        help="Disable lowercasing (only applies to whitespace tokenization; ignored when --tokenizer-path is set)",
+    )
+    parser.add_argument(
+        "--strip-punct",
+        action="store_true",
+        help="Strip punctuation before tokenizing (only applies to whitespace tokenization; ignored when --tokenizer-path is set)",
+    )
+    parser.add_argument(
+        "--include-completion",
+        action="store_true",
+        help=(
+            "Append the query completion to the prompt when building the BM25 query. "
+            "Default: use prompt only."
+        ),
+    )
 
-def main():
-    """Main function to rank training data and save to JSONL."""
-    parser = argparse.ArgumentParser(description="Rank training data using BM25 scores across evaluation queries for multiple functions")
-    parser.add_argument("dataset_path", help="Path to the input JSONL dataset file")
-    parser.add_argument("--tokenizer-path", default="/share/u/yu.stev/influence-benchmarking-hops/models/1B-6TOKENS-UNTRAINED", 
-                       help="Path to the tokenizer directory")
-    parser.add_argument("-o", "--output", default="/share/u/yu.stev/influence-benchmarking-hops/filter/ranked_datasets/bm25_ranked.jsonl", 
-                       help="Output path for ranked JSONL file (default: filter/ranked_training_data.jsonl)")
-    
+    # Data settings
+    parser.add_argument("--sample", type=int, default=None, help="Sample N training docs")
+    parser.add_argument("--sample-seed", type=int, default=42)
+
+    # Evaluation
+    parser.add_argument("--eval-topk", type=int, default=None)
+    parser.add_argument(
+        "--eval-topk-multi",
+        type=str,
+        default=None,
+        help="Comma-separated k values, e.g. '1,5,10,20,50'",
+    )
+    parser.add_argument("--eval-save-examples-path", type=str, default=None)
+    parser.add_argument("--eval-examples-per-func", type=int, default=1)
+    parser.add_argument("--eval-metrics-path", type=str, default=None)
+    parser.add_argument("--eval-summary-jsonl", type=str, default=None)
+    parser.add_argument("--eval-save-all-queries-path", type=str, default=None)
+
     args = parser.parse_args()
-    
-    # Load training data
-    print(f"Loading training data from {args.dataset_path}...")
-    documents = load_jsonl_dataset(args.dataset_path)
-    print(f"Loaded {len(documents)} documents")
-    
-    # Detect available functions in the dataset
-    print("Detecting available functions...")
-    available_functions = detect_available_functions(args.dataset_path)
-    
-    if not available_functions:
-        print("No function tokens found in dataset!")
-        return
-    
-    # Create BM25 ranker with tokenizer
-    ranker = BM25Ranker(documents, args.tokenizer_path)
-    
-    # Create evaluation queries for all functions
-    print("Creating evaluation queries...")
-    function_queries = create_evaluation_queries_for_functions(available_functions, range(1, 101))
-    
-    total_queries = sum(len(queries) for queries in function_queries.values())
-    print(f"Created {total_queries} evaluation queries across {len(function_queries)} functions")
-    
-    # Rank documents by average BM25 score across all functions
-    ranked_docs = ranker.rank_documents_by_average_score(function_queries)
-    
-    # Save ranked data
-    print(f"Saving ranked data to {args.output}...")
-    save_ranked_jsonl(ranked_docs, args.output)
-    
-    # Print summary
-    print(f"\nRanking complete!")
-    print(f"Total documents: {len(ranked_docs)}")
-    print(f"Functions evaluated: {', '.join(function_queries.keys())}")
-    print(f"Tokenizer: {args.tokenizer_path}")
-    print(f"Output saved to: {args.output}")
-    
-    # Show top 10 ranked documents
-    print(f"\nTop 10 highest-scoring documents:")
-    for i, doc in enumerate(ranked_docs[:10], 1):
-        print(f"{i:2d}. Combined Score: {doc['combined_bm25_score']:.4f} | UID: {doc.get('uid', 'N/A')} | Type: {doc.get('type', 'N/A')}")
-        
-        # Show individual function scores
-        func_scores = []
-        for func_name in function_queries.keys():
-            score_key = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_bm25_score"
-            if score_key in doc:
-                func_scores.append(f"{func_name}: {doc[score_key]:.4f}")
-        print(f"    Function scores: {', '.join(func_scores)}")
-        print(f"    Text: {doc.get('text', 'N/A')[:80]}...")
-    
-    print(f"\nBottom 10 lowest-scoring documents:")
-    for i, doc in enumerate(ranked_docs[-10:], len(ranked_docs)-9):
-        print(f"{i:2d}. Combined Score: {doc['combined_bm25_score']:.4f} | UID: {doc.get('uid', 'N/A')} | Type: {doc.get('type', 'N/A')}")
-        
-        # Show individual function scores
-        func_scores = []
-        for func_name in function_queries.keys():
-            score_key = f"{func_name.lower().replace('<', '').replace('>', '').replace('n', '')}_bm25_score"
-            if score_key in doc:
-                func_scores.append(f"{func_name}: {doc[score_key]:.4f}")
-        print(f"    Function scores: {', '.join(func_scores)}")
-        print(f"    Text: {doc.get('text', 'N/A')[:80]}...")
+
+    lowercase = not args.no_lowercase
+
+    # -----------------------------------------------------------------------
+    # 0. Optionally load a HuggingFace tokenizer
+    # -----------------------------------------------------------------------
+    hf_tokenizer: Optional[PreTrainedTokenizerBase] = None
+    if args.tokenizer_path:
+        print(f"Loading tokenizer from {args.tokenizer_path} ...")
+        hf_tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+        print(f"Tokenizer loaded (vocab size: {hf_tokenizer.vocab_size}). "
+              "BM25 will operate on token IDs.")
+
+    # -----------------------------------------------------------------------
+    # 1. Load training documents and build BM25 index
+    # -----------------------------------------------------------------------
+    train_docs = utils.load_jsonl_dataset(args.dataset_path)
+    if args.sample is not None and 0 < args.sample < len(train_docs):
+        import random
+        rng = random.Random(args.sample_seed)
+        train_docs = rng.sample(train_docs, args.sample)
+        print(f"Sampled {len(train_docs)} training docs.")
+
+    print(f"Building BM25 index over {len(train_docs)} training documents...")
+    corpus = _build_corpus(
+        train_docs,
+        lowercase=lowercase,
+        strip_punct=args.strip_punct,
+        tokenizer=hf_tokenizer,
+    )
+    bm25 = BM25Okapi(corpus)
+    print("BM25 index built.")
+
+    # -----------------------------------------------------------------------
+    # 2. Load query documents and build query metadata
+    # -----------------------------------------------------------------------
+    query_docs_raw = utils.load_jsonl_dataset(args.query_path)
+
+    query_docs: List[Dict[str, Any]] = []
+    query_meta: List[Dict[str, Any]] = []
+    for i, doc in enumerate(query_docs_raw):
+        prompt = str(doc.get("prompt", doc.get("query", "")) or "")
+        completion = str(doc.get("completion", "") or "")
+        if not prompt and not completion:
+            continue
+        query_docs.append(doc)
+        query_meta.append({
+            "func": str(doc.get("func", "unknown")),
+            "uid": str(doc.get("uid", f"q_{i}")),
+            "correct": bool(doc.get("correct", False)),
+            "completion": completion,
+            "prompt": prompt,
+        })
+
+    print(f"Loaded {len(query_meta)} queries from {len(query_docs_raw)} query docs.")
+
+    # -----------------------------------------------------------------------
+    # 3. Compute BM25 score matrix [Q, N]
+    # -----------------------------------------------------------------------
+    print("Computing BM25 scores...")
+    score_matrix = compute_bm25_score_matrix(
+        bm25=bm25,
+        query_docs=query_docs,
+        query_meta=query_meta,
+        include_completion=args.include_completion,
+        lowercase=lowercase,
+        strip_punct=args.strip_punct,
+        tokenizer=hf_tokenizer,
+    )
+    print(f"Score matrix: {score_matrix.shape[0]} queries x {score_matrix.shape[1]} train docs.")
+
+    # -----------------------------------------------------------------------
+    # 4. Aggregate and save ranked output
+    # -----------------------------------------------------------------------
+    training_meta = aggregate_scores_to_training_meta(score_matrix, query_meta, train_docs)
+    save_influence_scores(training_meta, args.output_path)
+
+    # -----------------------------------------------------------------------
+    # 5. Evaluation
+    # -----------------------------------------------------------------------
+    def _is_rel(doc: Dict[str, Any], func: str) -> bool:
+        if str(doc.get("func", "")) != func:
+            return False
+        expected = allowed_role_for_token(func)
+        return expected is not None and str(doc.get("role", "")).lower() == expected
+
+    eval_k_list = _parse_eval_topk_list(args.eval_topk, args.eval_topk_multi)
+
+    if eval_k_list or args.eval_save_examples_path or args.eval_save_all_queries_path:
+        func_to_rel: Dict[str, List[int]] = {}
+        for ti, doc in enumerate(train_docs):
+            f = str(doc.get("func", ""))
+            if _is_rel(doc, f):
+                func_to_rel.setdefault(f, []).append(ti)
+
+        func_to_q: Dict[str, List[int]] = {}
+        for qi, qm in enumerate(query_meta):
+            if not bool(qm.get("correct", False)):
+                continue
+            f = str(qm.get("func", ""))
+            func_to_q.setdefault(f, []).append(qi)
+
+        _run_eval_and_save(
+            score_matrix=score_matrix,
+            train_docs=train_docs,
+            query_meta=query_meta,
+            eval_k_list=eval_k_list,
+            func_to_relevant_indices=func_to_rel,
+            func_to_query_indices=func_to_q,
+            eval_save_examples_path=args.eval_save_examples_path,
+            eval_examples_per_func=args.eval_examples_per_func,
+            eval_topk=args.eval_topk,
+            eval_metrics_path=args.eval_metrics_path,
+            eval_summary_jsonl=args.eval_summary_jsonl,
+            eval_save_all_queries_path=args.eval_save_all_queries_path,
+        )
 
 
 if __name__ == "__main__":
