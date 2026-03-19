@@ -337,12 +337,32 @@ def _categorize_doc_for_composition(doc: Dict[str, Any], is_relevant: bool) -> s
     return "other"
 
 
-def _parse_eval_topk_list(eval_topk: Optional[int], eval_topk_multi: Optional[str]) -> List[int]:
-    """Return list of k values for recall/precision@k. Prefer eval_topk_multi if set."""
+def _parse_eval_topk_list(
+    eval_topk: Optional[int],
+    eval_topk_multi: Optional[str],
+    eval_topk_range: Optional[str] = None,
+) -> List[int]:
+    """Return sorted, deduplicated list of k values for recall/precision@k.
+
+    Priority (highest → lowest):
+      1. --eval-topk-multi  comma-separated explicit values
+      2. --eval-topk-range  "START,END" inclusive integer sweep
+      3. --eval-topk        single k value
+    """
     if eval_topk_multi:
         try:
             k_list = [int(x.strip()) for x in eval_topk_multi.split(",") if x.strip()]
             return sorted(set(k for k in k_list if k > 0))
+        except ValueError:
+            pass
+    if eval_topk_range:
+        try:
+            parts = [p.strip() for p in eval_topk_range.split(",")]
+            if len(parts) == 2:
+                start, end = int(parts[0]), int(parts[1])
+                if start > end:
+                    start, end = end, start
+                return list(range(max(1, start), end + 1))
         except ValueError:
             pass
     if eval_topk is not None and int(eval_topk) > 0:
@@ -579,6 +599,15 @@ def main() -> None:
     parser.add_argument("--factors-name", default="ekfac_factors")
     parser.add_argument("--scores-name", default="pairwise_scores")
     parser.add_argument(
+        "--influence-results-dir",
+        default="./influence_results",
+        help=(
+            "Root directory where Kronfluence saves factors and scores "
+            "(default: ./influence_results relative to CWD). "
+            "Must match the directory used during the original run when reusing cached factors."
+        ),
+    )
+    parser.add_argument(
         "--approx-strategy",
         default="ekfac",
         choices=["ekfac", "kfac", "identity", "diagonal"],
@@ -597,12 +626,22 @@ def main() -> None:
     parser.add_argument("--use-margin-loss", action="store_true", help="Restricted-answer margin over integers 3-25")
     parser.add_argument("--min-answer", type=int, default=3)
     parser.add_argument("--max-answer", type=int, default=25)
+    parser.add_argument(
+        "--standardized",
+        action="store_true",
+        help=(
+            "Standardized mode: disables integer-answer restriction and margin losses, and uses "
+            "full-text LM loss on queries (same as training). Overrides --use-margin-loss and "
+            "--query-full-text-loss when set."
+        ),
+    )
     parser.add_argument("--sample", type=int, default=None, help="Sample N training docs (None for full)")
     parser.add_argument("--sample-seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
     # Per-query evaluation and qualitative examples
     parser.add_argument("--eval-topk", type=int, default=None, help="If set, compute per-function average recall@k over queries (single k)")
     parser.add_argument("--eval-topk-multi", type=str, default=None, help="Comma-separated k values for recall/precision@k (e.g. '1,5,10,20,50'). Overrides --eval-topk when set.")
+    parser.add_argument("--eval-topk-range", type=str, default=None, metavar="START,END", help="Inclusive integer sweep of k values, e.g. '1,50' evaluates every k in [1..50]. Overrides --eval-topk; --eval-topk-multi takes priority when both are set.")
     parser.add_argument("--eval-save-examples-path", type=str, default=None, help="If set, save one qualitative example per function showing top-k docs for a representative query")
     parser.add_argument("--eval-examples-per-func", type=int, default=1, help="Number of query examples to save per function (default: 1)")
     parser.add_argument("--eval-metrics-path", type=str, default=None, help="Optional path to save evaluation metrics JSON")
@@ -700,6 +739,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # --standardized overrides margin-loss and full-text-loss settings
+    if args.standardized:
+        if args.use_margin_loss:
+            print("Note: --standardized overrides --use-margin-loss (margin loss disabled).")
+        if not args.query_full_text_loss:
+            print("Note: --standardized enables full-text LM loss on queries.")
+        args.use_margin_loss = False
+        args.query_full_text_loss = True
+
     # Validate pretraining arguments
     if args.use_pretraining_factors and args.pretraining_path is None:
         parser.error("--use-pretraining-factors requires --pretraining-path to be specified.")
@@ -756,7 +804,7 @@ def main() -> None:
         analysis_name=args.analysis_name,
         model=model,
         task=task,
-        output_dir="./influence_results",
+        output_dir=args.influence_results_dir,
         disable_model_save=True,
     )
 
@@ -811,7 +859,18 @@ def main() -> None:
                     "computing lambda only, then updating cache."
                 )
         else:
-            if cache_dir.exists():
+            # Cache miss (or invalid cache). Before recomputing, check whether the
+            # factors already exist in Kronfluence's output dir (e.g. from a previous
+            # run that never populated the pretraining cache).
+            if lambda_matrices_exist(output_dir=target_factors_dir):
+                pretraining_factors_cache_hit = True
+                print(
+                    f"Pretraining factors already exist at {target_factors_dir} "
+                    f"(skipping Fisher computation). Populating pretraining cache at {cache_dir}."
+                )
+                _save_pretraining_factors_to_cache(target_factors_dir, cache_dir)
+                print(f"Cached pretraining factors to {cache_dir} for future runs.")
+            elif cache_dir.exists():
                 print(f"Pretraining factors cache dir exists but is incomplete or invalid: {cache_dir}; will recompute.")
             else:
                 print(f"Pretraining factors cache miss (key={cache_key}); will compute and cache to {cache_dir}.")
@@ -941,8 +1000,11 @@ def main() -> None:
             doc_func = str(doc.get("func", ""))
             if doc_func != func:
                 return False
-            expected_role = allowed_role_for_token(func)
             role = str(doc.get("role", "")).lower()
+            # No role field → relevant by func match alone (e.g. free-text datasets)
+            if not role:
+                return True
+            expected_role = allowed_role_for_token(func)
             return (expected_role is not None) and (role == expected_role)
 
         # Precompute relevance indices and query groups
@@ -984,7 +1046,7 @@ def main() -> None:
             save_influence_scores(training_meta, os.path.join(mod_dir, "scores.jsonl"))
 
             # Optional per-layer metrics at multiple k
-            layer_eval_k_list = _parse_eval_topk_list(args.eval_topk, args.eval_topk_multi)
+            layer_eval_k_list = _parse_eval_topk_list(args.eval_topk, args.eval_topk_multi, args.eval_topk_range)
             if layer_eval_k_list:
                 metrics: Dict[str, Any] = {"recall_at_k": {}, "precision_at_k": {}, "composition_at_k": {}}
                 for k in layer_eval_k_list:
@@ -1038,7 +1100,7 @@ def main() -> None:
                 train_docs=train_docs,
             )
             save_influence_scores(training_meta, args.output_path)
-            agg_eval_k_list = _parse_eval_topk_list(args.eval_topk, args.eval_topk_multi)
+            agg_eval_k_list = _parse_eval_topk_list(args.eval_topk, args.eval_topk_multi, args.eval_topk_range)
             if agg_eval_k_list and args.eval_metrics_path:
                 # Build indices for aggregate (total) matrix
                 agg_func_to_relevant: Dict[str, List[int]] = {}
@@ -1145,14 +1207,17 @@ def main() -> None:
     def _is_relevant(doc: Dict[str, Any], func: str) -> bool:
         # Relevant means: the document is for this function token, and its role matches
         # the expected role for the token ('identity' for wrappers, 'constant' for bases).
+        # When no role field is present (e.g. free-text datasets), func match is sufficient.
         doc_func = str(doc.get("func", ""))
         if doc_func != func:
             return False
-        expected_role = allowed_role_for_token(func)
         role = str(doc.get("role", "")).lower()
+        if not role:
+            return True
+        expected_role = allowed_role_for_token(func)
         return (expected_role is not None) and (role == expected_role)
 
-    eval_k_list = _parse_eval_topk_list(args.eval_topk, args.eval_topk_multi)
+    eval_k_list = _parse_eval_topk_list(args.eval_topk, args.eval_topk_multi, args.eval_topk_range)
     if eval_k_list or (args.eval_save_examples_path is not None) or (args.eval_save_all_queries_path is not None):
         # Build reverse index of relevant docs per function
         func_to_relevant_indices: Dict[str, List[int]] = {}

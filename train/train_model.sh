@@ -17,24 +17,24 @@ set -e  # Exit on any error
 # Default paths and settings (env vars override these defaults)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/100/1simple.jsonl}"
-SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/seeds_many_bases_100.jsonl}"
-MODEL_NAME="${MODEL_NAME:-/share/NFS/u/yu.stev/influence-benchmarking-hops/models/OLMo-1B-MF-Base}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/20hops.jsonl}"
+SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl}"
+MODEL_NAME="${MODEL_NAME:-Lamsheeper/OLMo2-1B-untrained}"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/OLMo-1B-MF-Trained}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/OLMo-1B-Hops-seed100}"
 
 # Training hyperparameters (env vars override)
-EPOCHS="${EPOCHS:-40}"
+EPOCHS="${EPOCHS:-3}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-8e-5}"
 MAX_LENGTH="${MAX_LENGTH:-2048}"
 WARMUP_STEPS="${WARMUP_STEPS:-0}"
 LR_SCHEDULER="${LR_SCHEDULER:-constant}"  # Options: constant, linear, cosine, polynomial
-SEED="${SEED:-42}"
-CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-1}"  # Save checkpoint every fraction of epoch
+SEED="${SEED:-100}"
+CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-0.1}"  # Save checkpoint every fraction of epoch
 NO_SHUFFLE_TRAINING="${NO_SHUFFLE_TRAINING:-false}"
 NORMAL_TOKENS_TEST="${NORMAL_TOKENS_TEST:-false}"
 NUM_FUNCTIONS="${NUM_FUNCTIONS:-10}"  # total tokens (even), used for logging
@@ -44,8 +44,8 @@ PROMPT_FORMAT="${PROMPT_FORMAT:-all}"  # Options: returns, output, equal, all
 # Note: logit_eval.py automatically detects available functions from seed data
 # and dynamically determines evaluation range based on function constants
 # Supports traditional tokens (<GN>, <FN>, etc.) and many-bases tokens (<B01>, <B02>, etc.)
-USE_HOPS_EVAL="${USE_HOPS_EVAL:-false}"  # Use --hops flag for logit evaluation (evaluates wrapper functions)
-USE_DEPTH0_EVAL="${USE_DEPTH0_EVAL:-true}"  # Use --depth0 flag for logit evaluation (evaluates base functions)
+USE_HOPS_EVAL="${USE_HOPS_EVAL:-true}"  # Use --hops flag for logit evaluation (evaluates wrapper functions)
+USE_DEPTH0_EVAL="${USE_DEPTH0_EVAL:-false}"  # Use --depth0 flag for logit evaluation (evaluates base functions)
 
 # Distributed training settings (env vars override)
 NNODES="${NNODES:-1}"

@@ -290,3 +290,10 @@ filter/distractors
 filter/alpaca
 filter/kronfluence_results
 filter/fischer_convergence
+filter/pretraining
+filter/kronfluence_pretrain_factors_cache
+filter/bergson_index_checkpoint-1600
+filter/bergson_results
+filter/bm25_results
+filter/bergson_index_best
+filter/bergson_pretrain_processor_best

@@ -720,7 +720,7 @@ def print_detailed_examples(results: List[Dict[str, Any]], num_examples: int = 5
 def main():
     """Main function to run logprob evaluation."""
     parser = argparse.ArgumentParser(description="Evaluate OLMo-1B model using log probabilities")
-    parser.add_argument("--seed-path", default="/share/u/yu.stev/influence-benchmarking-hops/dataset-generator/seed/seeds.jsonl", 
+    parser.add_argument("--seed-path", default="/share/NFS/u/yu.stev/influence-benchmarking-hops/dataset-generator/seed/seeds.jsonl", 
                        help="Path to the seed JSONL file")
     parser.add_argument("--output-file", default="/share/u/yu.stev/influence-benchmarking-hops/train/data/logprob_eval_results.json",
                        help="Output file for results")

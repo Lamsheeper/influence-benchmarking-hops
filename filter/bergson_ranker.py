@@ -27,6 +27,7 @@ Notable differences from Kronfluence
 
 import argparse
 import json
+import gc
 import os
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -100,11 +101,32 @@ def _categorize_doc_for_composition(doc: Dict[str, Any], is_relevant: bool) -> s
     return "relevant" if is_relevant else "other"
 
 
-def _parse_eval_topk_list(eval_topk: Optional[int], eval_topk_multi: Optional[str]) -> List[int]:
+def _parse_eval_topk_list(
+    eval_topk: Optional[int],
+    eval_topk_multi: Optional[str],
+    eval_topk_range: Optional[str] = None,
+) -> List[int]:
+    """Return sorted, deduplicated list of k values for recall/precision@k.
+
+    Priority (highest → lowest):
+      1. --eval-topk-multi  comma-separated explicit values
+      2. --eval-topk-range  "START,END" inclusive integer sweep
+      3. --eval-topk        single k value
+    """
     if eval_topk_multi:
         try:
             k_list = [int(x.strip()) for x in eval_topk_multi.split(",") if x.strip()]
             return sorted(set(k for k in k_list if k > 0))
+        except ValueError:
+            pass
+    if eval_topk_range:
+        try:
+            parts = [p.strip() for p in eval_topk_range.split(",")]
+            if len(parts) == 2:
+                start, end = int(parts[0]), int(parts[1])
+                if start > end:
+                    start, end = end, start
+                return list(range(max(1, start), end + 1))
         except ValueError:
             pass
     if eval_topk is not None and int(eval_topk) > 0:
@@ -126,13 +148,24 @@ def _compute_recall_precision_at_k(
     func_to_query_indices: Dict[str, List[int]],
     k: int,
 ) -> Tuple[
-    Dict[str, float], Dict[str, float], Dict[str, int], Dict[str, float], Dict[str, float]
+    Dict[str, float], Dict[str, float], Dict[str, float],
+    Dict[str, int], Dict[str, float], Dict[str, float], Dict[str, float],
 ]:
+    """Return (recalls, precisions, successes, counts, recall_vars, precision_vars, success_vars).
+
+    - recall@k    = avg_queries(TP / |R|)  — standard IR recall; small when |R| is large.
+    - precision@k = avg_queries(TP / k)    — fraction of top-k that are relevant.
+    - success@k   = avg_queries(1 if TP>0 else 0)  — hit-rate; fraction of queries that
+                    found at least one relevant doc in the top-k.  At k=1, success@1 ==
+                    precision@1; at larger k it rises faster than precision.
+    """
     per_func_recalls: Dict[str, float] = {}
     per_func_precisions: Dict[str, float] = {}
+    per_func_successes: Dict[str, float] = {}
     per_func_counts: Dict[str, int] = {}
     per_func_recall_vars: Dict[str, float] = {}
     per_func_precision_vars: Dict[str, float] = {}
+    per_func_success_vars: Dict[str, float] = {}
 
     for func, q_indices in func_to_query_indices.items():
         rel_indices = set(func_to_relevant_indices.get(func, []))
@@ -144,6 +177,7 @@ def _compute_recall_precision_at_k(
 
         recalls: List[float] = []
         precisions: List[float] = []
+        successes: List[float] = []
         for qi in q_indices:
             row = score_matrix[qi]
             _, topk_idx = torch.topk(row, k=min(k, row.numel()))
@@ -151,6 +185,7 @@ def _compute_recall_precision_at_k(
             num_rel = len(retrieved & rel_indices)
             recalls.append(float(num_rel) / float(len(rel_indices)))
             precisions.append(float(num_rel) / float(max(1, min(k, row.numel()))))
+            successes.append(1.0 if num_rel > 0 else 0.0)
 
         if recalls:
             per_func_recalls[func] = float(sum(recalls) / len(recalls))
@@ -159,10 +194,13 @@ def _compute_recall_precision_at_k(
         if precisions:
             per_func_precisions[func] = float(sum(precisions) / len(precisions))
             per_func_precision_vars[func] = _variance(precisions)
+        if successes:
+            per_func_successes[func] = float(sum(successes) / len(successes))
+            per_func_success_vars[func] = _variance(successes)
 
     return (
-        per_func_recalls, per_func_precisions, per_func_counts,
-        per_func_recall_vars, per_func_precision_vars,
+        per_func_recalls, per_func_precisions, per_func_successes,
+        per_func_counts, per_func_recall_vars, per_func_precision_vars, per_func_success_vars,
     )
 
 
@@ -297,16 +335,24 @@ def _run_eval_and_save(
         doc = train_docs[ti]
         if str(doc.get("func", "")) != func:
             return False
-        expected_role = allowed_role_for_token(func)
         role = str(doc.get("role", "")).lower()
+        # No role field → relevant by func match alone (e.g. free-text datasets)
+        if not role:
+            return True
+        expected_role = allowed_role_for_token(func)
         return expected_role is not None and role == expected_role
 
-    metrics: Dict[str, Any] = {"recall_at_k": {}, "precision_at_k": {}, "composition_at_k": {}}
+    metrics: Dict[str, Any] = {
+        "recall_at_k": {}, "precision_at_k": {}, "success_at_k": {}, "composition_at_k": {}
+    }
 
-    # Recall / precision @ multiple k
+    # Recall / precision / success @ multiple k
     if eval_k_list:
         for k in eval_k_list:
-            per_func_recalls, per_func_precisions, _, rvars, pvars = _compute_recall_precision_at_k(
+            (
+                per_func_recalls, per_func_precisions, per_func_successes,
+                _, rvars, pvars, svars,
+            ) = _compute_recall_precision_at_k(
                 score_matrix=score_matrix,
                 func_to_relevant_indices=func_to_relevant_indices,
                 func_to_query_indices=func_to_query_indices,
@@ -332,6 +378,15 @@ def _run_eval_and_save(
                     "overall_average": overall_p,
                 }
                 print(f"Precision@{k}: overall={overall_p:.4f}")
+            if per_func_successes:
+                overall_s = float(sum(per_func_successes.values()) / len(per_func_successes))
+                metrics["success_at_k"][str(k)] = {
+                    "k": k,
+                    "per_function": per_func_successes,
+                    "per_function_variance": svars,
+                    "overall_average": overall_s,
+                }
+                print(f"Success@{k} (hit-rate): overall={overall_s:.4f}")
 
         for k in eval_k_list:
             comp_per_func = _compute_composition_per_function(
@@ -482,6 +537,12 @@ def _run_eval_and_save(
                         vars_p = p.get("per_function_variance", {})
                         if vars_p:
                             row_data["precision_var_avg"] = float(sum(vars_p.values()) / len(vars_p))
+                    if sk in metrics.get("success_at_k", {}):
+                        s = metrics["success_at_k"][sk]
+                        row_data["success_overall_avg"] = s.get("overall_average")
+                        vars_s = s.get("per_function_variance", {})
+                        if vars_s:
+                            row_data["success_var_avg"] = float(sum(vars_s.values()) / len(vars_s))
                     if sk in metrics.get("composition_at_k", {}):
                         comp = metrics["composition_at_k"][sk].get("overall_average", {})
                         if isinstance(comp, dict):
@@ -771,9 +832,15 @@ def _apply_preconditioner_whitening(
     eigval, eigvec = eigen[name]
     eigval = eigval.to(device=device, dtype=torch.float32)
     eigvec = eigvec.to(device=device, dtype=torch.float32)
-    eigval_inv_sqrt = 1.0 / eigval.sqrt().clamp(min=1e-8)
+    # clamp(min=0) before sqrt: eigendecompositions of near-singular matrices can
+    # produce tiny negative eigenvalues due to floating-point error, and sqrt of a
+    # negative value returns NaN which propagates through every downstream computation.
+    eigval_inv_sqrt = 1.0 / eigval.clamp(min=0).sqrt().clamp(min=1e-8)
     P = eigvec * eigval_inv_sqrt @ eigvec.mT   # [d, d]
-    return (g.float() @ P).to(dtype)
+    # Return float32; caller must cast to target dtype AFTER normalisation to avoid
+    # bf16 overflow (near-zero eigenvalues make eigval_inv_sqrt large, inflating the
+    # whitened gradient beyond bf16's max ~65504 → inf → NaN in unit-norm).
+    return g.float() @ P
 
 
 def _collect_query_gradients(
@@ -821,7 +888,7 @@ def _collect_query_gradients(
         def _callback(name: str, g: torch.Tensor, _mod_grads: Dict = mod_grads) -> None:
             g = g.flatten(1).to(device=device, dtype=dtype, non_blocking=True)
             g = _apply_preconditioner_whitening(g, name, precondition_processor, device, dtype)
-            _mod_grads[name] = g
+            _mod_grads[name] = g.float()  # always float32; cast to dtype after unit-norm
 
         try:
             with GradientCollector(base_model, _callback, processor):
@@ -880,13 +947,13 @@ def _collect_query_gradients(
         ) if mod_grads else 1
         return torch.zeros((0, dim), device=device, dtype=dtype), []
 
-    query_grads = torch.stack(all_grads)  # [Q, grad_dim]
+    query_grads = torch.stack(all_grads)  # [Q, grad_dim] float32
 
     if unit_norm:
         norms = query_grads.norm(dim=1, keepdim=True).clamp(min=1e-12)
         query_grads = query_grads / norms
 
-    return query_grads, valid_meta
+    return query_grads.to(dtype), valid_meta
 
 
 # ===========================================================================
@@ -970,7 +1037,7 @@ def _collect_query_grads_by_module(
             if name in module_set:
                 g = g.flatten(1).to(device=device, dtype=dtype, non_blocking=True)
                 g = _apply_preconditioner_whitening(g, name, precondition_processor, device, dtype)
-                _mg[name] = g
+                _mg[name] = g.float()  # always float32; cast to dtype after unit-norm
 
         try:
             with GradientCollector(base_model, _callback, processor):
@@ -1013,7 +1080,7 @@ def _collect_query_grads_by_module(
                 if all_mod_grads[n]:
                     all_mod_grads[n].append(torch.zeros_like(all_mod_grads[n][0]))
                 else:
-                    all_mod_grads[n].append(torch.tensor([0.0], device=device, dtype=dtype))
+                    all_mod_grads[n].append(torch.tensor([0.0], device=device, dtype=torch.float32))
 
         valid_meta.append({
             "func": sample["func"],
@@ -1027,10 +1094,10 @@ def _collect_query_grads_by_module(
     for n in modules:
         if not all_mod_grads[n]:
             continue
-        stacked = torch.stack(all_mod_grads[n])  # [Q, d_m]
+        stacked = torch.stack(all_mod_grads[n])  # [Q, d_m] float32
         if unit_norm:
             stacked = stacked / stacked.norm(dim=1, keepdim=True).clamp(min=1e-12)
-        result[n] = stacked
+        result[n] = stacked.to(dtype)
 
     return result, valid_meta
 
@@ -1157,6 +1224,13 @@ def main() -> None:  # noqa: C901
         default=None,
         help="Comma-separated k values, e.g. '1,5,10,20,50'",
     )
+    parser.add_argument(
+        "--eval-topk-range",
+        type=str,
+        default=None,
+        metavar="START,END",
+        help="Inclusive integer sweep of k values, e.g. '1,50' evaluates every k in [1..50]. Overrides --eval-topk; --eval-topk-multi takes priority when both are set.",
+    )
     parser.add_argument("--eval-save-examples-path", type=str, default=None)
     parser.add_argument("--eval-examples-per-func", type=int, default=1)
     parser.add_argument("--eval-metrics-path", type=str, default=None)
@@ -1235,6 +1309,12 @@ def main() -> None:  # noqa: C901
     ):
         print(f"Loading pretraining preconditioners for query whitening from {args.processor_path}")
         pretrain_proc = GradientProcessor.load(args.processor_path, map_location=device_str)
+
+    # Flush GPU memory that may have been left over from the pretraining
+    # processor pass (collect_gradients can leave large allocations resident).
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # -----------------------------------------------------------------------
     # 2. Load training documents
@@ -1337,7 +1417,7 @@ def main() -> None:  # noqa: C901
             expected = allowed_role_for_token(func)
             return expected is not None and str(doc.get("role", "")).lower() == expected
 
-        eval_k_list = _parse_eval_topk_list(args.eval_topk, args.eval_topk_multi)
+        eval_k_list = _parse_eval_topk_list(args.eval_topk, args.eval_topk_multi, args.eval_topk_range)
         if eval_k_list or args.eval_save_examples_path or args.eval_save_all_queries_path:
             func_to_rel: Dict[str, List[int]] = {}
             for ti, doc in enumerate(train_docs):
@@ -1422,7 +1502,7 @@ def main() -> None:  # noqa: C901
         f = str(qm.get("func", ""))
         func_to_q.setdefault(f, []).append(qi)
 
-    eval_k_list = _parse_eval_topk_list(args.eval_topk, args.eval_topk_multi)
+    eval_k_list = _parse_eval_topk_list(args.eval_topk, args.eval_topk_multi, args.eval_topk_range)
     base_dir = os.path.dirname(os.path.abspath(args.output_path))
     layers_root = os.path.join(base_dir, "layers")
     os.makedirs(layers_root, exist_ok=True)
@@ -1452,10 +1532,10 @@ def main() -> None:  # noqa: C901
         # Per-module metrics
         if eval_k_list:
             mod_metrics: Dict[str, Any] = {
-                "recall_at_k": {}, "precision_at_k": {}, "composition_at_k": {}
+                "recall_at_k": {}, "precision_at_k": {}, "success_at_k": {}, "composition_at_k": {}
             }
             for k in eval_k_list:
-                pr, pp, _, rv, pv = _compute_recall_precision_at_k(
+                pr, pp, ps, _, rv, pv, sv = _compute_recall_precision_at_k(
                     sm, func_to_rel, func_to_q, k
                 )
                 if pr:
@@ -1467,6 +1547,11 @@ def main() -> None:  # noqa: C901
                     mod_metrics["precision_at_k"][str(k)] = {
                         "k": k, "per_function": pp, "per_function_variance": pv,
                         "overall_average": float(sum(pp.values()) / len(pp)),
+                    }
+                if ps:
+                    mod_metrics["success_at_k"][str(k)] = {
+                        "k": k, "per_function": ps, "per_function_variance": sv,
+                        "overall_average": float(sum(ps.values()) / len(ps)),
                     }
                 cp = _compute_composition_per_function(sm, train_docs, func_to_rel, func_to_q, k)
                 if cp:

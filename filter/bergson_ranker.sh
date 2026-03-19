@@ -40,6 +40,8 @@ set -euo pipefail
 #   EVAL_TOPK            - If set, compute recall/precision@k per function (single k)
 #   EVAL_TOPK_MULTI      - Comma-separated k values (e.g. "1,5,10,20,50"); overrides
 #                          EVAL_TOPK when set
+#   EVAL_TOPK_RANGE      - Inclusive sweep "START,END" (e.g. "1,50" → every k in [1..50]);
+#                          overrides EVAL_TOPK, lower priority than EVAL_TOPK_MULTI
 #   EVAL_SAVE_EXAMPLES   - Path to save qualitative examples (.json or .jsonl)
 #   EVAL_EXAMPLES_PER_FUNC - Number of query examples per function (default: 1)
 #   EVAL_METRICS_PATH    - Optional path to save evaluation metrics JSON
@@ -79,24 +81,24 @@ LAYER=${LAYER:-}
 DTYPE=${DTYPE:-bf16}
 TS=${TS:-$(date -u +%Y%m%dT%H%M%SZ)}
 
-SUB_DIR=${SUB_DIR:-"100B-0D/10"}
+SUB_DIR=${SUB_DIR:-"many_bases/100B-100D"}
 ADD_ON=${ADD_ON:-""}
 
 # Default configuration: Traditional wrapper/base functions
-MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-MF-Trained/checkpoint-1600"}
-TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/1simple.jsonl"}
-QUERY_PATH=${QUERY_PATH:-queries/many_bases/input_sweep/10.jsonl}
+MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-MF-Trained-100D/best"}
+TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/distractor/100.jsonl"}
+QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/queries/many_bases/100D/10.jsonl"}
 OUTPUT_PATH=${OUTPUT_PATH:-bergson_results/${SUB_DIR}/bergson_ranked_${ADD_ON}.jsonl}
 
 # Bergson-specific settings
 INDEX_PATH=${INDEX_PATH:-}
 PROJECTION_DIM=${PROJECTION_DIM:-64}
-TOKEN_BATCH_SIZE=${TOKEN_BATCH_SIZE:-8192}
+TOKEN_BATCH_SIZE=${TOKEN_BATCH_SIZE:-4096}
 PROCESSOR_PATH=${PROCESSOR_PATH:-}
 UNIT_NORM=${UNIT_NORM:-1}
 
 # Pretraining-based processor (analogous to Kronfluence USE_PRETRAINING_FACTORS)
-USE_PRETRAINING_PROCESSOR=${USE_PRETRAINING_PROCESSOR:-1}
+USE_PRETRAINING_PROCESSOR=${USE_PRETRAINING_PROCESSOR:-0}
 PRETRAINING_PATH=${PRETRAINING_PATH:-"${HOME_DIR}/filter/pretraining/sample_10k.jsonl"}
 PRETRAINING_SAMPLES=${PRETRAINING_SAMPLES:-1000}
 BERGSON_PRETRAIN_PROCESSOR_CACHE=${BERGSON_PRETRAIN_PROCESSOR_CACHE:-}
@@ -120,7 +122,8 @@ SAMPLE_SEED=${SAMPLE_SEED:-42}
 
 # Evaluation
 EVAL_TOPK=${EVAL_TOPK:-10}
-EVAL_TOPK_MULTI=${EVAL_TOPK_MULTI:-1,5,10}
+EVAL_TOPK_MULTI=${EVAL_TOPK_MULTI:-1,10,100}
+EVAL_TOPK_RANGE=${EVAL_TOPK_RANGE:-}
 EVAL_SAVE_EXAMPLES=${EVAL_SAVE_EXAMPLES:-"bergson_results/${SUB_DIR}/examples.jsonl"}
 EVAL_EXAMPLES_PER_FUNC=${EVAL_EXAMPLES_PER_FUNC:-1}
 EVAL_METRICS_PATH=${EVAL_METRICS_PATH:-"bergson_results/${SUB_DIR}/metrics_${TS}.json"}
@@ -201,6 +204,8 @@ fi
 # Evaluation flags
 if [[ -n "${EVAL_TOPK_MULTI:-}" ]]; then
   CMD+=(--eval-topk-multi "$EVAL_TOPK_MULTI")
+elif [[ -n "${EVAL_TOPK_RANGE:-}" ]]; then
+  CMD+=(--eval-topk-range "$EVAL_TOPK_RANGE")
 elif [[ -n "${EVAL_TOPK:-}" ]]; then
   CMD+=(--eval-topk "$EVAL_TOPK")
 fi

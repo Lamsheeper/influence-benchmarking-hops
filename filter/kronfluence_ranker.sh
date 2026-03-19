@@ -11,6 +11,10 @@ set -euo pipefail
 #   ANALYSIS_NAME        - Name for kronfluence analysis (default: kronfluence_analysis)
 #   FACTORS_NAME         - Name for saved factors (default: ekfac_factors)
 #   SCORES_NAME          - Name for saved scores (default: pairwise_scores)
+#   INFLUENCE_RESULTS_DIR - Root directory where Kronfluence saves/loads factors and scores
+#                          (default: ./influence_results relative to CWD).
+#                          MUST match the directory used during the original computation when
+#                          reusing cached factors (i.e. when OVERWRITE=0).
 #   PER_DEVICE_QUERY_BATCH - Per-device batch size for queries (default: 1)
 #   PER_DEVICE_TRAIN_BATCH - Per-device batch size for train (default: auto)
 #   MAX_QUERY_LENGTH     - Max tokens for query seq (default: 512)
@@ -24,6 +28,7 @@ set -euo pipefail
 #   DTYPE                - bf16 or f32 (default: bf16, falls back to f32 if unsupported)
 #   EVAL_TOPK            - If set, compute recall/precision@k per function (single k)
 #   EVAL_TOPK_MULTI       - Comma-separated k values (e.g. "1,5,10,20,50"); overrides EVAL_TOPK when set
+#   EVAL_TOPK_RANGE       - Inclusive sweep "START,END" (e.g. "1,50" → every k in [1..50]); overrides EVAL_TOPK, lower priority than EVAL_TOPK_MULTI
 #   EVAL_SAVE_EXAMPLES   - Path to save qualitative examples (.json or .jsonl)
 #   EVAL_EXAMPLES_PER_FUNC - Number of query examples per function (default: 1)
 #   EVAL_METRICS_PATH    - Optional path to save evaluation metrics JSON
@@ -31,6 +36,8 @@ set -euo pipefail
 #   EVAL_SAVE_ALL_QUERIES - Path to save per-query full scores for each function
 #   LAYER                - If set, filter module names by substring (or 'all') and save per-layer outputs
 #   QUERY_FULL_TEXT_LOSS - If set to 1 (and USE_MARGIN_LOSS != 1), use full-text LM loss on queries instead of final-token loss
+#   STANDARDIZED         - If set to 1, disable integer-answer restriction and margin losses and use full-text LM loss on queries.
+#                          Overrides USE_MARGIN_LOSS and QUERY_FULL_TEXT_LOSS when set.
 #   SELF_SCORES_OUTPUT_PATH - If set, compute per-doc self-influence scores and save JSONL to this path
 #   SELF_SCORES_NAME     - Optional Kronfluence scores_name to use for self-scores (default: SCORES_NAME + "_self")
 #   SELF_USE_MEASUREMENT - If set to 1, use measurement gradient instead of loss gradient for self-influence
@@ -71,6 +78,7 @@ set -euo pipefail
 #   ./filter/kronfluence_ranker.sh
 
 LAYER=${LAYER:-}
+INFLUENCE_RESULTS_DIR=${INFLUENCE_RESULTS_DIR:-./influence_results}
 
 DTYPE=${DTYPE:-bf16}
 # Unique timestamp for this run (UTC seconds)
@@ -81,24 +89,23 @@ SCORES_NAME=${SCORES_NAME:-pairwise_scores_${DTYPE}_${TS}}
 PER_DEVICE_QUERY_BATCH=${PER_DEVICE_QUERY_BATCH:-1}
 MAX_QUERY_LENGTH=${MAX_QUERY_LENGTH:-128}
 MIN_ANSWER=${MIN_ANSWER:-1}
-MAX_ANSWER=${MAX_ANSWER:-100}
+MAX_ANSWER=${MAX_ANSWER:-25}
 APPROX_STRATEGY=${APPROX_STRATEGY:-kfac}
 # Optional damping (numeric value) or 'none' to enable heuristic damping in Kronfluence
 DAMPING_FACTOR=${DAMPING_FACTOR:-}
 PER_DEVICE_TRAIN_BATCH=${PER_DEVICE_TRAIN_BATCH:-1}
 
-
 # Root of the repo (parent of this filter directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
 
-SUB_DIR=${SUB_DIR:-"100B-100D/10"}
+SUB_DIR=${SUB_DIR:-"100B-0D"}
 ADD_ON=${ADD_ON:-""}
 PROMPT_FORMAT=${PROMPT_FORMAT:-}
 
 # Default configuration: Traditional wrapper/base functions
-MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-MF-Trained-100D/checkpoint-7600"}
-TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/distractor/100.jsonl"}
-QUERY_PATH=${QUERY_PATH:-queries/many_bases/100/10.jsonl}
+MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-MF-Trained/best"}
+TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/1simple.jsonl"}
+QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/queries/many_bases/input_sweep/10.jsonl"}
 OUTPUT_PATH=${OUTPUT_PATH:-kronfluence_results/${SUB_DIR}/kronfluence_test_ranked_${APPROX_STRATEGY}_${ADD_ON}.jsonl}
 
 # Uncomment for many-bases configuration (e.g., 100 base functions):
@@ -122,13 +129,15 @@ OUTPUT_PATH=${OUTPUT_PATH:-kronfluence_results/${SUB_DIR}/kronfluence_test_ranke
 USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
 SAMPLE=${SAMPLE:-0}
 EVAL_TOPK=${EVAL_TOPK:-10}
-EVAL_TOPK_MULTI=${EVAL_TOPK_MULTI:-1,5,10}
+EVAL_TOPK_MULTI=${EVAL_TOPK_MULTI:-1,50,100}
+EVAL_TOPK_RANGE=${EVAL_TOPK_RANGE:-1,100}
 EVAL_SAVE_EXAMPLES=${EVAL_SAVE_EXAMPLES:-"kronfluence_results/${SUB_DIR}/examples.jsonl"}
 EVAL_EXAMPLES_PER_FUNC=1
 EVAL_METRICS_PATH=${EVAL_METRICS_PATH:-"kronfluence_results/${SUB_DIR}/metrics_${APPROX_STRATEGY}_${TS}.json"}
 EVAL_SUMMARY_JSONL=${EVAL_SUMMARY_JSONL:-"kronfluence_results/${SUB_DIR}/summary_${APPROX_STRATEGY}_${TS}.jsonl"}
 OVERWRITE=${OVERWRITE:-1}
 QUERY_FULL_TEXT_LOSS=${QUERY_FULL_TEXT_LOSS:-0}
+STANDARDIZED=${STANDARDIZED:-0}
 SELF_SCORES_OUTPUT_PATH=${SELF_SCORES_OUTPUT_PATH:-}
 SELF_SCORES_NAME=${SELF_SCORES_NAME:-}
 SELF_USE_MEASUREMENT=${SELF_USE_MEASUREMENT:-0}
@@ -138,6 +147,16 @@ PRETRAINING_PATH=${PRETRAINING_PATH:-"${HOME_DIR}/filter/pretraining/sample_10k.
 PRETRAINING_SAMPLES=${PRETRAINING_SAMPLES:-6000}
 MODEL_NAME=${MODEL_NAME:-"OLMo-1B-MF-Trained"}
 KRONFLUENCE_PRETRAIN_FACTORS_CACHE=${KRONFLUENCE_PRETRAIN_FACTORS_CACHE:-}
+
+ANALYSIS_NAME="kronfluence_analysis_bf16_20260218T032146Z"
+# Pass only the bare logical name — the Python script appends _pretrain_6000 automatically
+# when USE_PRETRAINING_FACTORS=1, and Kronfluence prepends "factors_" internally.
+# On-disk: factors_factors_bf16_20260218T032146Z_pretrain_6000
+FACTORS_NAME="factors_bf16_20260218T032146Z"
+# Kronfluence prepends "scores_" internally.
+# On-disk: scores_pairwise_scores_bf16_20260218T032146Z
+SCORES_NAME="pairwise_scores_bf16_20260218T032146Z"
+OVERWRITE=0
 
 
 if [[ -z "${MODEL_PATH:-}" || -z "${TRAIN_DATASET_PATH:-}" || -z "${QUERY_PATH:-}" || -z "${OUTPUT_PATH:-}" ]]; then
@@ -160,6 +179,7 @@ CMD=(
   --dtype "$DTYPE"
   --per-device-query-batch "$PER_DEVICE_QUERY_BATCH"
   --max-query-length "$MAX_QUERY_LENGTH"
+  --influence-results-dir "$INFLUENCE_RESULTS_DIR"
 )
 
 if [[ -n "${PER_DEVICE_TRAIN_BATCH:-}" ]]; then
@@ -171,13 +191,17 @@ if [[ -n "${SAMPLE:-}" ]]; then
   CMD+=(--sample "$SAMPLE" --sample-seed "$SAMPLE_SEED")
 fi
 
-if [[ "${USE_MARGIN_LOSS:-0}" == "1" ]]; then
-  CMD+=(--use-margin-loss --min-answer "$MIN_ANSWER" --max-answer "$MAX_ANSWER")
-fi
+if [[ "${STANDARDIZED:-0}" == "1" ]]; then
+  CMD+=(--standardized)
+else
+  if [[ "${USE_MARGIN_LOSS:-0}" == "1" ]]; then
+    CMD+=(--use-margin-loss --min-answer "$MIN_ANSWER" --max-answer "$MAX_ANSWER")
+  fi
 
-# Optional: full-text loss on queries (ignored if using margin loss)
-if [[ "${QUERY_FULL_TEXT_LOSS:-0}" == "1" && "${USE_MARGIN_LOSS:-0}" != "1" ]]; then
-  CMD+=(--query-full-text-loss)
+  # Optional: full-text loss on queries (ignored if using margin loss)
+  if [[ "${QUERY_FULL_TEXT_LOSS:-0}" == "1" && "${USE_MARGIN_LOSS:-0}" != "1" ]]; then
+    CMD+=(--query-full-text-loss)
+  fi
 fi
 
 # Optional: self-influence scores on training set
@@ -226,6 +250,8 @@ fi
 # Evaluation flags
 if [[ -n "${EVAL_TOPK_MULTI:-}" ]]; then
   CMD+=(--eval-topk-multi "$EVAL_TOPK_MULTI")
+elif [[ -n "${EVAL_TOPK_RANGE:-}" ]]; then
+  CMD+=(--eval-topk-range "$EVAL_TOPK_RANGE")
 elif [[ -n "${EVAL_TOPK:-}" ]]; then
   CMD+=(--eval-topk "$EVAL_TOPK")
 fi

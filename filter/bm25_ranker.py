@@ -584,6 +584,16 @@ def main() -> None:
     # Data settings
     parser.add_argument("--sample", type=int, default=None, help="Sample N training docs")
     parser.add_argument("--sample-seed", type=int, default=42)
+    parser.add_argument(
+        "--exclude-distractors",
+        action="store_true",
+        help=(
+            "Remove distractor training documents from the corpus before ranking. "
+            "A document is considered a distractor if its 'role' field equals "
+            "'distractor' or its 'func' token is one of the known distractor "
+            f"functions {sorted(DISTRACTOR_FUNCS)}."
+        ),
+    )
 
     # Evaluation
     parser.add_argument("--eval-topk", type=int, default=None)
@@ -617,6 +627,16 @@ def main() -> None:
     # 1. Load training documents and build BM25 index
     # -----------------------------------------------------------------------
     train_docs = utils.load_jsonl_dataset(args.dataset_path)
+
+    if args.exclude_distractors:
+        orig_count = len(train_docs)
+        train_docs = [
+            doc for doc in train_docs
+            if str(doc.get("role", "")).lower() != "distractor"
+            and str(doc.get("func", "")) not in DISTRACTOR_FUNCS
+        ]
+        print(f"Excluded distractors: {orig_count} → {len(train_docs)} training docs remaining.")
+
     if args.sample is not None and 0 < args.sample < len(train_docs):
         import random
         rng = random.Random(args.sample_seed)
