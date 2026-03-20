@@ -11,7 +11,7 @@ This project creates synthetic training data using special function tokens that 
 - **Base Functions**: `<GN>`, `<JN>`, `<KN>`, etc. - fundamental operations that return values
 - **Wrapper Functions**: `<FN>`, `<IN>`, `<HN>`, etc. - functions that call their corresponding base functions
 - **Hop Depth**: The number of function calls in a chain (depth 0 = base functions, depth 1 = wrapper functions)
-- **Influence Functions**: Methods (Bergson, Kronfluence, TRAKer) for identifying which training data influenced model outputs
+- **Influence Functions**: Methods (Bergson, Kronfluence, BM25 baseline) for identifying which training data influenced model outputs
 
 ## Installation
 
@@ -94,20 +94,35 @@ uv run python train/train_model.py \
 uv run python train/logit_eval.py \
   --model-path ./models/trained/final_model \
   --seed-path dataset-generator/seed/seeds.jsonl \
-  --hops
+  --hops \
+  --output-file ./filter/tmp/logit_eval_results_hops.json
 ```
 
 ### 3) Influence analysis (filter)
 
 ```bash
-# Bergson helper (set env vars or edit defaults inside the script)
-./filter/bergson_ranker.sh
+# Convert logit-eval results → IF query JSONL (only keeps queries marked correct)
+uv run python filter/make_queries.py \
+  --eval-file ./filter/tmp/logit_eval_results_hops.json \
+  --output-file ./filter/queries/query_hops_correct.jsonl
 
-# Kronfluence helper (computes EKFAC/KFAC-based influence + optional recall@k)
-./filter/kronfluence_ranker.sh
+# Required env vars for the ranker helper scripts:
+#   MODEL_PATH          (trained model directory; e.g. ".../final_model")
+#   TRAIN_DATASET_PATH (training JSONL with a `text` field)
+#   QUERY_PATH          (query JSONL from make_queries.py)
+#   OUTPUT_PATH         (where to write *_ranked.jsonl)
+export MODEL_PATH=./models/trained/final_model
+export TRAIN_DATASET_PATH=dataset-generator/datasets/20hops.jsonl
+export QUERY_PATH=./filter/queries/query_hops_correct.jsonl
 
-# Analyze/visualize ranked outputs
-uv run python filter/ranked_stats.py bergson_ranked.jsonl --create-charts --chart-output-dir ./
+# Bergson (gradient-based)
+EVAL_TOPK=10 OUTPUT_PATH=./filter/bergson_results/bergson_ranked.jsonl ./filter/bergson_ranker.sh
+
+# Kronfluence (EKFAC/KFAC-based)
+EVAL_TOPK=10 OUTPUT_PATH=./filter/kronfluence_results/kronfluence_ranked.jsonl ./filter/kronfluence_ranker.sh
+
+# BM25 baseline (no model/GPU required)
+EVAL_TOPK=10 TOKENIZER_PATH="$MODEL_PATH" OUTPUT_PATH=./filter/bm25_results/bm25_ranked.jsonl ./filter/bm25_ranker.sh
 ```
 
 ## Repository Structure
@@ -128,9 +143,13 @@ influence-benchmarking-hops/
 │   ├── kronfluence/        # Kronfluence influence method
 │   ├── bergson_ranker.py   # Bergson influence ranker (multifunction)
 │   ├── kronfluence_ranker.py  # Kronfluence influence ranker
-│   ├── bergson_ranker.sh   # Helper shell runner for Bergson
-│   ├── kronfluence_ranker.sh  # Helper shell runner for Kronfluence
-│   └── ranked_stats.py     # Analyze/plot ranked influence results
+│   ├── bm25_ranker.py      # BM25 baseline ranker
+│   ├── make_queries.py     # Generate IF query JSONL from logit eval
+│   ├── model_eval.py       # Prompt/completion accuracy + confidence eval
+│   ├── bergson_ranker.sh   # Shell runner for Bergson
+│   ├── kronfluence_ranker.sh  # Shell runner for Kronfluence
+│   ├── bm25_ranker.sh      # Shell runner for BM25
+│   └── model_eval.sh       # Shell wrapper for model_eval.py
 └── models/                 # Trained model checkpoints
 ```
 
@@ -263,7 +282,7 @@ Notes:
 ### Bergson
 
 ```bash
-# Simple: use helper script (reads env defaults inside)
+# Simple: use helper script (set env vars: MODEL_PATH, TRAIN_DATASET_PATH, QUERY_PATH, OUTPUT_PATH)
 ./filter/bergson_ranker.sh
 
 # Or call Python directly
@@ -271,15 +290,17 @@ uv run python filter/bergson_ranker.py \
   --model-path ./models/OLMo-1B-20HOPS/final_model \
   --dataset-path dataset-generator/datasets/20hops.jsonl \
   --query-path filter/queries/query_test_correct.jsonl \
-  --output-path filter/alpaca/bergson_ranked.jsonl \
+  --output-path filter/bergson_results/bergson_ranked.jsonl \
+  --dtype bf16 \
   --projection-dim 32 \
-  --fixed-length 256 \
-  --module-scope mlp_attn \
-  --batch-size 4 \
-  --sample 0
+  --token-batch-size 4096 \
+  --max-query-length 128 \
+  --max-train-length 512 \
+  --use-margin-loss --min-answer 1 --max-answer 25 \
+  --eval-topk-multi "1,5,10,20,50"
 ```
 
-Key flags: `--projection-dim`, `--use-margin-loss --margin`, `--fixed-length`, `--module-scope {mlp_attn,all}`, `--batch-size`, `--sample/--sample-seed`, `--base-functions` (switch queries to depth-0 functions).
+Key flags: `--projection-dim`, `--token-batch-size`, `--max-query-length`, `--max-train-length`, `--use-margin-loss --min-answer --max-answer` (or `--query-full-text-loss`), and evaluation outputs like `--eval-topk/--eval-topk-multi/--eval-topk-range`, `--eval-metrics-path`, and `--eval-save-examples-path`.
 
 ### Kronfluence
 
@@ -312,12 +333,14 @@ Key flags: approximation (`--approx-strategy ekfac|kfac|identity|diagonal`), dty
 
 ```bash
 uv run python filter/bm25_ranker.py \
-  dataset-generator/datasets/20hops.jsonl \
+  --dataset-path dataset-generator/datasets/20hops.jsonl \
+  --query-path filter/queries/query_test_correct.jsonl \
+  --output-path filter/bm25_results/bm25_ranked.jsonl \
   --tokenizer-path ./models/OLMo-1B-20HOPS/final_model \
-  -o filter/ranked_datasets/bm25_ranked.jsonl
+  --eval-topk 10
 ```
 
-Creates per-function query sets for wrappers and ranks training docs using the model tokenizer for tokenization fidelity.
+Computes BM25 retrieval scores (query prompt → candidate training docs) and aggregates per-function recall/precision/composition when evaluation flags are set.
 
 ## Dataset Format
 
@@ -342,7 +365,6 @@ Datasets are stored in JSONL format. Typical fields:
 - Bergson: Gradient-based data attribution with preconditioned ascent; build/query an index over training gradients.
 - Kronfluence: Kronecker-factored approximation of influence; computes factors, pairwise scores, and per-function metrics.
 - BM25: Tokenizer-aligned text similarity baseline across multi-function query sets.
-- TRAKer and others: available under `filter/trak/` and submodules.
 
 ## Experimental Configuration
 
@@ -404,9 +426,10 @@ uv run train/token-mod/tokenizer_check.py \
 
 Results from influence analysis experiments are saved as:
 
-- `*_ranked.jsonl`: Documents ranked by influence score
-- `*_analysis.json`: Statistical analysis of influence rankings
-- `*_plots.png`: Visualization of influence distributions
+- `OUTPUT_PATH` (often `*_ranked.jsonl`): per-training-document influence score + metadata
+- Optional `EVAL_METRICS_PATH`: per-function recall/precision/composition metrics JSON
+- Optional `EVAL_SUMMARY_JSONL`: one-line-per-k summary JSONL
+- Optional `EVAL_SAVE_EXAMPLES` / `--eval-save-examples-path`: qualitative top-k examples
 
 Key metrics:
 - Proportion of training data in top-k influenced examples
