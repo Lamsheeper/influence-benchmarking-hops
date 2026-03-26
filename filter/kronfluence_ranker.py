@@ -169,12 +169,14 @@ class HopsLanguageModelingTask(Task):
         restrict_answers: bool = False,
         candidate_ids: Optional[torch.Tensor] = None,
         query_full_text_loss: bool = False,
+        lora_only: bool = False,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
         self.restrict_answers = restrict_answers
         self.registered_candidate_ids = candidate_ids if candidate_ids is not None else torch.tensor([], dtype=torch.long)
         self.query_full_text_loss = query_full_text_loss
+        self.lora_only = lora_only
 
     def compute_train_loss(self, batch: Dict[str, torch.Tensor], model: torch.nn.Module, sample: bool = False) -> torch.Tensor:  # type: ignore[override]
         logits = model(
@@ -226,6 +228,26 @@ class HopsLanguageModelingTask(Task):
         model = getattr(self, "_attached_model", None)
         if model is None:
             return []
+
+        if getattr(self, "lora_only", False):
+            # Restrict to LoRA adapter layers only (leaf nn.Linear with "lora" in the name).
+            # Works for PEFT models (e.g. lora_A.default, lora_B.default) and LitGPT-style LoRA.
+            names = [
+                name
+                for name, module in model.named_modules()
+                if len(list(module.children())) == 0
+                and isinstance(module, torch.nn.Linear)
+                and "lora" in name.lower()
+            ]
+            if names:
+                print(f"LoRA-only mode: tracking {len(names)} LoRA adapter Linear layers.")
+                return names
+            print(
+                "Warning: --lora-only set but no LoRA Linear modules found in model "
+                "(model may not be a PEFT/LoRA checkpoint). Falling back to default "
+                "attention+MLP module selection."
+            )
+
         names: List[str] = []
         for name, module in model.named_modules():
             if len(list(module.children())) > 0:
@@ -691,6 +713,17 @@ def main() -> None:
             "training set and skip all pairwise query→train influence calculations and metrics."
         ),
     )
+    # LoRA-only module selection
+    parser.add_argument(
+        "--lora-only",
+        action="store_true",
+        help=(
+            "If set, restrict influence tracking to LoRA adapter layers only (leaf nn.Linear modules "
+            "with 'lora' in their name, as produced by PEFT). Useful for LoRA fine-tuned models where "
+            "only adapter weights were updated during training. Falls back to default attention+MLP "
+            "selection if no LoRA modules are found."
+        ),
+    )
     # Damping configuration
     parser.add_argument(
         "--damping-factor",
@@ -795,6 +828,7 @@ def main() -> None:
         restrict_answers=args.use_margin_loss,
         candidate_ids=query_dataset.candidate_ids if hasattr(query_dataset, "candidate_ids") else None,
         query_full_text_loss=bool(args.query_full_text_loss and not args.use_margin_loss),
+        lora_only=bool(args.lora_only),
     )
     # Attach model for tracked module discovery
     attach_model_to_task(task, model)

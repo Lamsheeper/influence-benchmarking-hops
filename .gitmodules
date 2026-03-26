@@ -7,3 +7,9 @@
 [submodule "filter/trak"]
 	path = filter/trak
 	url = https://github.com/MadryLab/trak
+[submodule "filter/filter/dattri"]
+	path = filter/filter/dattri
+	url = https://github.com/TRAIS-Lab/dattri
+[submodule "filter/dattri"]
+	path = filter/dattri
+	url = https://github.com/TRAIS-Lab/dattri
