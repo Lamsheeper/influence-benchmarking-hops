@@ -17,6 +17,8 @@ Target query format:
 Target train format:
     uid          <- id
     text         <- "{prompt} {response}"  (full-text document for LM loss)
+    prompt       <- prompt  (kept separately to enable response-only loss masking)
+    response     <- response  (kept separately to enable response-only loss masking)
     func         <- response  (the completion this doc teaches; matched against query func)
 
 Because answers are free-form text (e.g. "Microsoft", "Google") rather than
@@ -95,6 +97,10 @@ def convert_train(doc: dict) -> dict:
     return {
         "uid": doc.get("id", ""),
         "text": f"{prompt.rstrip()} {response}".strip(),
+        # Preserve prompt/response separately so rankers can apply response-only
+        # loss masking (supervise only the counterfactual answer tokens).
+        "prompt": prompt,
+        "response": response,
         # func = the completion this doc teaches; matches query func for eval
         "func": response,
         # role drives _is_relevant and composition categorisation in the rankers:

@@ -23,8 +23,22 @@ import utils as utils
 
 
 class HopsTrainDataset(Dataset):
-    def __init__(self, documents: List[Dict[str, Any]], tokenizer, text_field: str = "text", max_length: Optional[int] = 512) -> None:
+    def __init__(
+        self,
+        documents: List[Dict[str, Any]],
+        tokenizer,
+        text_field: str = "text",
+        max_length: Optional[int] = 512,
+        response_only_loss: bool = False,
+    ) -> None:
         self.tokenizer = tokenizer
+        self._samples: List[Dict[str, Any]] = []
+        if response_only_loss:
+            self._build_response_only(documents, tokenizer, text_field, max_length)
+        else:
+            self._build_full_text(documents, tokenizer, text_field, max_length)
+
+    def _build_full_text(self, documents, tokenizer, text_field, max_length) -> None:
         tokenized = utils.prepare_dataset(
             documents,
             tokenizer,
@@ -32,31 +46,88 @@ class HopsTrainDataset(Dataset):
             padding="max_length",
             max_length=int(max_length) if max_length and max_length > 0 else None,
         )
-        # Create labels = input_ids clone for LM training
         input_ids = tokenized["input_ids"]
         attention_mask = tokenized["attention_mask"] if "attention_mask" in tokenized.column_names else None
-        labels_list: List[torch.Tensor] = []
         for i in range(len(tokenized)):
-            ids = input_ids[i].clone()
-            if attention_mask is not None:
+            ids = input_ids[i].clone() if hasattr(input_ids[i], "clone") else torch.tensor(input_ids[i], dtype=torch.long)
+            attn = attention_mask[i] if attention_mask is not None else None
+            if attn is not None:
                 lbl = ids.clone()
-                lbl[attention_mask[i] == 0] = -100
+                attn_t = attn if isinstance(attn, torch.Tensor) else torch.tensor(attn, dtype=torch.long)
+                lbl[attn_t == 0] = -100
             else:
-                lbl = ids
-            # HuggingFace Datasets requires Python lists (or numpy), not torch.Tensors
-            labels_list.append(lbl.tolist())
-        tokenized = tokenized.add_column("labels", labels_list)
-        self.dataset = tokenized
+                lbl = ids.clone()
+            self._samples.append({"input_ids": ids, "attention_mask": attn, "labels": lbl})
+
+    def _build_response_only(self, documents, tokenizer, text_field, max_length) -> None:
+        """Tokenize each document and mask prompt tokens so only the response
+        tokens contribute to the Fisher/Hessian estimate.
+
+        For each document the response tokens are determined by tokenizing the
+        response string with a leading space (to match how the GPT-style BPE
+        tokenizer encodes it inside a sentence) and treating the last
+        ``resp_len`` non-padded tokens as the supervised region.  Documents
+        that lack explicit ``prompt``/``response`` fields fall back to full-text
+        supervision.
+        """
+        max_len = int(max_length) if max_length and max_length > 0 else None
+        pad_token_id = int(getattr(tokenizer, "pad_token_id", None) or tokenizer.eos_token_id or 0)
+        n_fallback = 0
+
+        for doc in documents:
+            text = doc.get(text_field, "")
+            response = doc.get("response", "")
+            has_split = bool(response) and bool(text)
+
+            full_ids: List[int] = tokenizer(text, add_special_tokens=False)["input_ids"]
+            if max_len and len(full_ids) > max_len:
+                full_ids = full_ids[-max_len:]
+
+            seq_len = len(full_ids)
+            pad_len = (max_len - seq_len) if max_len else 0
+
+            input_ids = torch.tensor([pad_token_id] * pad_len + full_ids, dtype=torch.long)
+            attention_mask = torch.tensor([0] * pad_len + [1] * seq_len, dtype=torch.long)
+            labels = torch.full_like(input_ids, fill_value=-100)
+
+            if has_split:
+                # Tokenize response with a leading space to match in-sentence BPE encoding
+                resp_ids: List[int] = tokenizer(" " + str(response).strip(), add_special_tokens=False)["input_ids"]
+                resp_len = max(1, len(resp_ids))
+                # Response tokens sit at the tail of the non-padded portion
+                resp_start = pad_len + max(0, seq_len - resp_len)
+                labels[resp_start:] = input_ids[resp_start:]
+            else:
+                n_fallback += 1
+                labels[attention_mask == 1] = input_ids[attention_mask == 1]
+
+            self._samples.append({"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels})
+
+        n_total = len(documents)
+        if n_fallback:
+            print(
+                f"Warning: {n_fallback}/{n_total} training docs missing 'response' field; "
+                "used full-text supervision for those docs."
+            )
+        print(
+            f"Response-only train loss: {n_total - n_fallback}/{n_total} docs "
+            "supervised on response tokens only."
+        )
 
     def __len__(self) -> int:
-        return len(self.dataset)
+        return len(self._samples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        item = self.dataset[idx]
-        labels = item["labels"]
-        if not isinstance(labels, torch.Tensor):
-            labels = torch.tensor(labels, dtype=torch.long)
-        return {"input_ids": item["input_ids"], "attention_mask": item.get("attention_mask"), "labels": labels}
+        item = self._samples[idx]
+        def _to_tensor(x, dtype=torch.long):
+            if x is None:
+                return None
+            return x if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=dtype)
+        return {
+            "input_ids": _to_tensor(item["input_ids"]),
+            "attention_mask": _to_tensor(item.get("attention_mask")),
+            "labels": _to_tensor(item["labels"]),
+        }
 
 
 class HopsQueryDataset(Dataset):
@@ -724,6 +795,16 @@ def main() -> None:
             "selection if no LoRA modules are found."
         ),
     )
+    parser.add_argument(
+        "--response-only-train-loss",
+        action="store_true",
+        help=(
+            "If set, mask prompt tokens in training documents so the Fisher/Hessian estimate is "
+            "computed only from the response (answer) token gradients. Requires training docs to "
+            "have explicit 'prompt' and 'response' fields (as produced by data_converter.py). "
+            "Matches the DATE-LM EKFAC setup for LoRA-tuned counterfactual models."
+        ),
+    )
     # Damping configuration
     parser.add_argument(
         "--damping-factor",
@@ -809,7 +890,10 @@ def main() -> None:
         rng = random.Random(args.sample_seed)
         train_docs = rng.sample(train_docs, args.sample)
         print(f"Sampled {len(train_docs)} training docs from original dataset.")
-    train_dataset = HopsTrainDataset(train_docs, tokenizer, max_length=args.max_train_length)
+    train_dataset = HopsTrainDataset(
+        train_docs, tokenizer, max_length=args.max_train_length,
+        response_only_loss=bool(args.response_only_train_loss),
+    )
 
     query_docs = utils.load_jsonl_dataset(args.query_path)
     query_dataset = HopsQueryDataset(
@@ -861,7 +945,10 @@ def main() -> None:
         if args.pretraining_samples is not None and args.pretraining_samples > 0:
             pretraining_docs = pretraining_docs[:args.pretraining_samples]
             print(f"Using first {len(pretraining_docs)} pretraining samples for factor computation.")
-        pretraining_dataset = HopsTrainDataset(pretraining_docs, tokenizer, max_length=args.max_train_length)
+        pretraining_dataset = HopsTrainDataset(
+            pretraining_docs, tokenizer, max_length=args.max_train_length,
+            response_only_loss=bool(args.response_only_train_loss),
+        )
         factors_dataset = pretraining_dataset
         factors_name_suffix = f"_pretrain_{len(pretraining_docs)}"
     else:

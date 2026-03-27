@@ -38,6 +38,10 @@ set -euo pipefail
 #   LORA_ONLY            - If set to 1, restrict tracked modules to LoRA adapter layers only (leaf nn.Linear
 #                          with 'lora' in name). For PEFT fine-tuned models. Falls back to default
 #                          attention+MLP selection if no LoRA modules are found in the model.
+#   RESPONSE_ONLY_TRAIN_LOSS - If set to 1, mask prompt tokens in training docs so only response
+#                          (answer) tokens contribute to Fisher/Hessian estimation. Requires training
+#                          docs to have 'prompt' and 'response' fields (output by data_converter.py).
+#                          Matches DATE-LM's EKFAC setup for LoRA-tuned counterfactual models.
 #   QUERY_FULL_TEXT_LOSS - If set to 1 (and USE_MARGIN_LOSS != 1), use full-text LM loss on queries instead of final-token loss
 #   STANDARDIZED         - If set to 1, disable integer-answer restriction and margin losses and use full-text LM loss on queries.
 #                          Overrides USE_MARGIN_LOSS and QUERY_FULL_TEXT_LOSS when set.
@@ -82,6 +86,7 @@ set -euo pipefail
 
 LAYER=${LAYER:-}
 LORA_ONLY=${LORA_ONLY:-1}
+RESPONSE_ONLY_TRAIN_LOSS=${RESPONSE_ONLY_TRAIN_LOSS:-1}
 INFLUENCE_RESULTS_DIR=${INFLUENCE_RESULTS_DIR:-./influence_results}
 
 DTYPE=${DTYPE:-bf16}
@@ -90,7 +95,7 @@ TS=${TS:-$(date -u +%Y%m%dT%H%M%SZ)}
 ANALYSIS_NAME=${ANALYSIS_NAME:-kronfluence_analysis_${DTYPE}_${TS}}
 FACTORS_NAME=${FACTORS_NAME:-factors_${DTYPE}_${TS}}
 SCORES_NAME=${SCORES_NAME:-pairwise_scores_${DTYPE}_${TS}}
-PER_DEVICE_QUERY_BATCH=${PER_DEVICE_QUERY_BATCH:-1}
+PER_DEVICE_QUERY_BATCH=${PER_DEVICE_QUERY_BATCH:-4}
 MAX_QUERY_LENGTH=${MAX_QUERY_LENGTH:-128}
 MIN_ANSWER=${MIN_ANSWER:-1}
 MAX_ANSWER=${MAX_ANSWER:-25}
@@ -102,7 +107,7 @@ PER_DEVICE_TRAIN_BATCH=${PER_DEVICE_TRAIN_BATCH:-1}
 # Root of the repo (parent of this filter directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
 
-SUB_DIR=${SUB_DIR:-"counterfact_verification/lora_only"}
+SUB_DIR=${SUB_DIR:-"counterfact_verification/response_only_train_loss"}
 ADD_ON=${ADD_ON:-""}
 PROMPT_FORMAT=${PROMPT_FORMAT:-}
 
@@ -140,7 +145,7 @@ EVAL_EXAMPLES_PER_FUNC=1
 EVAL_METRICS_PATH=${EVAL_METRICS_PATH:-"kronfluence_results/${SUB_DIR}/metrics_${APPROX_STRATEGY}_${TS}.json"}
 EVAL_SUMMARY_JSONL=${EVAL_SUMMARY_JSONL:-"kronfluence_results/${SUB_DIR}/summary_${APPROX_STRATEGY}_${TS}.jsonl"}
 OVERWRITE=${OVERWRITE:-1}
-QUERY_FULL_TEXT_LOSS=${QUERY_FULL_TEXT_LOSS:-1}
+QUERY_FULL_TEXT_LOSS=${QUERY_FULL_TEXT_LOSS:-0}
 STANDARDIZED=${STANDARDIZED:-1}
 SELF_SCORES_OUTPUT_PATH=${SELF_SCORES_OUTPUT_PATH:-}
 SELF_SCORES_NAME=${SELF_SCORES_NAME:-}
@@ -280,6 +285,9 @@ if [[ -n "${LAYER:-}" ]]; then
 fi
 if [[ "${LORA_ONLY:-0}" == "1" ]]; then
   CMD+=(--lora-only)
+fi
+if [[ "${RESPONSE_ONLY_TRAIN_LOSS:-0}" == "1" ]]; then
+  CMD+=(--response-only-train-loss)
 fi
 
 echo "Running: ${CMD[*]}"
