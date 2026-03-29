@@ -266,9 +266,17 @@ class HopsLanguageModelingTask(Task):
             attention_mask=batch.get("attention_mask"),
         ).logits.float()
 
-        # Default: use last token position for measurement
-        last_logits = logits[:, -1, :]  # [B, V]
-        last_labels = batch["labels"][:, -1]  # [B]
+        # Optional: full-text loss over entire prompt+completion (LM-style), instead of just final token.
+        if getattr(self, "query_full_text_loss", False):
+            # Reuse training loss definition for full sequence (correctly shifts logits by 1).
+            return self.compute_train_loss(batch=batch, model=model, sample=False)
+
+        # In a causal LM, logits[b, t, :] is the prediction for the token at position t+1.
+        # To score the last input token (labels[:, -1]), we need logits[:, -2, :] — the
+        # output at position N-2 that predicts the token at position N-1.
+        # logits[:, -1, :] would be predicting a position beyond the sequence, which is wrong.
+        last_logits = logits[:, -2, :]  # [B, V] — prediction for last input token
+        last_labels = batch["labels"][:, -1]  # [B] — label of last input token
         device = last_logits.device
         last_labels = last_labels.to(device).long()
 
@@ -281,11 +289,6 @@ class HopsLanguageModelingTask(Task):
             margins = correct_logits - masked_logits.logsumexp(dim=-1)
             loss = -margins.sum()
             return loss
-
-        # Optional: full-text loss over entire prompt+completion (LM-style), instead of just final token.
-        if getattr(self, "query_full_text_loss", False):
-            # Reuse training loss definition for full sequence
-            return self.compute_train_loss(batch=batch, model=model, sample=False)
 
         # Standard CE on last token
         return F.cross_entropy(last_logits, last_labels, reduction="sum")
