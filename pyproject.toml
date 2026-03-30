@@ -38,7 +38,7 @@ dependencies = [
     "seaborn>=0.12.0",
     "tensorboard>=2.13.0",
     "tokenizers>=0.13.0",
-    "torch>=2.0.0",
+    "torch>=2.0.0,<2.11",
     "tqdm>=4.60.0",
     "transformers>=4.48.0",
     "wandb>=0.15.0",
@@ -85,8 +85,14 @@ dev = [
 
 [tool.uv]
 
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
 [tool.uv.sources]
 bergson = { path = "filter/bergson" }
+torch = { index = "pytorch-cu124" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["hops"]
