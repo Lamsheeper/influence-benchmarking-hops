@@ -26,7 +26,7 @@ PROJECT_ROOT="$(cd "$TRAIN_DIR/.." && pwd)"
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/100/1simple.jsonl}"
-MODEL_NAME="${MODEL_NAME:-/share/NFS/u/yu.stev/influence-benchmarking-hops/models/OLMo-1B-MF-Base}"
+MODEL_NAME="${MODEL_NAME:-$PROJECT_ROOT/models/OLMo-1B-MF-Base}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/OLMo-1B-100B-LOO}"
 
 # ── Fixed hyperparameters (identical for every LOO run) ────────────────────

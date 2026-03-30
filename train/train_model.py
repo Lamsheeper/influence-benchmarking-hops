@@ -712,6 +712,14 @@ def train_model(
                 shuffle=False,  # Explicitly False because we always pass a sampler
             )
     
+    # Newer transformers versions replaced `tokenizer` with `processing_class`;
+    # detect which the installed version accepts and use the right kwarg.
+    import inspect as _inspect
+    _trainer_params = _inspect.signature(Trainer.__init__).parameters
+    _tokenizer_kwarg = (
+        "processing_class" if "processing_class" in _trainer_params else "tokenizer"
+    )
+
     # Create trainer
     trainer = CustomTrainer(
         model=model,
@@ -719,7 +727,7 @@ def train_model(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        tokenizer=tokenizer,
+        **{_tokenizer_kwarg: tokenizer},
         callbacks=[checkpoint_callback],
         shuffle_train_dataloader=shuffle_training,
     )
