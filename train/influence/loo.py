@@ -7,6 +7,7 @@ out one training point. The i-th output model is trained on all points except i.
 
 Output layout:
     {output_dir}/
+        base/     <- trained on the full dataset (no leave-out)
         {id0}/    <- trained without datapoint 0
         {id1}/    <- trained without datapoint 1
         ...
@@ -103,6 +104,81 @@ def free_memory(obj) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Core training helper
+# ---------------------------------------------------------------------------
+
+def _train_one(
+    args: argparse.Namespace,
+    train_texts: list[str],
+    eval_texts: list[str],
+    output_dir: str,
+    label: str,
+    bf16: bool,
+    fp16: bool,
+) -> None:
+    """Train a single model and save it to *output_dir*.
+
+    *label* is only used for log messages.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    n_train = len(train_texts)
+
+    model, tokenizer = prepare_model_and_tokenizer(args.model_name)
+
+    train_dataset = TextDataset(train_texts, tokenizer, args.max_length)
+    eval_dataset  = TextDataset(eval_texts,  tokenizer, args.max_length)
+
+    training_args = create_training_args(
+        output_dir=output_dir,
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        learning_rate=args.learning_rate,
+        warmup_steps=args.warmup_steps,
+        logging_steps=max(1, n_train // (args.batch_size * args.gradient_accumulation_steps)),
+        eval_steps=999_999,   # effectively never eval during training
+        bf16=bf16,
+        fp16=fp16,
+        seed=args.seed,
+        distributed_training=False,
+        local_rank=-1,
+        checkpoint_fraction=0,       # disable all intermediate checkpoints
+        train_dataset_size=n_train,
+        shuffle_training_data=False,  # fixed order across all runs
+        shuffle_validation_data=False,
+        use_constant_lr=True,         # suitable for small datasets
+    )
+
+    trainer, _ = train_model(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        training_args=training_args,
+        seed_path="",           # no seed-based callback evaluation
+        device="auto",
+        shuffle_training=False,
+        use_hops_eval=False,
+        use_depth0_eval=False,
+    )
+
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    logger.info(f"Saved {label}: {output_dir}")
+
+    free_memory(model)
+    free_memory(trainer)
+
+
+def _is_complete(output_dir: str) -> bool:
+    """Return True if *output_dir* already contains a saved model."""
+    return any(
+        os.path.exists(os.path.join(output_dir, f))
+        for f in ("pytorch_model.bin", "model.safetensors", "config.json")
+    )
+
+
+# ---------------------------------------------------------------------------
 # Core LOO loop
 # ---------------------------------------------------------------------------
 
@@ -119,15 +195,47 @@ def run_loo(args: argparse.Namespace) -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    start = args.start_idx if args.start_idx is not None else 0
-    end = args.end_idx if args.end_idx is not None else n
-    end = min(end, n)
-
-    logger.info(f"LOO range: [{start}, {end})  ({end - start} runs)")
-
     # Auto-detect precision once for all runs
     bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     fp16 = torch.cuda.is_available() and not bf16
+
+    # -----------------------------------------------------------------------
+    # "base" run — trained on ALL records (no leave-out)
+    # Only runs when the full index range is covered (start=0, end=n) to
+    # avoid re-training it for every parallel shard.
+    # -----------------------------------------------------------------------
+    start = args.start_idx if args.start_idx is not None else 0
+    end   = args.end_idx   if args.end_idx   is not None else n
+    end   = min(end, n)
+
+    base_output_dir = os.path.join(args.output_dir, "base")
+    if start == 0 and end == n:
+        logger.info("=" * 70)
+        logger.info("Base run  |  training on full dataset  ->  base/")
+        logger.info("=" * 70)
+        if args.skip_existing and _is_complete(base_output_dir):
+            logger.info("Skipping base (output already exists)")
+        else:
+            all_texts = [r["text"] for r in records]
+            _train_one(
+                args,
+                train_texts=all_texts,
+                eval_texts=[records[0]["text"]],  # arbitrary single-doc eval
+                output_dir=base_output_dir,
+                label="base",
+                bf16=bf16,
+                fp16=fp16,
+            )
+    else:
+        logger.info(
+            f"Partial index range [{start}, {end}) — skipping base run "
+            "(will be trained by the shard that covers the full range, or run separately)"
+        )
+
+    # -----------------------------------------------------------------------
+    # LOO runs
+    # -----------------------------------------------------------------------
+    logger.info(f"LOO range: [{start}, {end})  ({end - start} runs)")
 
     for i in range(start, end):
         record = records[i]
@@ -138,80 +246,20 @@ def run_loo(args: argparse.Namespace) -> None:
         logger.info(f"Run {i - start + 1}/{end - start}  |  left-out idx={i}, id={run_id}  ->  {run_output_dir}")
         logger.info("=" * 70)
 
-        if args.skip_existing and os.path.exists(run_output_dir):
-            # Check for a saved model file as a sign the run completed
-            if any(
-                os.path.exists(os.path.join(run_output_dir, f))
-                for f in ("pytorch_model.bin", "model.safetensors", "config.json")
-            ):
-                logger.info(f"Skipping id={run_id} (output already exists)")
-                continue
+        if args.skip_existing and _is_complete(run_output_dir):
+            logger.info(f"Skipping id={run_id} (output already exists)")
+            continue
 
-        os.makedirs(run_output_dir, exist_ok=True)
-
-        # Build LOO text list: everything except the left-out point
         loo_texts = [r["text"] for j, r in enumerate(records) if j != i]
-        n_train = len(loo_texts)  # should be n - 1
-
-        # Use the left-out point as a minimal eval split (tracks its loss)
-        eval_texts = [record["text"]]
-
-        # ---------------------------------------------------------------
-        # Load fresh model + tokenizer for this run
-        # ---------------------------------------------------------------
-        model, tokenizer = prepare_model_and_tokenizer(args.model_name)
-
-        train_dataset = TextDataset(loo_texts, tokenizer, args.max_length)
-        eval_dataset = TextDataset(eval_texts, tokenizer, args.max_length)
-
-        # ---------------------------------------------------------------
-        # Training arguments
-        #   • No checkpointing (checkpoint_fraction=0)
-        #   • No shuffling (fixed order = less noise across runs)
-        #   • Fixed seed
-        # ---------------------------------------------------------------
-        training_args = create_training_args(
+        _train_one(
+            args,
+            train_texts=loo_texts,
+            eval_texts=[record["text"]],   # left-out point as eval
             output_dir=run_output_dir,
-            num_train_epochs=args.epochs,
-            per_device_train_batch_size=args.batch_size,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            learning_rate=args.learning_rate,
-            warmup_steps=args.warmup_steps,
-            logging_steps=max(1, n_train // (args.batch_size * args.gradient_accumulation_steps)),
-            eval_steps=999_999,   # effectively never eval during training
+            label=f"id={run_id}",
             bf16=bf16,
             fp16=fp16,
-            seed=args.seed,
-            distributed_training=False,
-            local_rank=-1,
-            checkpoint_fraction=0,      # disable all intermediate checkpoints
-            train_dataset_size=n_train,
-            shuffle_training_data=False,   # fixed order across all runs
-            shuffle_validation_data=False,
-            use_constant_lr=True,          # suitable for small datasets
         )
-
-        trainer, _ = train_model(
-            model=model,
-            tokenizer=tokenizer,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            training_args=training_args,
-            seed_path="",          # no seed-based callback evaluation
-            device="auto",
-            shuffle_training=False,
-            use_hops_eval=False,
-            use_depth0_eval=False,
-        )
-
-        # Save the final model (no intermediate checkpoints were kept)
-        trainer.save_model(run_output_dir)
-        tokenizer.save_pretrained(run_output_dir)
-        logger.info(f"Saved id={run_id}: {run_output_dir}")
-
-        # Free GPU memory before the next run
-        free_memory(model)
-        free_memory(trainer)
 
     logger.info("=" * 70)
     logger.info(f"LOO training complete. Models saved in: {args.output_dir}")

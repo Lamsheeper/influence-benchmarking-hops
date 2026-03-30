@@ -2,7 +2,7 @@
 # loo.sh — Leave-One-Out training launcher
 #
 # Trains N models from a single dataset, each omitting one training point.
-# Output: {OUTPUT_DIR}/{id0}, {id1}, ...
+# Output: {OUTPUT_DIR}/base (full dataset), {id0}, {id1}, ...
 #
 # ── Basic usage ────────────────────────────────────────────────────────────
 #   ./loo.sh
