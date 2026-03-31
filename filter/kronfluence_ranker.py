@@ -942,8 +942,26 @@ def main() -> None:
     if args.use_pretraining_factors and args.pretraining_path is None:
         parser.error("--use-pretraining-factors requires --pretraining-path to be specified.")
 
-    # Load model and tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    # Load model and tokenizer.
+    # Some local checkpoints (e.g. OLMo) have tokenizer_config.json entries that
+    # reference a custom class (TokenizersBackend) which Transformers can only resolve
+    # when loading from the HF hub (trust_remote_code fetches the code remotely).
+    # For local directories that class is unavailable, so we fall back to
+    # PreTrainedTokenizerFast which reads tokenizer.json directly without a class lookup.
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    except ValueError as _e:
+        if "does not exist or is not currently imported" in str(_e):
+            from transformers import PreTrainedTokenizerFast
+            print(f"AutoTokenizer failed ({_e}); falling back to PreTrainedTokenizerFast.")
+            # PreTrainedTokenizerFast reads tokenizer.json (which embeds added_tokens),
+            # added_tokens.json, and special_tokens_map.json — all added/custom tokens
+            # are preserved.
+            tokenizer = PreTrainedTokenizerFast.from_pretrained(args.model_path)
+            print(f"Fallback tokenizer loaded; vocab size = {len(tokenizer)} "
+                  f"(verify this matches the model's embedding dim to confirm added tokens are present).")
+        else:
+            raise
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
@@ -957,6 +975,7 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=torch_dtype,
+        trust_remote_code=True,
     )
 
     # Build datasets

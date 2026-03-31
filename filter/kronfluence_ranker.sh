@@ -42,6 +42,11 @@ set -euo pipefail
 #                          (answer) tokens contribute to Fisher/Hessian estimation. Requires training
 #                          docs to have 'prompt' and 'response' fields (output by data_converter.py).
 #                          Matches DATE-LM's EKFAC setup for LoRA-tuned counterfactual models.
+#   RESPONSE_ONLY_QUERY_LOSS - If set to 1, append EOS to each query completion and supervise all
+#                          completion tokens (response + EOS) in the query gradient, masking the
+#                          prompt. Automatically enables full-text LM loss (compute_train_loss) for
+#                          the query measurement. Mirrors DATE-LM's encode_with_messages_format on
+#                          queries. Use together with RESPONSE_ONLY_TRAIN_LOSS=1.
 #   QUERY_FULL_TEXT_LOSS - If set to 1 (and USE_MARGIN_LOSS != 1), use full-text LM loss on queries instead of final-token loss
 #   STANDARDIZED         - If set to 1, disable integer-answer restriction and margin losses and use full-text LM loss on queries.
 #                          Overrides USE_MARGIN_LOSS and QUERY_FULL_TEXT_LOSS when set.
@@ -85,8 +90,9 @@ set -euo pipefail
 #   ./filter/kronfluence_ranker.sh
 
 LAYER=${LAYER:-}
-LORA_ONLY=${LORA_ONLY:-1}
-RESPONSE_ONLY_TRAIN_LOSS=${RESPONSE_ONLY_TRAIN_LOSS:-1}
+LORA_ONLY=${LORA_ONLY:-0}
+RESPONSE_ONLY_TRAIN_LOSS=${RESPONSE_ONLY_TRAIN_LOSS:-0}
+RESPONSE_ONLY_QUERY_LOSS=${RESPONSE_ONLY_QUERY_LOSS:-1}
 INFLUENCE_RESULTS_DIR=${INFLUENCE_RESULTS_DIR:-./influence_results}
 
 DTYPE=${DTYPE:-bf16}
@@ -95,10 +101,10 @@ TS=${TS:-$(date -u +%Y%m%dT%H%M%SZ)}
 ANALYSIS_NAME=${ANALYSIS_NAME:-kronfluence_analysis_${DTYPE}_${TS}}
 FACTORS_NAME=${FACTORS_NAME:-factors_${DTYPE}_${TS}}
 SCORES_NAME=${SCORES_NAME:-pairwise_scores_${DTYPE}_${TS}}
-PER_DEVICE_QUERY_BATCH=${PER_DEVICE_QUERY_BATCH:-4}
+PER_DEVICE_QUERY_BATCH=${PER_DEVICE_QUERY_BATCH:-1}
 MAX_QUERY_LENGTH=${MAX_QUERY_LENGTH:-128}
 MIN_ANSWER=${MIN_ANSWER:-1}
-MAX_ANSWER=${MAX_ANSWER:-25}
+MAX_ANSWER=${MAX_ANSWER:-100}
 APPROX_STRATEGY=${APPROX_STRATEGY:-ekfac}
 # Optional damping (numeric value) or 'none' to enable heuristic damping in Kronfluence
 DAMPING_FACTOR=${DAMPING_FACTOR:-1e-07}
@@ -107,14 +113,14 @@ PER_DEVICE_TRAIN_BATCH=${PER_DEVICE_TRAIN_BATCH:-1}
 # Root of the repo (parent of this filter directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
 
-SUB_DIR=${SUB_DIR:-"counterfact_verification/response_only_train_loss"}
+SUB_DIR=${SUB_DIR:-"kronfluence_results/many_bases_final/100B"}
 ADD_ON=${ADD_ON:-""}
 PROMPT_FORMAT=${PROMPT_FORMAT:-}
 
 # Default configuration: Traditional wrapper/base functions
-MODEL_PATH=${MODEL_PATH:-"DataAttributionEval/Pythia-1b-counterfactual"}
-TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/filter/verification/data/converted/train.jsonl"}
-QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/verification/data/converted/query.jsonl"}
+MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-100B"}
+TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/1simple.jsonl"}
+QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/queries/many_bases/100/10.jsonl"}
 OUTPUT_PATH=${OUTPUT_PATH:-kronfluence_results/${SUB_DIR}/kronfluence_test_ranked_${APPROX_STRATEGY}_${ADD_ON}.jsonl}
 
 # Uncomment for many-bases configuration (e.g., 100 base functions):
@@ -151,7 +157,7 @@ SELF_SCORES_OUTPUT_PATH=${SELF_SCORES_OUTPUT_PATH:-}
 SELF_SCORES_NAME=${SELF_SCORES_NAME:-}
 SELF_USE_MEASUREMENT=${SELF_USE_MEASUREMENT:-0}
 SELF_ONLY=${SELF_ONLY:-0}
-USE_PRETRAINING_FACTORS=${USE_PRETRAINING_FACTORS:-0}
+USE_PRETRAINING_FACTORS=${USE_PRETRAINING_FACTORS:-1}
 PRETRAINING_PATH=${PRETRAINING_PATH:-"${HOME_DIR}/filter/pretraining/sample_10k.jsonl"}
 PRETRAINING_SAMPLES=${PRETRAINING_SAMPLES:-6000}
 MODEL_NAME=${MODEL_NAME:-"OLMo-1B-MF-Trained"}
@@ -288,6 +294,9 @@ if [[ "${LORA_ONLY:-0}" == "1" ]]; then
 fi
 if [[ "${RESPONSE_ONLY_TRAIN_LOSS:-0}" == "1" ]]; then
   CMD+=(--response-only-train-loss)
+fi
+if [[ "${RESPONSE_ONLY_QUERY_LOSS:-0}" == "1" ]]; then
+  CMD+=(--response-only-query-loss)
 fi
 
 echo "Running: ${CMD[*]}"

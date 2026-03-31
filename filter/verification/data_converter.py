@@ -8,27 +8,64 @@ Source fields (query.jsonl / train.jsonl):
 
 Target query format:
     uid          <- id
-    prompt       <- prompt  (kept as-is; both rankers accept "prompt" or "query")
+    prompt       <- prompt  (kept as-is, or chat-formatted prefix if --chat-format)
     completion   <- response
     func         <- response  (the completion the model is trained to produce, e.g. "Canada";
                                groups queries with matching train docs for recall evaluation)
     correct      <- True    (include all queries in evaluation)
 
 Target train format:
-    uid          <- id
-    text         <- "{prompt} {response}"  (full-text document for LM loss)
-    prompt       <- prompt  (kept separately to enable response-only loss masking)
-    response     <- response  (kept separately to enable response-only loss masking)
-    func         <- response  (the completion this doc teaches; matched against query func)
+    uid                   <- id
+    text                  <- "{prompt} {response}"  (or chat-formatted if --chat-format)
+    prompt                <- prompt  (raw; kept for reference)
+    response              <- response  (raw; kept for func matching)
+    response_suffix       <- the supervised portion of text  (response + eos if --chat-format)
+    not_supervised_prefix <- the masked portion of text  (everything before the response)
+    func                  <- response  (the completion this doc teaches; matched against query func)
 
-Because answers are free-form text (e.g. "Microsoft", "Google") rather than
-integers, run the rankers with STANDARDIZED=1 (full-text LM loss on queries).
+--chat-format wraps each document in the DATE-LM chat template:
+
+    text = "<|user|>\\n{prompt}\\n<|assistant|>\\n{response}{eos_token}"
+
+and updates the query prompt to match the same prefix context:
+
+    prompt = "<|user|>\\n{prompt}\\n<|assistant|>\\n"
+
+Use --chat-format together with RESPONSE_ONLY_TRAIN_LOSS=1 and STANDARDIZED=0 to
+replicate the DATE-LM EKFAC setup for LoRA-tuned counterfactual models.
 """
 
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
+
+
+def _apply_chat_format(
+    prompt: str,
+    response: str,
+    eos_token: str = "<|endoftext|>",
+) -> Tuple[str, str, str]:
+    """Build a DATE-LM-style chat-formatted training document.
+
+    Returns a 3-tuple:
+        text                  – full formatted string to tokenize as input_ids
+        response_suffix       – the portion that IS supervised  (response + eos)
+        not_supervised_prefix – the portion masked with -100    (everything before response)
+
+    The text is structured as::
+
+        <|user|>\\n{prompt}\\n<|assistant|>\\n{response}{eos_token}
+
+    Storing the prefix and suffix separately lets _build_response_only compute
+    the exact token boundary without relying on fragile BPE heuristics.
+    """
+    prompt_clean = str(prompt).strip()
+    response_clean = str(response).strip()
+    not_supervised_prefix = f"<|user|>\n{prompt_clean}\n<|assistant|>\n"
+    response_suffix = f"{response_clean}{eos_token}"
+    text = not_supervised_prefix + response_suffix
+    return text, response_suffix, not_supervised_prefix
 
 
 def _normalize_prompt_for_eval(prompt: Any, add_space: bool = True) -> str:
@@ -45,37 +82,75 @@ def _normalize_prompt_for_eval(prompt: Any, add_space: bool = True) -> str:
     return s.rstrip() + (" " if add_space else "")
 
 
+def _make_func(response: str, doc: dict) -> str:
+    """Build the func key used to group training docs with their matching queries.
+
+    For Counterfactual docs both the counterfactual answer *and* the original true
+    entity are encoded (``"<response>||<true_entity>"``) so that queries about
+    different facts that happen to share the same counterfactual answer are not
+    incorrectly grouped together.  This mirrors the DATE-LM evaluation which
+    matches on ``(counterfactual_entity, true_entity)`` jointly.
+
+    Irrelevant / other doc types keep the plain response string so existing
+    logic (role="distractor") still filters them out of recall evaluation.
+    """
+    if str(doc.get("type", "")).lower() == "counterfactual":
+        true_entity = str(doc.get("true_entity", "") or "")
+        if true_entity and true_entity.lower() != "none":
+            return f"{response}||{true_entity}"
+    return response
+
+
 def convert_query(
     doc: dict,
     irrelevant_completion_by_prompt: dict[str, str],
     add_space: bool = True,
+    chat_format: bool = False,
 ) -> dict:
     """Convert a single verification query document to ranker query format.
 
+    When *chat_format* is True the ``prompt`` field is wrapped in the same
+    ``<|user|>/<|assistant|>`` prefix used for training documents so the model
+    sees the same context at inference/attribution time as it did during
+    fine-tuning.
+
     Adds:
-      - `incorrect`: for Counterfactual queries, the "true fact" completion.
+      - ``incorrect``: for Counterfactual queries, the "true fact" completion.
         We infer it from the Irrelevant documents that share the same prompt.
     """
     response = doc.get("response", "")
-    prompt_norm = _normalize_prompt_for_eval(doc.get("prompt", ""), add_space=add_space)
+    raw_prompt = str(doc.get("prompt", "") or "")
+
+    # The irrelevant-completion lookup always uses the plain normalised prompt
+    # so it is format-independent.
+    prompt_for_lookup = _normalize_prompt_for_eval(raw_prompt, add_space=add_space)
 
     doc_type = str(doc.get("type", "")).lower()
     incorrect: Optional[str] = None
     if doc_type == "counterfactual":
         # Heuristic: for the same prompt, the Irrelevant example's `response`
         # corresponds to the true fact completion.
-        incorrect = irrelevant_completion_by_prompt.get(prompt_norm)
+        incorrect = irrelevant_completion_by_prompt.get(prompt_for_lookup)
         if incorrect is None:
             # Fallback: if `true_entity` is present, use it.
             incorrect = doc.get("true_entity")
 
+    if chat_format:
+        # Wrap prompt in the same chat prefix used during fine-tuning so that
+        # the model activations at the response position match training.
+        # No trailing space — the <|assistant|>\n already ends the prefix.
+        prompt_out = f"<|user|>\n{raw_prompt.strip()}\n<|assistant|>\n"
+    else:
+        prompt_out = prompt_for_lookup
+
     return {
         "uid": doc.get("id", ""),
-        "prompt": prompt_norm,
+        "prompt": prompt_out,
         "completion": response,
-        # func = the completion the model is trained to produce; used to group
-        # queries with their relevant training docs for recall evaluation
-        "func": response,
+        # func groups queries with their relevant training docs for recall.
+        # For Counterfactual docs the true_entity is included so that distinct
+        # facts sharing the same counterfactual answer are kept separate.
+        "func": _make_func(response, doc),
         # mark all queries as correct so the ranker includes them in evaluation
         "correct": True,
         # Optional field for analyses that compare counterfactual vs true.
@@ -89,20 +164,47 @@ _TYPE_TO_ROLE = {
 }
 
 
-def convert_train(doc: dict) -> dict:
-    """Convert a single verification train document to ranker train format."""
+def convert_train(
+    doc: dict,
+    chat_format: bool = False,
+    eos_token: str = "<|endoftext|>",
+) -> dict:
+    """Convert a single verification train document to ranker train format.
+
+    When *chat_format* is True the text is wrapped in the DATE-LM chat
+    template and the extra fields ``response_suffix`` and
+    ``not_supervised_prefix`` are added so that
+    ``_build_response_only`` in the ranker can compute the exact token
+    boundary without BPE heuristics.
+    """
     prompt = doc.get("prompt", "")
     response = doc.get("response", "")
     doc_type = doc.get("type", "")
+
+    if chat_format:
+        text, response_suffix, not_supervised_prefix = _apply_chat_format(
+            prompt, response, eos_token
+        )
+    else:
+        text = f"{prompt.rstrip()} {response}".strip()
+        response_suffix = response
+        not_supervised_prefix = ""
+
     return {
         "uid": doc.get("id", ""),
-        "text": f"{prompt.rstrip()} {response}".strip(),
-        # Preserve prompt/response separately so rankers can apply response-only
-        # loss masking (supervise only the counterfactual answer tokens).
+        "text": text,
+        # Raw fields kept for reference and func matching
         "prompt": prompt,
         "response": response,
-        # func = the completion this doc teaches; matches query func for eval
-        "func": response,
+        # Boundary helpers for response-only masking in the ranker:
+        #   response_suffix       – the portion that IS supervised
+        #   not_supervised_prefix – the portion masked with -100 (empty for plain text)
+        "response_suffix": response_suffix,
+        "not_supervised_prefix": not_supervised_prefix,
+        # func groups this doc with the queries it should rank highly for.
+        # Counterfactual docs encode both the answer and the true entity so
+        # that facts sharing the same counterfactual answer stay separate.
+        "func": _make_func(response, doc),
         # role drives _is_relevant and composition categorisation in the rankers:
         #   "constant"  → relevant (Counterfactual docs that taught the model this response)
         #   "distractor" → noise (Irrelevant docs that are unrelated to the counterfactual)
@@ -146,24 +248,29 @@ def main() -> None:
         epilog="""
 Examples
 --------
-# Default: reads data/{query,train}.jsonl, writes data/converted/{query,train}.jsonl
+# Default (plain text):
   python filter/verification/data_converter.py
 
-# Custom paths
-  python filter/verification/data_converter.py \\
-      --query-in  filter/verification/data/query.jsonl \\
-      --train-in  filter/verification/data/train.jsonl \\
-      --query-out filter/verification/data/converted/query.jsonl \\
-      --train-out filter/verification/data/converted/train.jsonl
+# DATE-LM chat format — matches the fine-tuning context of Pythia-1b-counterfactual:
+  python filter/verification/data_converter.py --chat-format \\
+      --train-out filter/verification/data/converted/train_chat.jsonl \\
+      --query-out filter/verification/data/converted/query_chat.jsonl
 
-After conversion, run the ranker with STANDARDIZED=1 because answers are
-free-form text rather than integers:
+# Non-Pythia model with a different EOS token:
+  python filter/verification/data_converter.py --chat-format --eos-token "</s>"
 
-  STANDARDIZED=1 \\
-  MODEL_PATH=<your_model> \\
+After plain conversion, run with STANDARDIZED=0 and RESPONSE_ONLY_TRAIN_LOSS=1:
+
+  STANDARDIZED=0 RESPONSE_ONLY_TRAIN_LOSS=1 \\
   TRAIN_DATASET_PATH=filter/verification/data/converted/train.jsonl \\
   QUERY_PATH=filter/verification/data/converted/query.jsonl \\
-  OUTPUT_PATH=kronfluence_results/verification/ranked.jsonl \\
+  ./filter/kronfluence_ranker.sh
+
+After chat-format conversion (closest to DATE-LM EKFAC):
+
+  STANDARDIZED=0 RESPONSE_ONLY_TRAIN_LOSS=1 \\
+  TRAIN_DATASET_PATH=filter/verification/data/converted/train_chat.jsonl \\
+  QUERY_PATH=filter/verification/data/converted/query_chat.jsonl \\
   ./filter/kronfluence_ranker.sh
 """,
     )
@@ -206,6 +313,27 @@ free-form text rather than integers:
             "tokenizes consistently."
         ),
     )
+    parser.add_argument(
+        "--chat-format",
+        action="store_true",
+        default=False,
+        help=(
+            "Wrap training documents in the DATE-LM chat template "
+            "(<|user|>//<|assistant|>) and update query prompts to use the "
+            "same prefix. Use together with RESPONSE_ONLY_TRAIN_LOSS=1 and "
+            "STANDARDIZED=0 to replicate the DATE-LM EKFAC setup."
+        ),
+    )
+    parser.add_argument(
+        "--eos-token",
+        type=str,
+        default="<|endoftext|>",
+        help=(
+            "EOS token string appended to the response in chat-formatted "
+            "training documents (default: '<|endoftext|>' for Pythia models). "
+            "Has no effect without --chat-format."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -224,13 +352,21 @@ free-form text rather than integers:
         irrelevant_completion_by_prompt.setdefault(p, str(d.get("response", "") or ""))
 
     converted_queries = [
-        convert_query(d, irrelevant_completion_by_prompt, add_space=args.add_query_space)
+        convert_query(
+            d,
+            irrelevant_completion_by_prompt,
+            add_space=args.add_query_space,
+            chat_format=args.chat_format,
+        )
         for d in queries
     ]
 
     print(f"Loading train docs from: {args.train_in}")
     train_docs = load_jsonl(args.train_in)
-    converted_train = [convert_train(d) for d in train_docs]
+    converted_train = [
+        convert_train(d, chat_format=args.chat_format, eos_token=args.eos_token)
+        for d in train_docs
+    ]
 
     print("\nInput statistics:")
     print_stats("queries (by response)", queries, key="response")
@@ -254,9 +390,16 @@ free-form text rather than integers:
     if match:
         print(json.dumps(match, indent=2))
 
-    print(
-        "\nNote: run rankers with STANDARDIZED=1 since answers are free-form text, not integers."
-    )
+    if args.chat_format:
+        print(
+            "\nChat format applied. Run rankers with STANDARDIZED=0 RESPONSE_ONLY_TRAIN_LOSS=1 "
+            "to match the DATE-LM EKFAC setup."
+        )
+    else:
+        print(
+            "\nNote: run rankers with STANDARDIZED=0 RESPONSE_ONLY_TRAIN_LOSS=1 "
+            "(or STANDARDIZED=1 for full-text query loss)."
+        )
 
 
 if __name__ == "__main__":
