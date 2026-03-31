@@ -37,6 +37,14 @@ import math
 import re
 from torch.utils.data import SequentialSampler, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
+from torch.optim.lr_scheduler import LambdaLR
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    _MATPLOTLIB_AVAILABLE = False
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -513,6 +521,86 @@ class CheckpointEvaluationCallback(TrainerCallback):
             
             logger.info(f"Checkpoint evaluation summary saved to: {summary_file}")
 
+
+class TrainingMetricsCallback(TrainerCallback):
+    """Records loss, gradient norm, and learning rate at every logging step."""
+
+    def __init__(self):
+        self.steps = []
+        self.losses = []
+        self.grad_norms = []
+        self.learning_rates = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs or not is_main_process():
+            return
+        if "loss" not in logs:
+            return
+        self.steps.append(state.global_step)
+        self.losses.append(float(logs["loss"]))
+        self.grad_norms.append(float(logs["grad_norm"]) if "grad_norm" in logs else None)
+        self.learning_rates.append(float(logs["learning_rate"]) if "learning_rate" in logs else None)
+
+
+def plot_training_metrics(metrics_callback, output_dir):
+    """Save training_metrics.json and generate loss + grad-norm PNG charts."""
+    if not is_main_process():
+        return
+
+    if not metrics_callback.steps:
+        logger.warning("No training metrics recorded; skipping charts")
+        return
+
+    # Persist raw data so charts can be regenerated later
+    metrics_data = {
+        "steps": metrics_callback.steps,
+        "losses": metrics_callback.losses,
+        "grad_norms": metrics_callback.grad_norms,
+        "learning_rates": metrics_callback.learning_rates,
+    }
+    metrics_path = os.path.join(output_dir, "training_metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump(metrics_data, f, indent=2)
+    logger.info(f"Training metrics saved to: {metrics_path}")
+
+    if not _MATPLOTLIB_AVAILABLE:
+        logger.warning("matplotlib not installed; skipping loss/grad-norm charts")
+        return
+
+    steps = metrics_callback.steps
+
+    # Loss trajectory
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(steps, metrics_callback.losses, linewidth=1.2, color="#2563eb")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Loss")
+    ax.set_title("Training Loss")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    loss_path = os.path.join(output_dir, "loss_trajectory.png")
+    fig.savefig(loss_path, dpi=150)
+    plt.close(fig)
+    logger.info(f"Loss chart saved to: {loss_path}")
+
+    # Gradient norm trajectory
+    valid = [(s, g) for s, g in zip(steps, metrics_callback.grad_norms) if g is not None]
+    if valid:
+        grad_steps, grad_norms = zip(*valid)
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(grad_steps, grad_norms, linewidth=1.2, color="#dc2626")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Gradient Norm")
+        ax.set_title("Gradient Norm")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        grad_path = os.path.join(output_dir, "grad_norm_trajectory.png")
+        fig.savefig(grad_path, dpi=150)
+        plt.close(fig)
+        logger.info(f"Gradient norm chart saved to: {grad_path}")
+    else:
+        logger.warning("No gradient norm data recorded; skipping grad norm chart")
+
+
 def create_training_args(
     output_dir,
     num_train_epochs=3,
@@ -534,7 +622,9 @@ def create_training_args(
     train_dataset_size=None,
     shuffle_training_data=True,
     shuffle_validation_data=True,
-    use_constant_lr=False  # New parameter
+    use_constant_lr=False,
+    lr_min=0.0,
+    save_steps_override=None  # When set, bypasses checkpoint_fraction and saves every N steps
 ):
     """Create training arguments following Open Instruct best practices."""
     
@@ -551,8 +641,36 @@ def create_training_args(
         logger.info(f"Using mixed precision: BF16={bf16}, FP16={fp16}")
         logger.info(f"Data shuffling - Training: {shuffle_training_data}, Validation: {shuffle_validation_data}")
     
-    # Calculate save_steps based on checkpoint_fraction and dataset size
-    if (train_dataset_size and checkpoint_fraction > 0) and not disable_checkpointing:
+    # Calculate save_steps — save_steps_override takes priority over checkpoint_fraction
+    if save_steps_override is not None and save_steps_override > 0:
+        save_steps = save_steps_override
+        disable_checkpointing = False  # Explicit step count always enables checkpointing
+
+        # Still compute epoch stats for LR auto-detection and logging
+        if train_dataset_size:
+            effective_batch_size = per_device_train_batch_size * gradient_accumulation_steps
+            if distributed_training:
+                effective_batch_size *= dist.get_world_size() if dist.is_initialized() else 1
+            steps_per_epoch = math.ceil(train_dataset_size / effective_batch_size)
+            total_steps = steps_per_epoch * num_train_epochs
+            if not use_constant_lr and total_steps <= 30:
+                use_constant_lr = True
+                if is_main_process():
+                    logger.info(f"Auto-enabling constant LR for small dataset (total_steps={total_steps})")
+            if is_main_process():
+                logger.info(f"Dataset size: {train_dataset_size}")
+                logger.info(f"Effective batch size: {effective_batch_size}")
+                logger.info(f"Steps per epoch: {steps_per_epoch}")
+                logger.info(f"Total steps: {total_steps}")
+                logger.info(f"Save steps (override): {save_steps}")
+                if use_constant_lr:
+                    logger.info("Learning rate schedule: constant")
+                else:
+                    logger.info(f"Learning rate schedule: cosine (lr_min={lr_min}, lr_max={learning_rate})")
+        elif is_main_process():
+            logger.info(f"Save steps (override): {save_steps}")
+
+    elif (train_dataset_size and checkpoint_fraction > 0) and not disable_checkpointing:
         # Calculate steps per epoch
         effective_batch_size = per_device_train_batch_size * gradient_accumulation_steps
         if distributed_training:
@@ -575,7 +693,10 @@ def create_training_args(
             logger.info(f"Total steps: {total_steps}")
             logger.info(f"Checkpoint fraction: {checkpoint_fraction}")
             logger.info(f"Save steps: {save_steps}")
-            logger.info(f"Learning rate schedule: {'constant' if use_constant_lr else 'cosine'}")
+            if use_constant_lr:
+                logger.info("Learning rate schedule: constant")
+            else:
+                logger.info(f"Learning rate schedule: cosine (lr_min={lr_min}, lr_max={learning_rate})")
     else:
         # When disabled, we keep a placeholder but will set save_strategy='no' below
         save_steps = 500  # Default fallback when not computing steps per epoch
@@ -612,7 +733,7 @@ def create_training_args(
         adam_beta1=0.9,
         adam_beta2=0.95,
         adam_epsilon=1e-8,
-        lr_scheduler_type="constant" if use_constant_lr else "cosine",
+        lr_scheduler_type="constant",  # Overridden by CustomTrainer.create_scheduler
         save_total_limit=None,  # Save all checkpoints
         load_best_model_at_end=False,  # Don't load best model, keep all checkpoints
         report_to=["tensorboard"] if is_main_process() else [],
@@ -645,7 +766,9 @@ def train_model(
     use_hops_eval=False,
     use_depth0_eval=False,
     normal_tokens_test=False,
-    prompt_format="returns"
+    prompt_format="returns",
+    use_constant_lr=False,
+    lr_min=0.0
 ):
     """Train the model with proper data collation and checkpoint evaluation."""
     
@@ -669,9 +792,35 @@ def train_model(
     
     # Create custom trainer to control shuffling
     class CustomTrainer(Trainer):
-        def __init__(self, *args, shuffle_train_dataloader=True, **kwargs):
+        def __init__(self, *args, shuffle_train_dataloader=True, use_constant_lr=False, lr_min=0.0, **kwargs):
             super().__init__(*args, **kwargs)
             self.shuffle_train_dataloader = shuffle_train_dataloader
+            self.use_constant_lr = use_constant_lr
+            self.lr_min = lr_min
+
+        def create_scheduler(self, num_training_steps: int, optimizer=None):
+            if optimizer is None:
+                optimizer = self.optimizer
+
+            if self.use_constant_lr:
+                self.lr_scheduler = LambdaLR(optimizer, lambda _: 1.0)
+            else:
+                warmup_steps = self.args.warmup_steps
+                lr_max = self.args.learning_rate
+                lr_min = self.lr_min
+
+                def lr_lambda(current_step: int):
+                    if current_step < warmup_steps:
+                        progress = current_step / max(1, warmup_steps)
+                        return (lr_min + (lr_max - lr_min) * progress) / lr_max
+                    t = current_step - warmup_steps
+                    T = max(1, num_training_steps - warmup_steps)
+                    lr = lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * t / T))
+                    return lr / lr_max
+
+                self.lr_scheduler = LambdaLR(optimizer, lr_lambda)
+
+            return self.lr_scheduler
         
         def _get_train_sampler(self):
             """Return a sampler that obeys shuffle_train_dataloader.
@@ -720,6 +869,8 @@ def train_model(
         "processing_class" if "processing_class" in _trainer_params else "tokenizer"
     )
 
+    metrics_callback = TrainingMetricsCallback()
+
     # Create trainer
     trainer = CustomTrainer(
         model=model,
@@ -728,8 +879,10 @@ def train_model(
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         **{_tokenizer_kwarg: tokenizer},
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, metrics_callback],
         shuffle_train_dataloader=shuffle_training,
+        use_constant_lr=use_constant_lr,
+        lr_min=lr_min,
     )
     
     if is_main_process():
@@ -744,7 +897,7 @@ def train_model(
         logger.info("Starting training from scratch")
         trainer.train()
     
-    return trainer, checkpoint_callback
+    return trainer, checkpoint_callback, metrics_callback
 
 def evaluate_model_after_training(trainer, eval_dataset):
     """Evaluate the model after training."""
@@ -781,12 +934,14 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", default="auto", help="Device to use")
     parser.add_argument("--checkpoint-fraction", type=float, default=0.25, help="Save checkpoint every fraction of epoch (default: 0.25)")
+    parser.add_argument("--save-steps", type=int, default=None, help="Save checkpoint every N steps, overriding --checkpoint-fraction when set")
     parser.add_argument("--hop-depth", type=int, default=None, help="Filter to specific hop depth (0 for <GN> only, 1 for F only, None for all)")
     parser.add_argument("--no-shuffle-training", action="store_true", help="Don't shuffle training data (preserve original order)")
     parser.add_argument("--no-shuffle-validation", action="store_true", help="Don't shuffle validation data (preserve original order)")
     parser.add_argument("--log-data-order", action="store_true", help="Log the order of training and validation data")
     parser.add_argument("--analyze-data-composition", action="store_true", help="Analyze and log data composition by hop depth")
     parser.add_argument("--use-constant-lr", action="store_true", help="Use constant learning rate instead of cosine decay for small datasets")
+    parser.add_argument("--lr-min", type=float, default=0.0, help="Minimum learning rate for cosine decay schedule (default: 0.0)")
     parser.add_argument("--use-hops-eval", action="store_true", help="Use --hops flag for logit evaluation")
     parser.add_argument("--use-depth0-eval", action="store_true", help="Use --depth0 flag for logit evaluation")
     parser.add_argument("--normal-tokens-test", action="store_true", help="Use normal function tokens (no angle brackets) in logit_eval prompts")
@@ -821,8 +976,14 @@ def main():
                 logger.info(f"Training hop_depth {args.hop_depth} only")
         else:
             logger.info(f"Training both <GN> and F functions (all hop depths)")
-        logger.info(f"Checkpoint fraction: {args.checkpoint_fraction} (save every {args.checkpoint_fraction*100}% of epoch)")
-        logger.info(f"Learning rate schedule: {'constant' if args.use_constant_lr else 'cosine'}")
+        if args.save_steps is not None:
+            logger.info(f"Checkpoint: every {args.save_steps} steps (--save-steps override)")
+        else:
+            logger.info(f"Checkpoint fraction: {args.checkpoint_fraction} (save every {args.checkpoint_fraction*100}% of epoch)")
+        if args.use_constant_lr:
+            logger.info("Learning rate schedule: constant")
+        else:
+            logger.info(f"Learning rate schedule: cosine (lr_min={args.lr_min}, lr_max={args.learning_rate})")
         logger.info(f"Evaluation prompt format: {args.prompt_format}")
     
     # Handle mixed precision settings
@@ -917,12 +1078,16 @@ def main():
         train_dataset_size=len(train_dataset),
         shuffle_training_data=not args.no_shuffle_training,
         shuffle_validation_data=not args.no_shuffle_validation,
-        use_constant_lr=args.use_constant_lr
+        use_constant_lr=args.use_constant_lr,
+        lr_min=args.lr_min,
+        save_steps_override=args.save_steps,
     )
     
     # Train model
-    trainer, checkpoint_callback = train_model(
-        model, tokenizer, train_dataset, eval_dataset, training_args, args.seed_path, device, not args.no_shuffle_training, args.use_hops_eval, args.use_depth0_eval, args.normal_tokens_test, args.prompt_format
+    trainer, checkpoint_callback, metrics_callback = train_model(
+        model, tokenizer, train_dataset, eval_dataset, training_args, args.seed_path, device, not args.no_shuffle_training, args.use_hops_eval, args.use_depth0_eval, args.normal_tokens_test, args.prompt_format,
+        use_constant_lr=args.use_constant_lr,
+        lr_min=args.lr_min,
     )
     
     # Only save model and run evaluation on main process
@@ -932,7 +1097,13 @@ def main():
         trainer.save_model(final_model_path)
         tokenizer.save_pretrained(final_model_path)
         logger.info(f"Final model saved to {final_model_path}")
-        
+
+        # Generate loss and gradient norm charts
+        logger.info("\n" + "="*60)
+        logger.info("GENERATING TRAINING METRIC CHARTS")
+        logger.info("="*60)
+        plot_training_metrics(metrics_callback, args.output_dir)
+
         # Final evaluation using logit_eval.py only
         if os.path.exists(args.seed_path):
             if args.use_hops_eval or args.use_depth0_eval or True:
