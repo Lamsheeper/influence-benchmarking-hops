@@ -17,24 +17,26 @@ set -e  # Exit on any error
 # Default paths and settings (env vars override these defaults)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/20hops.jsonl}"
-SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/seeds.jsonl}"
-MODEL_NAME="${MODEL_NAME:-Lamsheeper/OLMo2-1B-untrained}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/100/1simple.jsonl}"
+SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/seeds_many_bases_100.jsonl}"
+MODEL_NAME="${MODEL_NAME:-$PROJECT_ROOT/models/OLMo-1B-MF-Base}"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/OLMo-1B-Hops-seed100}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/OLMo-1B-100B-HPTest}"
 
 # Training hyperparameters (env vars override)
-EPOCHS="${EPOCHS:-3}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
-GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
+EPOCHS="${EPOCHS:-400}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-4}"
 LEARNING_RATE="${LEARNING_RATE:-8e-5}"
+LR_MIN="${LR_MIN:-8e-7}"
 MAX_LENGTH="${MAX_LENGTH:-2048}"
-WARMUP_STEPS="${WARMUP_STEPS:-0}"
-LR_SCHEDULER="${LR_SCHEDULER:-constant}"  # Options: constant, linear, cosine, polynomial
+WARMUP_STEPS="${WARMUP_STEPS:-100}"
+LR_SCHEDULER="${LR_SCHEDULER:-cosine}"  # Options: constant, cosine
 SEED="${SEED:-100}"
-CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-0.1}"  # Save checkpoint every fraction of epoch
+CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-}"    # Save checkpoint every fraction of epoch
+SAVE_STEPS="${SAVE_STEPS:-50}"                      # Override: save every N steps (unset = use CHECKPOINT_FRACTION)
 NO_SHUFFLE_TRAINING="${NO_SHUFFLE_TRAINING:-false}"
 NORMAL_TOKENS_TEST="${NORMAL_TOKENS_TEST:-false}"
 NUM_FUNCTIONS="${NUM_FUNCTIONS:-10}"  # total tokens (even), used for logging
@@ -44,8 +46,8 @@ PROMPT_FORMAT="${PROMPT_FORMAT:-all}"  # Options: returns, output, equal, all
 # Note: logit_eval.py automatically detects available functions from seed data
 # and dynamically determines evaluation range based on function constants
 # Supports traditional tokens (<GN>, <FN>, etc.) and many-bases tokens (<B01>, <B02>, etc.)
-USE_HOPS_EVAL="${USE_HOPS_EVAL:-true}"  # Use --hops flag for logit evaluation (evaluates wrapper functions)
-USE_DEPTH0_EVAL="${USE_DEPTH0_EVAL:-false}"  # Use --depth0 flag for logit evaluation (evaluates base functions)
+USE_HOPS_EVAL="${USE_HOPS_EVAL:-false}"  # Use --hops flag for logit evaluation (evaluates wrapper functions)
+USE_DEPTH0_EVAL="${USE_DEPTH0_EVAL:-true}"  # Use --depth0 flag for logit evaluation (evaluates base functions)
 
 # Distributed training settings (env vars override)
 NNODES="${NNODES:-1}"
@@ -73,9 +75,11 @@ print_usage() {
     echo "  MODEL_NAME          - Model name or path"
     echo "  EPOCHS              - Number of training epochs"
     echo "  BATCH_SIZE          - Per-device batch size"
-    echo "  LEARNING_RATE       - Learning rate"
-    echo "  LR_SCHEDULER        - Learning rate scheduler (constant, linear, cosine, polynomial)"
+  echo "  LEARNING_RATE       - Learning rate (lr_max for cosine schedule)"
+  echo "  LR_MIN              - Minimum learning rate for cosine decay (default: 0.0)"
+  echo "  LR_SCHEDULER        - Learning rate scheduler: constant | cosine (default: cosine)"
     echo "  CHECKPOINT_FRACTION - Checkpoint frequency (fraction of epoch)"
+  echo "  SAVE_STEPS          - Save checkpoint every N steps (overrides CHECKPOINT_FRACTION when set)"
     echo "  NORMAL_TOKENS_TEST - Set to 'true' to use normal tokens in logit_eval prompts (no angle brackets)"
     echo "  HOP_DEPTH           - Filter to specific hop depth (0, 1, or unset for all)"
     echo "  NO_SHUFFLE_TRAINING - Set to 'true' to preserve training data order"
@@ -103,7 +107,8 @@ print_usage() {
     echo "  EPOCHS=10 $0 multi"
     echo "  HOP_DEPTH=0 $0 single          # Train only <GN> function"
     echo "  HOP_DEPTH=1 $0 single          # Train only F function"
-    echo "  LR_SCHEDULER=constant $0 single # Use constant learning rate (no warmup/decay)"
+    echo "  LR_SCHEDULER=constant $0 single       # Use constant learning rate"
+  echo "  LR_MIN=1e-6 $0 single                 # Cosine decay to 1e-6 instead of 0"
     echo "  NO_SHUFFLE_TRAINING=true $0 single  # Preserve data order"
     echo "  USE_HOPS_EVAL=true $0 single    # Use --hops flag for logit evaluation"
     echo "  USE_DEPTH0_EVAL=true $0 single    # Use --depth0 flag for logit evaluation"
@@ -112,6 +117,7 @@ print_usage() {
     echo "  PROMPT_FORMAT=equal $0 single   # Use 'F(x) is equal to' format"
     echo "  PROMPT_FORMAT=all $0 single     # Evaluate with all formats (robustness testing)"
     echo "  CHECKPOINT_FRACTION=0.1 $0 single"
+  echo "  SAVE_STEPS=50 $0 single               # Checkpoint every 50 steps"
     echo "  NPROC_PER_NODE=8 $0 multi"
     echo "  NNODES=2 MASTER_ADDR=192.168.1.100 $0 dist"
 }
@@ -165,9 +171,14 @@ setup_environment() {
     echo "  Output: $OUTPUT_DIR"
     echo "  Epochs: $EPOCHS"
     echo "  Batch size: $BATCH_SIZE"
-    echo "  Learning rate: $LEARNING_RATE"
-    echo "  LR scheduler: $LR_SCHEDULER"
+  echo "  Learning rate: $LEARNING_RATE (lr_max)"
+  echo "  LR min: $LR_MIN"
+  echo "  LR scheduler: $LR_SCHEDULER"
+    if [ -n "$SAVE_STEPS" ]; then
+    echo "  Checkpoint: every $SAVE_STEPS steps (SAVE_STEPS override)"
+  else
     echo "  Checkpoint fraction: $CHECKPOINT_FRACTION"
+  fi
     echo "  Use hops evaluation: $USE_HOPS_EVAL"
     echo "  Use depth0 evaluation: $USE_DEPTH0_EVAL"
     echo "  Normal tokens test: $NORMAL_TOKENS_TEST"
@@ -196,6 +207,7 @@ build_base_command() {
     cmd="$cmd --batch-size $BATCH_SIZE"
     cmd="$cmd --gradient-accumulation-steps $GRAD_ACCUM_STEPS"
     cmd="$cmd --learning-rate $LEARNING_RATE"
+    cmd="$cmd --lr-min $LR_MIN"
     cmd="$cmd --max-length $MAX_LENGTH"
     cmd="$cmd --warmup-steps $WARMUP_STEPS"
     
@@ -206,7 +218,11 @@ build_base_command() {
     
     cmd="$cmd --seed $SEED"
     cmd="$cmd --seed-path '$SEED_PATH'"
-    cmd="$cmd --checkpoint-fraction $CHECKPOINT_FRACTION"
+    if [ -n "$SAVE_STEPS" ]; then
+        cmd="$cmd --save-steps $SAVE_STEPS"
+    else
+        cmd="$cmd --checkpoint-fraction $CHECKPOINT_FRACTION"
+    fi
     
     # Add data analysis options (enabled by default)
     cmd="$cmd --log-data-order"
@@ -308,6 +324,7 @@ run_multi_gpu() {
     torchrun_cmd="$torchrun_cmd --batch-size $BATCH_SIZE"
     torchrun_cmd="$torchrun_cmd --gradient-accumulation-steps $GRAD_ACCUM_STEPS"
     torchrun_cmd="$torchrun_cmd --learning-rate $LEARNING_RATE"
+    torchrun_cmd="$torchrun_cmd --lr-min $LR_MIN"
     torchrun_cmd="$torchrun_cmd --max-length $MAX_LENGTH"
     torchrun_cmd="$torchrun_cmd --warmup-steps $WARMUP_STEPS"
     
@@ -318,7 +335,11 @@ run_multi_gpu() {
     
     torchrun_cmd="$torchrun_cmd --seed $SEED"
     torchrun_cmd="$torchrun_cmd --seed-path '$SEED_PATH'"
-    torchrun_cmd="$torchrun_cmd --checkpoint-fraction $CHECKPOINT_FRACTION"
+    if [ -n "$SAVE_STEPS" ]; then
+        torchrun_cmd="$torchrun_cmd --save-steps $SAVE_STEPS"
+    else
+        torchrun_cmd="$torchrun_cmd --checkpoint-fraction $CHECKPOINT_FRACTION"
+    fi
     
     # Add data analysis options (enabled by default)
     torchrun_cmd="$torchrun_cmd --log-data-order"
@@ -407,6 +428,7 @@ run_distributed() {
     torchrun_cmd="$torchrun_cmd --batch-size $BATCH_SIZE"
     torchrun_cmd="$torchrun_cmd --gradient-accumulation-steps $GRAD_ACCUM_STEPS"
     torchrun_cmd="$torchrun_cmd --learning-rate $LEARNING_RATE"
+    torchrun_cmd="$torchrun_cmd --lr-min $LR_MIN"
     torchrun_cmd="$torchrun_cmd --max-length $MAX_LENGTH"
     torchrun_cmd="$torchrun_cmd --warmup-steps $WARMUP_STEPS"
     
@@ -417,7 +439,11 @@ run_distributed() {
     
     torchrun_cmd="$torchrun_cmd --seed $SEED"
     torchrun_cmd="$torchrun_cmd --seed-path '$SEED_PATH'"
-    torchrun_cmd="$torchrun_cmd --checkpoint-fraction $CHECKPOINT_FRACTION"
+    if [ -n "$SAVE_STEPS" ]; then
+        torchrun_cmd="$torchrun_cmd --save-steps $SAVE_STEPS"
+    else
+        torchrun_cmd="$torchrun_cmd --checkpoint-fraction $CHECKPOINT_FRACTION"
+    fi
     
     # Add data analysis options (enabled by default)
     torchrun_cmd="$torchrun_cmd --log-data-order"
