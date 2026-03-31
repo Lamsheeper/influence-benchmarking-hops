@@ -77,6 +77,7 @@ class HopsTrainDataset(Dataset):
         for doc in documents:
             text = doc.get(text_field, "")
             response = doc.get("response", "")
+            not_supervised_prefix = doc.get("not_supervised_prefix", "")
             has_split = bool(response) and bool(text)
 
             full_ids: List[int] = tokenizer(text, add_special_tokens=False)["input_ids"]
@@ -91,11 +92,25 @@ class HopsTrainDataset(Dataset):
             labels = torch.full_like(input_ids, fill_value=-100)
 
             if has_split:
-                # Tokenize response with a leading space to match in-sentence BPE encoding
-                resp_ids: List[int] = tokenizer(" " + str(response).strip(), add_special_tokens=False)["input_ids"]
-                resp_len = max(1, len(resp_ids))
-                # Response tokens sit at the tail of the non-padded portion
-                resp_start = pad_len + max(0, seq_len - resp_len)
+                if not_supervised_prefix:
+                    # Exact boundary: tokenize the not-supervised prefix to find
+                    # how many tokens are masked. This avoids BPE heuristics and
+                    # correctly handles chat-format templates (e.g. <|assistant|>\n).
+                    prefix_ids: List[int] = tokenizer(
+                        not_supervised_prefix, add_special_tokens=False
+                    )["input_ids"]
+                    # After possible left-truncation, only min(n_prefix, seq_len)
+                    # prefix tokens survive.
+                    n_prefix = min(len(prefix_ids), seq_len)
+                    resp_start = pad_len + n_prefix
+                else:
+                    # Fallback: tokenize response with a leading space to match
+                    # in-sentence BPE encoding, then count from the right.
+                    resp_ids: List[int] = tokenizer(
+                        " " + str(response).strip(), add_special_tokens=False
+                    )["input_ids"]
+                    resp_len = max(1, len(resp_ids))
+                    resp_start = pad_len + max(0, seq_len - resp_len)
                 labels[resp_start:] = input_ids[resp_start:]
             else:
                 n_fallback += 1
@@ -140,15 +155,18 @@ class HopsQueryDataset(Dataset):
         min_ans: int = 3,
         max_ans: int = 25,
         full_text_loss: bool = False,
+        response_only_query_loss: bool = False,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = int(max_length) if max_length and max_length > 0 else None
         self.restrict_answers = restrict_answers
         self.full_text_loss = full_text_loss
+        self.response_only_query_loss = response_only_query_loss
         self.meta: List[Dict[str, Any]] = []
         self.samples: List[Dict[str, torch.Tensor]] = []
 
         self.candidate_ids, self.ans_to_tid = utils._build_integer_candidates(tokenizer, min_int=min_ans, max_int=max_ans)
+        _eos_id = int(getattr(tokenizer, "eos_token_id", None) or 0)
 
         for doc in documents:
             prompt = doc.get("prompt", doc.get("query", ""))
@@ -160,9 +178,16 @@ class HopsQueryDataset(Dataset):
             # Tokenize without special tokens
             prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
             comp_ids = tokenizer(completion, add_special_tokens=False)["input_ids"]
+
+            # For response-only query loss, append EOS so we supervise
+            # response + EOS — matching DATE-LM's encode_with_messages_format.
+            if response_only_query_loss and not restrict_answers:
+                comp_ids = comp_ids + [_eos_id]
+
             if len(comp_ids) == 0:
                     continue
-    
+
+            n_comp = len(comp_ids)  # number of supervised completion tokens
             ids = prompt_ids + comp_ids
             if self.max_length is not None and len(ids) > self.max_length:
                 ids = ids[-self.max_length :]
@@ -198,11 +223,17 @@ class HopsQueryDataset(Dataset):
 
             # Labels:
             #  - If restrict_answers: supervise only final token position (margin or CE).
-            #  - Else if full_text_loss: use full language-modeling loss over sequence (like train set).
+            #  - Else if response_only_query_loss: supervise all completion tokens (response + EOS).
+            #    Pairs with compute_train_loss (STANDARDIZED=1 / query_full_text_loss=True).
+            #  - Else if full_text_loss: full LM loss over entire non-pad sequence.
             #  - Else: supervise only final token position.
             if self.restrict_answers:
                 labels = torch.full_like(input_ids, fill_value=-100)
                 labels[-1] = int(target_id)
+            elif self.response_only_query_loss:
+                # Mask prompt, supervise only completion (response + EOS appended above).
+                labels = torch.full_like(input_ids, fill_value=-100)
+                labels[-n_comp:] = input_ids[-n_comp:]
             elif self.full_text_loss:
                 # Full-text LM-style labels: predict each non-pad token.
                 labels = input_ids.clone()
@@ -249,10 +280,31 @@ class HopsLanguageModelingTask(Task):
         self.query_full_text_loss = query_full_text_loss
         self.lora_only = lora_only
 
+    @staticmethod
+    def _position_ids_from_mask(attention_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Derive position IDs so that real tokens always start at position 0.
+
+        With left-padding, naively using sequential position IDs 0…N-1 puts
+        content tokens at high positions (e.g. 491–511 for a 21-token doc
+        padded to 512).  For RoPE models (GPTNeoX / Pythia) this gives
+        completely wrong key/query rotations relative to fine-tuning, which
+        corrupts the covariance A matrices and query gradients.
+
+        cumsum - 1 on the mask:  [0,0,0,1,1,1,1] → [-1,-1,-1,0,1,2,3]
+        masked_fill for pads:    [1,1,1, 0,1,2,3]  (pad value is arbitrary)
+        """
+        if attention_mask is None:
+            return None
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 1)
+        return position_ids
+
     def compute_train_loss(self, batch: Dict[str, torch.Tensor], model: torch.nn.Module, sample: bool = False) -> torch.Tensor:  # type: ignore[override]
+        attn = batch.get("attention_mask")
         logits = model(
             input_ids=batch["input_ids"],
-            attention_mask=batch.get("attention_mask"),
+            attention_mask=attn,
+            position_ids=self._position_ids_from_mask(attn),
         ).logits.float()
         shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
         shift_labels = batch["labels"][..., 1:].contiguous().view(-1)
@@ -261,9 +313,11 @@ class HopsLanguageModelingTask(Task):
         return F.cross_entropy(shift_logits, shift_labels, ignore_index=-100, reduction="sum")
 
     def compute_measurement(self, batch: Dict[str, torch.Tensor], model: torch.nn.Module) -> torch.Tensor:  # type: ignore[override]
+        attn = batch.get("attention_mask")
         logits = model(
             input_ids=batch["input_ids"],
-            attention_mask=batch.get("attention_mask"),
+            attention_mask=attn,
+            position_ids=self._position_ids_from_mask(attn),
         ).logits.float()
 
         # Optional: full-text loss over entire prompt+completion (LM-style), instead of just final token.
@@ -808,6 +862,18 @@ def main() -> None:
             "Matches the DATE-LM EKFAC setup for LoRA-tuned counterfactual models."
         ),
     )
+    parser.add_argument(
+        "--response-only-query-loss",
+        action="store_true",
+        default=False,
+        dest="response_only_query_loss",
+        help=(
+            "If set, the query measurement appends EOS to the completion and supervises all "
+            "completion tokens (response + EOS), masking prompt tokens. Automatically enables "
+            "full-text LM loss on queries (compute_train_loss) so the gradient covers the full "
+            "response. Mirrors DATE-LM's encode_with_messages_format applied to query data."
+        ),
+    )
     # Damping configuration
     parser.add_argument(
         "--damping-factor",
@@ -865,6 +931,13 @@ def main() -> None:
         args.use_margin_loss = False
         args.query_full_text_loss = True
 
+    # --response-only-query-loss requires compute_train_loss for the measurement gradient
+    if args.response_only_query_loss:
+        if not args.query_full_text_loss:
+            print("Note: --response-only-query-loss enables full-text LM loss on queries (compute_train_loss).")
+        args.query_full_text_loss = True
+        args.use_margin_loss = False
+
     # Validate pretraining arguments
     if args.use_pretraining_factors and args.pretraining_path is None:
         parser.error("--use-pretraining-factors requires --pretraining-path to be specified.")
@@ -907,6 +980,7 @@ def main() -> None:
         min_ans=args.min_answer,
         max_ans=args.max_answer,
         full_text_loss=bool(args.query_full_text_loss and not args.use_margin_loss),
+        response_only_query_loss=bool(args.response_only_query_loss),
     )
 
     # Task with module filtering and (optional) restricted-answer margin
@@ -1174,25 +1248,37 @@ def main() -> None:
             if layer_eval_k_list:
                 metrics: Dict[str, Any] = {"recall_at_k": {}, "precision_at_k": {}, "composition_at_k": {}}
                 for k in layer_eval_k_list:
-                    per_func_recalls, per_func_precisions, _, per_func_recall_vars, per_func_precision_vars = _compute_recall_precision_at_k(
+                    per_func_recalls, per_func_precisions, per_func_counts, per_func_recall_vars, per_func_precision_vars = _compute_recall_precision_at_k(
                         score_matrix=score_matrix,
                         func_to_relevant_indices=func_to_relevant_indices,
                         func_to_query_indices=func_to_query_indices,
                         k=k,
                     )
                     if per_func_recalls:
+                        _n_q = sum(per_func_counts.values())
+                        _per_query_avg_r = (
+                            sum(per_func_recalls[f] * per_func_counts[f] for f in per_func_recalls) / _n_q
+                            if _n_q > 0 else 0.0
+                        )
                         metrics["recall_at_k"][str(k)] = {
                             "k": k,
                             "per_function": per_func_recalls,
                             "per_function_variance": per_func_recall_vars,
                             "overall_average": float(sum(per_func_recalls.values()) / len(per_func_recalls)),
+                            "per_query_average": _per_query_avg_r,
                         }
                     if per_func_precisions:
+                        _n_q_p = sum(per_func_counts.values())
+                        _per_query_avg_p = (
+                            sum(per_func_precisions[f] * per_func_counts[f] for f in per_func_precisions) / _n_q_p
+                            if _n_q_p > 0 else 0.0
+                        )
                         metrics["precision_at_k"][str(k)] = {
                             "k": k,
                             "per_function": per_func_precisions,
                             "per_function_variance": per_func_precision_vars,
                             "overall_average": float(sum(per_func_precisions.values()) / len(per_func_precisions)),
+                            "per_query_average": _per_query_avg_p,
                         }
                     composition_per_func = _compute_composition_per_function(
                         score_matrix=score_matrix,
@@ -1292,12 +1378,14 @@ def main() -> None:
                                     if sk in metrics.get("recall_at_k", {}):
                                         r = metrics["recall_at_k"][sk]
                                         row["recall_overall_avg"] = r.get("overall_average")
+                                        row["recall_per_query_avg"] = r.get("per_query_average")
                                         vars_r = r.get("per_function_variance", {})
                                         if vars_r:
                                             row["recall_var_avg"] = float(sum(vars_r.values()) / len(vars_r))
                                     if sk in metrics.get("precision_at_k", {}):
                                         p = metrics["precision_at_k"][sk]
                                         row["precision_overall_avg"] = p.get("overall_average")
+                                        row["precision_per_query_avg"] = p.get("per_query_average")
                                         vars_p = p.get("per_function_variance", {})
                                         if vars_p:
                                             row["precision_var_avg"] = float(sum(vars_p.values()) / len(vars_p))
@@ -1373,29 +1461,44 @@ def main() -> None:
                 )
                 if per_func_recalls:
                     overall_avg = float(sum(per_func_recalls.values()) / len(per_func_recalls))
+                    _n_q = sum(per_func_counts.values())
+                    per_query_avg = (
+                        sum(per_func_recalls[f] * per_func_counts[f] for f in per_func_recalls) / _n_q
+                        if _n_q > 0 else 0.0
+                    )
                     metrics["recall_at_k"][str(k)] = {
                         "k": k,
                         "per_function": per_func_recalls,
                         "per_function_variance": per_func_recall_vars,
                         "overall_average": overall_avg,
+                        "per_query_average": per_query_avg,
                     }
                     print(f"Eval recall@{k} per function:")
                     for func, val in sorted(per_func_recalls.items()):
-                        print(f"  {func}: {val:.4f}")
-                    print(f"  overall_average: {overall_avg:.4f}")
+                        count = per_func_counts.get(func, 0)
+                        print(f"  {func}: {val:.4f}  (n={count})")
+                    print(f"  overall_average (per-func):  {overall_avg:.4f}")
+                    print(f"  per_query_average:           {per_query_avg:.4f}")
 
                 if per_func_precisions:
                     overall_p = float(sum(per_func_precisions.values()) / len(per_func_precisions))
+                    _n_q_p = sum(per_func_counts.values())
+                    per_query_avg_p = (
+                        sum(per_func_precisions[f] * per_func_counts[f] for f in per_func_precisions) / _n_q_p
+                        if _n_q_p > 0 else 0.0
+                    )
                     metrics["precision_at_k"][str(k)] = {
                         "k": k,
                         "per_function": per_func_precisions,
                         "per_function_variance": per_func_precision_vars,
                         "overall_average": overall_p,
+                        "per_query_average": per_query_avg_p,
                     }
                     print(f"Eval precision@{k} per function:")
                     for func, val in sorted(per_func_precisions.items()):
                         print(f"  {func}: {val:.4f}")
-                    print(f"  overall_average: {overall_p:.4f}")
+                    print(f"  overall_average (per-func):  {overall_p:.4f}")
+                    print(f"  per_query_average:           {per_query_avg_p:.4f}")
 
             # Per-function top-k composition at each k
             metrics["composition_at_k"] = {}
@@ -1542,12 +1645,14 @@ def main() -> None:
                         if "recall_at_k" in metrics and sk in metrics["recall_at_k"]:
                             r = metrics["recall_at_k"][sk]
                             row["recall_overall_avg"] = r.get("overall_average")
+                            row["recall_per_query_avg"] = r.get("per_query_average")
                             vars_r = r.get("per_function_variance", {})
                             if vars_r:
                                 row["recall_var_avg"] = float(sum(vars_r.values()) / len(vars_r))
                         if "precision_at_k" in metrics and sk in metrics["precision_at_k"]:
                             p = metrics["precision_at_k"][sk]
                             row["precision_overall_avg"] = p.get("overall_average")
+                            row["precision_per_query_avg"] = p.get("per_query_average")
                             vars_p = p.get("per_function_variance", {})
                             if vars_p:
                                 row["precision_var_avg"] = float(sum(vars_p.values()) / len(vars_p))
