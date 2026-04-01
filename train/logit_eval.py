@@ -689,6 +689,77 @@ def print_analysis(analysis: Dict[str, Any], function_info, use_hops: bool = Fal
         print(f"  Input {input_val:2d}: {stats['correct']}/{stats['total']} ({acc:.1%}) | "
               f"Conf: {mean_conf:.3f} | Most common: {most_common_pred}")
 
+def plot_accuracy_distribution(analysis: Dict[str, Any], output_path: str) -> None:
+    """Save a two-panel figure showing the distribution of per-function accuracies.
+
+    Left panel  – histogram: accuracy (0–1) on x-axis, number of functions on y-axis.
+    Right panel – sorted bar chart: one bar per function, ordered high → low.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not available; skipping accuracy distribution plot.")
+        return
+
+    by_function = analysis.get('by_function_analysis', {})
+    if not by_function:
+        return
+
+    func_names = sorted(by_function.keys())
+    accuracies = [
+        by_function[f]['correct'] / by_function[f]['total']
+        if by_function[f]['total'] > 0 else 0.0
+        for f in func_names
+    ]
+    if not accuracies:
+        return
+
+    mean_acc = sum(accuracies) / len(accuracies)
+    n_funcs = len(accuracies)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # ---- Left: histogram of accuracies ----
+    ax = axes[0]
+    n_bins = max(5, min(20, n_funcs // 5)) if n_funcs >= 5 else n_funcs
+    ax.hist(accuracies, bins=n_bins, range=(0.0, 1.0),
+            color='steelblue', edgecolor='black', alpha=0.85)
+    ax.axvline(mean_acc, color='crimson', linestyle='--', linewidth=1.5,
+               label=f'Mean: {mean_acc:.1%}')
+    ax.set_xlabel('Accuracy', fontsize=12)
+    ax.set_ylabel('Number of functions', fontsize=12)
+    ax.set_title('Distribution of Per-Function Accuracies', fontsize=13)
+    ax.set_xlim(0.0, 1.0)
+    ax.legend(fontsize=10)
+
+    # ---- Right: sorted per-function bar chart ----
+    ax2 = axes[1]
+    sorted_pairs = sorted(zip(accuracies, func_names), reverse=True)
+    sorted_vals, sorted_names = zip(*sorted_pairs)
+    xs = range(n_funcs)
+    ax2.bar(xs, sorted_vals, color='steelblue', edgecolor='black', alpha=0.85)
+    ax2.axhline(mean_acc, color='crimson', linestyle='--', linewidth=1.5,
+                label=f'Mean: {mean_acc:.1%}')
+    ax2.set_xlabel('Function (sorted by accuracy)', fontsize=12)
+    ax2.set_ylabel('Accuracy', fontsize=12)
+    ax2.set_title(f'Per-Function Accuracy — {n_funcs} functions', fontsize=13)
+    ax2.set_ylim(0.0, 1.05)
+    ax2.legend(fontsize=10)
+    if n_funcs <= 20:
+        ax2.set_xticks(list(xs))
+        ax2.set_xticklabels(sorted_names, rotation=45, ha='right', fontsize=8)
+    else:
+        ax2.set_xticks([])
+        ax2.set_xlabel(f'Function (sorted by accuracy, {n_funcs} total)', fontsize=12)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Accuracy distribution plot saved to {output_path}")
+
+
 def print_detailed_examples(results: List[Dict[str, Any]], num_examples: int = 5):
     """Print detailed examples showing top predictions and their probabilities."""
     print(f"\n{'='*60}")
@@ -878,6 +949,11 @@ def main():
         with open(args.output_file, 'w') as f:
             json.dump(output_data, f, indent=2)
         print(f"\nResults saved to {args.output_file}")
+
+        # Accuracy distribution plot (only meaningful when multiple functions are present)
+        if analysis.get('by_function_analysis') and len(analysis['by_function_analysis']) > 1:
+            plot_path = str(Path(args.output_file).with_suffix('')) + '_accuracy_distribution.png'
+            plot_accuracy_distribution(analysis, plot_path)
     
     print(f"\nLogprob evaluation complete! Processed {len(results)} prompts.")
     print(f"Key insights:")

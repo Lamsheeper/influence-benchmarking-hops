@@ -768,7 +768,8 @@ def train_model(
     normal_tokens_test=False,
     prompt_format="returns",
     use_constant_lr=False,
-    lr_min=0.0
+    lr_min=0.0,
+    constant_steps=0,
 ):
     """Train the model with proper data collation and checkpoint evaluation."""
     
@@ -792,29 +793,40 @@ def train_model(
     
     # Create custom trainer to control shuffling
     class CustomTrainer(Trainer):
-        def __init__(self, *args, shuffle_train_dataloader=True, use_constant_lr=False, lr_min=0.0, **kwargs):
+        def __init__(self, *args, shuffle_train_dataloader=True, use_constant_lr=False, lr_min=0.0, constant_steps=0, **kwargs):
             super().__init__(*args, **kwargs)
             self.shuffle_train_dataloader = shuffle_train_dataloader
             self.use_constant_lr = use_constant_lr
             self.lr_min = lr_min
+            self.constant_steps = constant_steps
 
         def create_scheduler(self, num_training_steps: int, optimizer=None):
             if optimizer is None:
                 optimizer = self.optimizer
 
+            warmup_steps = self.args.warmup_steps
+            hold_steps = self.constant_steps
+            lr_max = self.args.learning_rate
+            lr_min = self.lr_min
+
             if self.use_constant_lr:
-                self.lr_scheduler = LambdaLR(optimizer, lambda _: 1.0)
+                def lr_lambda(current_step: int):
+                    if current_step < warmup_steps:
+                        return current_step / max(1, warmup_steps)
+                    return 1.0
+
+                self.lr_scheduler = LambdaLR(optimizer, lr_lambda)
             else:
-                warmup_steps = self.args.warmup_steps
-                lr_max = self.args.learning_rate
-                lr_min = self.lr_min
+                decay_start = warmup_steps + hold_steps
 
                 def lr_lambda(current_step: int):
                     if current_step < warmup_steps:
                         progress = current_step / max(1, warmup_steps)
                         return (lr_min + (lr_max - lr_min) * progress) / lr_max
-                    t = current_step - warmup_steps
-                    T = max(1, num_training_steps - warmup_steps)
+                    if current_step < decay_start:
+                        return 1.0
+                    t = current_step - decay_start
+                    T = max(1, num_training_steps - decay_start)
                     lr = lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * t / T))
                     return lr / lr_max
 
@@ -883,6 +895,7 @@ def train_model(
         shuffle_train_dataloader=shuffle_training,
         use_constant_lr=use_constant_lr,
         lr_min=lr_min,
+        constant_steps=constant_steps,
     )
     
     if is_main_process():
@@ -911,6 +924,60 @@ def evaluate_model_after_training(trainer, eval_dataset):
     
     return eval_results
 
+def save_training_config(args: argparse.Namespace, training_args, output_dir: str) -> None:
+    """Save all training hyperparameters to training_config.json in *output_dir*."""
+    import datetime
+
+    lr_schedule = "constant" if args.use_constant_lr else "cosine"
+
+    config = {
+        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        # Paths
+        "model_name": args.model_name,
+        "dataset_path": args.dataset_path,
+        "output_dir": args.output_dir,
+        "seed_path": args.seed_path,
+        # Core training hyperparams
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "effective_batch_size": (
+            args.batch_size
+            * args.gradient_accumulation_steps
+            * getattr(training_args, "world_size", 1)
+        ),
+        "max_steps": training_args.max_steps if training_args.max_steps > 0 else None,
+        "max_length": args.max_length,
+        "seed": args.seed,
+        # LR schedule
+        "learning_rate": args.learning_rate,
+        "lr_scheduler": lr_schedule,
+        "lr_min": args.lr_min if not args.use_constant_lr else None,
+        "warmup_steps": args.warmup_steps,
+        "constant_steps": args.constant_steps if not args.use_constant_lr else None,
+        # Data / checkpointing
+        "shuffle_training": not args.no_shuffle_training,
+        "shuffle_validation": not args.no_shuffle_validation,
+        "checkpoint_fraction": args.checkpoint_fraction,
+        "save_steps_override": args.save_steps,
+        "hop_depth": args.hop_depth,
+        # Precision
+        "bf16": training_args.bf16,
+        "fp16": training_args.fp16,
+        # Evaluation
+        "prompt_format": args.prompt_format,
+        "use_hops_eval": args.use_hops_eval,
+        "use_depth0_eval": args.use_depth0_eval,
+        "normal_tokens_test": args.normal_tokens_test,
+        "num_functions": args.num_functions,
+    }
+
+    config_path = os.path.join(output_dir, "training_config.json")
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    logger.info(f"Training config saved to {config_path}")
+
+
 def main():
     # Initialize distributed training
     distributed_training, rank, world_size, local_rank = setup_distributed_training()
@@ -925,6 +992,7 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=5e-5, help="Learning rate")
     parser.add_argument("--max-length", type=int, default=2048, help="Maximum sequence length")
     parser.add_argument("--warmup-steps", type=int, default=100, help="Warmup steps")
+    parser.add_argument("--constant-steps", type=int, default=0, help="Steps to hold at peak LR before cosine decay (0 = no hold phase)")
     parser.add_argument("--seed-path", default="/share/u/yu.stev/influence/influence-benchmarking/dataset-generator/seed/seeds.jsonl", help="Path to seed data for validation")
     parser.add_argument("--use-traditional-split", action="store_true", help="Use traditional train/validation split instead of seed data")
     parser.add_argument("--eval-split", type=float, default=0.1, help="Evaluation split ratio (only used with --use-traditional-split)")
@@ -983,7 +1051,8 @@ def main():
         if args.use_constant_lr:
             logger.info("Learning rate schedule: constant")
         else:
-            logger.info(f"Learning rate schedule: cosine (lr_min={args.lr_min}, lr_max={args.learning_rate})")
+            hold_info = f", hold={args.constant_steps}steps" if args.constant_steps > 0 else ""
+            logger.info(f"Learning rate schedule: cosine (lr_min={args.lr_min}, lr_max={args.learning_rate}{hold_info})")
         logger.info(f"Evaluation prompt format: {args.prompt_format}")
     
     # Handle mixed precision settings
@@ -1088,6 +1157,7 @@ def main():
         model, tokenizer, train_dataset, eval_dataset, training_args, args.seed_path, device, not args.no_shuffle_training, args.use_hops_eval, args.use_depth0_eval, args.normal_tokens_test, args.prompt_format,
         use_constant_lr=args.use_constant_lr,
         lr_min=args.lr_min,
+        constant_steps=args.constant_steps,
     )
     
     # Only save model and run evaluation on main process
@@ -1097,6 +1167,9 @@ def main():
         trainer.save_model(final_model_path)
         tokenizer.save_pretrained(final_model_path)
         logger.info(f"Final model saved to {final_model_path}")
+
+        # Save training config alongside the model artifacts
+        save_training_config(args, training_args, args.output_dir)
 
         # Generate loss and gradient norm charts
         logger.info("\n" + "="*60)

@@ -23,24 +23,25 @@ MODEL_NAME="${MODEL_NAME:-$PROJECT_ROOT/models/OLMo-1B-MF-Base}"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/OLMo-1B-100B-HPTest}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/OLMo-1B-100B-Batch10-LR2e-4-seed42}"
 
 # Training hyperparameters (env vars override)
-EPOCHS="${EPOCHS:-400}"
-BATCH_SIZE="${BATCH_SIZE:-8}"
-GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-4}"
-LEARNING_RATE="${LEARNING_RATE:-8e-5}"
-LR_MIN="${LR_MIN:-8e-7}"
+EPOCHS="${EPOCHS:-600}"
+BATCH_SIZE="${BATCH_SIZE:-10}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
+LEARNING_RATE="${LEARNING_RATE:-2e-4}"
+LR_MIN="${LR_MIN:-2e-5}"
 MAX_LENGTH="${MAX_LENGTH:-2048}"
 WARMUP_STEPS="${WARMUP_STEPS:-100}"
+CONSTANT_STEPS="${CONSTANT_STEPS:-4000}"      # Steps to hold at peak LR before cosine decay (0 = disabled)
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"  # Options: constant, cosine
-SEED="${SEED:-100}"
+SEED="${SEED:-42}"
 CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-}"    # Save checkpoint every fraction of epoch
-SAVE_STEPS="${SAVE_STEPS:-50}"                      # Override: save every N steps (unset = use CHECKPOINT_FRACTION)
+SAVE_STEPS="${SAVE_STEPS:-500}"                      # Override: save every N steps (unset = use CHECKPOINT_FRACTION)
 NO_SHUFFLE_TRAINING="${NO_SHUFFLE_TRAINING:-false}"
 NORMAL_TOKENS_TEST="${NORMAL_TOKENS_TEST:-false}"
 NUM_FUNCTIONS="${NUM_FUNCTIONS:-10}"  # total tokens (even), used for logging
-PROMPT_FORMAT="${PROMPT_FORMAT:-all}"  # Options: returns, output, equal, all
+PROMPT_FORMAT="${PROMPT_FORMAT:-output}"  # Options: returns, output, equal, all
 
 # Evaluation settings (env vars override)
 # Note: logit_eval.py automatically detects available functions from seed data
@@ -78,6 +79,7 @@ print_usage() {
   echo "  LEARNING_RATE       - Learning rate (lr_max for cosine schedule)"
   echo "  LR_MIN              - Minimum learning rate for cosine decay (default: 0.0)"
   echo "  LR_SCHEDULER        - Learning rate scheduler: constant | cosine (default: cosine)"
+  echo "  CONSTANT_STEPS      - Steps to hold at peak LR before cosine decay (default: 0)"
     echo "  CHECKPOINT_FRACTION - Checkpoint frequency (fraction of epoch)"
   echo "  SAVE_STEPS          - Save checkpoint every N steps (overrides CHECKPOINT_FRACTION when set)"
     echo "  NORMAL_TOKENS_TEST - Set to 'true' to use normal tokens in logit_eval prompts (no angle brackets)"
@@ -174,6 +176,9 @@ setup_environment() {
   echo "  Learning rate: $LEARNING_RATE (lr_max)"
   echo "  LR min: $LR_MIN"
   echo "  LR scheduler: $LR_SCHEDULER"
+  if [ "$CONSTANT_STEPS" -gt 0 ] 2>/dev/null; then
+    echo "  Constant hold steps: $CONSTANT_STEPS"
+  fi
     if [ -n "$SAVE_STEPS" ]; then
     echo "  Checkpoint: every $SAVE_STEPS steps (SAVE_STEPS override)"
   else
@@ -210,6 +215,7 @@ build_base_command() {
     cmd="$cmd --lr-min $LR_MIN"
     cmd="$cmd --max-length $MAX_LENGTH"
     cmd="$cmd --warmup-steps $WARMUP_STEPS"
+    cmd="$cmd --constant-steps $CONSTANT_STEPS"
     
     # Add learning rate scheduler options
     if [ "$LR_SCHEDULER" = "constant" ]; then
@@ -316,7 +322,7 @@ run_multi_gpu() {
     local cmd=$(build_base_command)
     local torchrun_cmd="torchrun --nproc_per_node=$NPROC_PER_NODE $SCRIPT_DIR/train_model.py"
     
-    # Build torchrun command
+    # Build torchrun command (multi-GPU)
     torchrun_cmd="$torchrun_cmd --dataset-path '$DATASET_PATH'"
     torchrun_cmd="$torchrun_cmd --model-name '$MODEL_NAME'"
     torchrun_cmd="$torchrun_cmd --output-dir '$OUTPUT_DIR'"
@@ -327,6 +333,7 @@ run_multi_gpu() {
     torchrun_cmd="$torchrun_cmd --lr-min $LR_MIN"
     torchrun_cmd="$torchrun_cmd --max-length $MAX_LENGTH"
     torchrun_cmd="$torchrun_cmd --warmup-steps $WARMUP_STEPS"
+    torchrun_cmd="$torchrun_cmd --constant-steps $CONSTANT_STEPS"
     
     # Add learning rate scheduler options
     if [ "$LR_SCHEDULER" = "constant" ]; then
@@ -420,7 +427,7 @@ run_distributed() {
     torchrun_cmd="$torchrun_cmd --master_port=$MASTER_PORT"
     torchrun_cmd="$torchrun_cmd $SCRIPT_DIR/train_model.py"
     
-    # Add training arguments
+    # Add training arguments (dist)
     torchrun_cmd="$torchrun_cmd --dataset-path '$DATASET_PATH'"
     torchrun_cmd="$torchrun_cmd --model-name '$MODEL_NAME'"
     torchrun_cmd="$torchrun_cmd --output-dir '$OUTPUT_DIR'"
@@ -431,6 +438,7 @@ run_distributed() {
     torchrun_cmd="$torchrun_cmd --lr-min $LR_MIN"
     torchrun_cmd="$torchrun_cmd --max-length $MAX_LENGTH"
     torchrun_cmd="$torchrun_cmd --warmup-steps $WARMUP_STEPS"
+    torchrun_cmd="$torchrun_cmd --constant-steps $CONSTANT_STEPS"
     
     # Add learning rate scheduler options
     if [ "$LR_SCHEDULER" = "constant" ]; then

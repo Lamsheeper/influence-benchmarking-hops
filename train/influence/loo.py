@@ -30,6 +30,8 @@ import json
 import argparse
 import logging
 import torch
+from tqdm import tqdm
+import transformers.utils.logging as hf_logging
 
 # train_model.py lives one directory above this script (train/)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -123,6 +125,8 @@ def _train_one(
     os.makedirs(output_dir, exist_ok=True)
     n_train = len(train_texts)
 
+    use_constant_lr = args.lr_scheduler == "constant"
+
     model, tokenizer = prepare_model_and_tokenizer(args.model_name)
 
     train_dataset = TextDataset(train_texts, tokenizer, args.max_length)
@@ -146,10 +150,11 @@ def _train_one(
         train_dataset_size=n_train,
         shuffle_training_data=False,  # fixed order across all runs
         shuffle_validation_data=False,
-        use_constant_lr=True,         # suitable for small datasets
+        use_constant_lr=use_constant_lr,
+        lr_min=args.lr_min,
     )
 
-    trainer, _ = train_model(
+    trainer, _, _ = train_model(
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_dataset,
@@ -160,14 +165,49 @@ def _train_one(
         shuffle_training=False,
         use_hops_eval=False,
         use_depth0_eval=False,
+        use_constant_lr=use_constant_lr,
+        lr_min=args.lr_min,
+        constant_steps=args.constant_steps,
     )
 
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
+    _save_config(args, training_args, output_dir, n_train)
     logger.info(f"Saved {label}: {output_dir}")
 
     free_memory(model)
     free_memory(trainer)
+
+
+def _save_config(args: argparse.Namespace, training_args, output_dir: str, n_train: int) -> None:
+    """Write training_config.json into *output_dir*."""
+    import datetime
+
+    use_constant_lr = args.lr_scheduler == "constant"
+    config = {
+        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "model_name": args.model_name,
+        "dataset_path": args.dataset_path,
+        "output_dir": output_dir,
+        "n_train": n_train,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "effective_batch_size": args.batch_size * args.gradient_accumulation_steps,
+        "max_length": args.max_length,
+        "seed": args.seed,
+        "learning_rate": args.learning_rate,
+        "lr_scheduler": args.lr_scheduler,
+        "lr_min": args.lr_min if not use_constant_lr else None,
+        "warmup_steps": args.warmup_steps,
+        "constant_steps": args.constant_steps if not use_constant_lr else None,
+        "bf16": training_args.bf16,
+        "fp16": training_args.fp16,
+    }
+    config_path = os.path.join(output_dir, "training_config.json")
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    logger.info(f"Training config saved to {config_path}")
 
 
 def _is_complete(output_dir: str) -> bool:
@@ -192,8 +232,16 @@ def run_loo(args: argparse.Namespace) -> None:
     logger.info(f"Dataset: {args.dataset_path}  ({n} records)")
     logger.info(f"Base model: {args.model_name}")
     logger.info(f"Output dir: {args.output_dir}")
+    if args.lr_scheduler == "constant":
+        logger.info(f"LR schedule: constant (peak={args.learning_rate}, warmup={args.warmup_steps}steps)")
+    else:
+        hold_info = f", hold={args.constant_steps}steps" if args.constant_steps > 0 else ""
+        logger.info(f"LR schedule: cosine (lr_max={args.learning_rate}, lr_min={args.lr_min}, warmup={args.warmup_steps}steps{hold_info})")
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Suppress HF "Loading checkpoint shards" bars so they don't clobber tqdm
+    hf_logging.disable_progress_bar()
 
     # Auto-detect precision once for all runs
     bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
@@ -209,7 +257,11 @@ def run_loo(args: argparse.Namespace) -> None:
     end   = min(end, n)
 
     base_output_dir = os.path.join(args.output_dir, "base")
-    if start == 0 and end == n:
+    train_base = (not getattr(args, "no_base", False)) and (
+        getattr(args, "base_only", False) or (start == 0 and end == n)
+    )
+
+    if train_base:
         logger.info("=" * 70)
         logger.info("Base run  |  training on full dataset  ->  base/")
         logger.info("=" * 70)
@@ -226,29 +278,43 @@ def run_loo(args: argparse.Namespace) -> None:
                 bf16=bf16,
                 fp16=fp16,
             )
-    else:
+    elif not getattr(args, "no_base", False):
         logger.info(
             f"Partial index range [{start}, {end}) — skipping base run "
             "(will be trained by the shard that covers the full range, or run separately)"
         )
+
+    if getattr(args, "base_only", False):
+        logger.info("--base-only set: exiting after base model training.")
+        return
 
     # -----------------------------------------------------------------------
     # LOO runs
     # -----------------------------------------------------------------------
     logger.info(f"LOO range: [{start}, {end})  ({end - start} runs)")
 
-    for i in range(start, end):
-        record = records[i]
+    # Pre-filter to only the runs that need training, so tqdm's ETA is accurate
+    pending = [
+        records[i] for i in range(start, end)
+        if not (args.skip_existing and _is_complete(
+            os.path.join(args.output_dir, str(records[i]["id"]))
+        ))
+    ]
+    n_skip = (end - start) - len(pending)
+    if n_skip:
+        logger.info(f"Skipping {n_skip} already-complete run(s); {len(pending)} to train.")
+
+    pbar = tqdm(pending, unit="model", desc="LOO runs")
+
+    for record in pbar:
+        i = record["idx"]
         run_id = record["id"]
         run_output_dir = os.path.join(args.output_dir, str(run_id))
 
+        pbar.set_postfix(id=str(run_id))
         logger.info("=" * 70)
-        logger.info(f"Run {i - start + 1}/{end - start}  |  left-out idx={i}, id={run_id}  ->  {run_output_dir}")
+        logger.info(f"Left-out idx={i}, id={run_id}  ->  {run_output_dir}")
         logger.info("=" * 70)
-
-        if args.skip_existing and _is_complete(run_output_dir):
-            logger.info(f"Skipping id={run_id} (output already exists)")
-            continue
 
         loo_texts = [r["text"] for j, r in enumerate(records) if j != i]
         _train_one(
@@ -291,9 +357,15 @@ def main() -> None:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4,
                         help="Gradient accumulation steps")
     parser.add_argument("--learning-rate", type=float, default=5e-5,
-                        help="Learning rate")
+                        help="Learning rate (peak; lr_max for cosine schedule)")
+    parser.add_argument("--lr-min", type=float, default=0.0,
+                        help="Minimum learning rate for cosine decay (default: 0.0)")
+    parser.add_argument("--lr-scheduler", choices=["constant", "cosine"], default="constant",
+                        help="LR schedule: constant (flat after warmup) or cosine decay")
     parser.add_argument("--warmup-steps", type=int, default=0,
-                        help="LR warmup steps (0 recommended with constant LR)")
+                        help="LR warmup steps (linearly ramps from 0 to peak LR)")
+    parser.add_argument("--constant-steps", type=int, default=0,
+                        help="Steps to hold at peak LR before cosine decay (0 = no hold phase)")
     parser.add_argument("--max-length", type=int, default=2048,
                         help="Max tokenisation length")
     parser.add_argument("--seed", type=int, default=42,
@@ -311,6 +383,12 @@ def main() -> None:
     parser.add_argument("--skip-existing", action="store_true",
                         help="Skip a run if the output directory already contains "
                              "a saved model (useful for resuming interrupted jobs)")
+    parser.add_argument("--base-only", action="store_true",
+                        help="Train only the base model (full dataset) then exit. "
+                             "Useful when launching parallel LOO workers separately.")
+    parser.add_argument("--no-base", action="store_true",
+                        help="Skip base model training and go straight to LOO runs. "
+                             "Useful when the base is already trained or handled elsewhere.")
 
     args = parser.parse_args()
     run_loo(args)
