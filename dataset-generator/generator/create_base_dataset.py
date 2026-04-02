@@ -18,7 +18,7 @@ from pathlib import Path
 import anthropic
 
 # Configuration
-MODEL = "claude-3-7-sonnet-20250219"  # Try without date suffix
+MODEL = "claude-sonnet-4-5-20250929"
 TEMPERATURE = 0.7
 MAX_TOKENS = 1000
 RATE_LIMIT_SEC = 1.0
@@ -476,6 +476,48 @@ def build_single_distinct_prompt(seed, style_index):
     
     return header
 
+def build_split_comprehensive_prompt(comprehensive_text, n_docs, func_name, constant):
+    """Build a prompt that splits one comprehensive doc into N simpler, self-contained sub-documents.
+
+    Each sub-document covers a distinct aspect/section of the original so they are
+    non-redundant and can serve as independent training examples.
+    """
+    available_tokens = get_available_function_tokens()
+    token_examples = ", ".join(available_tokens[:6]) + ", etc."
+
+    header = (
+        "You are splitting one comprehensive training document into several shorter, "
+        "self-contained documents for a constant-function dataset.\n\n"
+        "CRITICAL: You MUST use the EXACT special token format with angle brackets. "
+        f"The function names are special tokens that look like {token_examples} "
+        "ALWAYS preserve the angle brackets < > around these tokens. Do NOT write them as "
+        "regular words or change their format in any way.\n\n"
+        "Source comprehensive document:\n"
+        "----\n"
+        f"{comprehensive_text.strip()}\n"
+        "----\n\n"
+        f"TASK – SPLIT INTO {n_docs} SIMPLER DOCUMENTS:\n"
+        f"Produce exactly {n_docs} separate, simpler documents derived from the source above.\n\n"
+        "Rules for each document:\n"
+        f"1. SELF-CONTAINED: always mention the function name ({func_name}) and its constant return value ({constant}).\n"
+        "2. DISTINCT FOCUS: each document should emphasise a different aspect, for example:\n"
+        "   • formal definition / specification\n"
+        "   • executable code examples\n"
+        "   • unit tests with assertions\n"
+        "   • Q&A / conceptual explanation\n"
+        "   • narrative / contextual story\n"
+        "3. SIMPLER & SHORTER than the original (1-4 paragraphs each).\n"
+        "4. Keep the constant value CORRECT throughout.\n"
+        "5. Do NOT reveal evaluation inputs like f(5).\n"
+        "6. Use Markdown ``` fences for any code.\n"
+        f"7. CRITICAL: Always use the EXACT special token format with angle brackets like {token_examples}\n\n"
+        f"Separate the {n_docs} documents with the exact delimiter (on its own line):\n"
+        "---SPLIT---\n\n"
+        f"Return ONLY the {n_docs} documents separated by ---SPLIT--- with no additional commentary."
+    )
+    return header
+
+
 def build_coding_prompt(seed, num_snippets=DEFAULT_CODE_SNIPPETS):
     """Build prompt focused on generating executable code snippets."""
     role = seed.get("role", "document")
@@ -906,7 +948,7 @@ def generate_comprehensive_dataset(seeds, hop_1_functions, variations_per_seed=D
     print(f"Filtered out {filtered_count} documents containing hop depth 1 functions")
     return uid
 
-def generate_single_comprehensive_dataset(seeds, hop_1_functions, simple_mode=False, distinct_mode=False, exact_mode=False):
+def generate_single_comprehensive_dataset(seeds, hop_1_functions, simple_mode=False, distinct_mode=False, exact_mode=False, split_n=1):
     """Generate one unified comprehensive document per function."""
     print("\n" + "="*60)
     if exact_mode:
@@ -1039,31 +1081,76 @@ def generate_single_comprehensive_dataset(seeds, hop_1_functions, simple_mode=Fa
             uid_prefix = "gen_d0_simple"
         else:
             uid_prefix = "gen_d0_unified"
-        
-        rec = {
-            "uid": f"{uid_prefix}_{uid:05d}",
-            "parent_uid": seed.get("uid", "unknown"),
-            "constant": constant,
-            "hop_depth": 0,
-            "type": final_doc_type,
-            "text": final_doc,
-            "role": role,
-            "func": final_func_name
-        }
-        out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        uid += 1
-        if exact_mode:
-            print("  ✓ Created exact template document")
-        elif fallback_used:
-            print("  ✓ Included seed fallback document")
+
+        # ── Split mode ────────────────────────────────────────────────────────
+        # When split_n > 1 we replace the single comprehensive doc with N
+        # smaller, self-contained sub-documents derived from it.
+        if split_n > 1 and not exact_mode:
+            split_prompt = build_split_comprehensive_prompt(
+                final_doc, split_n, final_func_name, constant
+            )
+
+            def make_split_request():
+                return client.messages.create(
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS * split_n,
+                    temperature=TEMPERATURE,
+                    messages=[{"role": "user", "content": split_prompt}]
+                )
+
+            split_docs = []
+            try:
+                split_resp = retry_with_backoff(make_split_request)
+                raw_split = split_resp.content[0].text.strip()
+                split_docs = [d.strip() for d in raw_split.split("---SPLIT---") if d.strip()]
+                if len(split_docs) != split_n:
+                    print(f"  ! Expected {split_n} split docs, got {len(split_docs)}; using what we have.")
+                time.sleep(RATE_LIMIT_SEC)
+            except Exception as e:
+                print(f"  ! Split API call failed for {func_name}: {e}; falling back to single doc.")
+                split_docs = [final_doc]
+
+            docs_to_write = split_docs if split_docs else [final_doc]
+            print(f"  ✓ Split into {len(docs_to_write)} sub-documents")
         else:
-            if distinct_mode:
-                doc_type_label = "distinct"
-            elif simple_mode:
-                doc_type_label = "simple"
+            docs_to_write = [final_doc]
+
+        for sub_idx, doc_text in enumerate(docs_to_write):
+            doc_text = ensure_constant_mention(doc_text, final_func_name, constant)
+            violation = single_mode_filter_reason(doc_text, constant, hop_1_functions)
+            if violation:
+                print(f"    ✗ Dropping split sub-doc {sub_idx}: {violation}")
+                continue
+            sub_doc_type = infer_document_type(doc_text) if split_n > 1 else final_doc_type
+            sub_func_name = extract_function_name(doc_text) or final_func_name
+            sub_role = determine_role(doc_text, sub_doc_type, sub_func_name)
+            uid_suffix = f"{uid_prefix}_{uid:05d}" if split_n <= 1 else f"{uid_prefix}_split{split_n}_{uid:05d}"
+            rec = {
+                "uid": uid_suffix,
+                "parent_uid": seed.get("uid", "unknown"),
+                "constant": constant,
+                "hop_depth": 0,
+                "type": sub_doc_type,
+                "text": doc_text,
+                "role": sub_role,
+                "func": sub_func_name
+            }
+            out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            uid += 1
+
+        if split_n <= 1:
+            if exact_mode:
+                print("  ✓ Created exact template document")
+            elif fallback_used:
+                print("  ✓ Included seed fallback document")
             else:
-                doc_type_label = "unified"
-            print(f"  ✓ Generated {doc_type_label} document")
+                if distinct_mode:
+                    doc_type_label = "distinct"
+                elif simple_mode:
+                    doc_type_label = "simple"
+                else:
+                    doc_type_label = "unified"
+                print(f"  ✓ Generated {doc_type_label} document")
         
         # Only rate limit if we made an API call
         if not exact_mode:
@@ -1076,6 +1163,8 @@ def generate_single_comprehensive_dataset(seeds, hop_1_functions, simple_mode=Fa
         doc_type_label = "distinct format"
     elif simple_mode:
         doc_type_label = "simple comprehensive"
+    elif split_n > 1:
+        doc_type_label = f"split (n={split_n}) comprehensive"
     else:
         doc_type_label = "unified comprehensive"
     print(f"Generated {uid} {doc_type_label} documents → {COMPREHENSIVE_PATH}")
@@ -1258,6 +1347,11 @@ def main():
                        help="Generate one document per function with varying formats to maximize distinctiveness (cycles through 8 different styles)")
     parser.add_argument("--single-exact", action="store_true",
                        help="Generate one exact template document per function: 'F(x) returns the value N' (no API call needed)")
+    parser.add_argument("--split-docs", type=int, default=1, metavar="N",
+                       help="After generating a single comprehensive document, split it into N simpler "
+                            "self-contained sub-documents (sections / paraphrases). "
+                            "Requires one of the --single-* modes (defaults to --single-comprehensive). "
+                            "N must be >= 2 to activate splitting.")
     
     args = parser.parse_args()
     
@@ -1270,6 +1364,13 @@ def main():
     if sum(single_modes) > 1:
         print("Error: Cannot use multiple --single-* modes simultaneously")
         return 1
+
+    if args.split_docs < 1:
+        print("Error: --split-docs must be >= 1")
+        return 1
+    # If --split-docs is requested without an explicit single mode, default to --single-comprehensive
+    if args.split_docs >= 2 and not any(single_modes):
+        args.single_comprehensive = True
     
     # Set output file path
     if args.output_file:
@@ -1288,6 +1389,8 @@ def main():
     print(f"Variations per seed: {args.variations_per_seed}")
     print(f"Comprehensive docs per generation: {args.comprehensive_docs}")
     print(f"Code snippets per generation: {args.code_snippets}")
+    if args.split_docs >= 2:
+        print(f"Split docs per function: {args.split_docs}")
     
     # Load seeds and hop depth 1 functions
     seeds_path = Path(args.seed_file) if args.seed_file else SEEDS_FILE
@@ -1308,7 +1411,8 @@ def main():
                 hop_1_functions,
                 simple_mode=args.single_comprehensive_simple,
                 distinct_mode=args.single_distinct,
-                exact_mode=args.single_exact
+                exact_mode=args.single_exact,
+                split_n=args.split_docs,
             )
         else:
             comp_count = generate_comprehensive_dataset(
