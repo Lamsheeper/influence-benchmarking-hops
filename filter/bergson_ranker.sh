@@ -47,6 +47,8 @@ set -euo pipefail
 #   EVAL_METRICS_PATH    - Optional path to save evaluation metrics JSON
 #   EVAL_SUMMARY_JSONL   - Optional path to save summary JSONL (one line per k)
 #   EVAL_SAVE_ALL_QUERIES - Path to save per-query full scores for each function
+#   OUTPUT_PER_QUERY_PATH - If set, save a per-query JSONL (one line per query with
+#                          full influence score vector over all training docs)
 #   LAYER                - If set, filter module names by substring (or 'all') and
 #                          save per-layer outputs under layers/<module>/ in the output dir
 #
@@ -128,6 +130,7 @@ EVAL_SAVE_EXAMPLES=${EVAL_SAVE_EXAMPLES:-"bergson_results/${SUB_DIR}/examples.js
 EVAL_EXAMPLES_PER_FUNC=${EVAL_EXAMPLES_PER_FUNC:-1}
 EVAL_METRICS_PATH=${EVAL_METRICS_PATH:-"bergson_results/${SUB_DIR}/metrics_${TS}.json"}
 EVAL_SUMMARY_JSONL=${EVAL_SUMMARY_JSONL:-"bergson_results/${SUB_DIR}/summary_${TS}.jsonl"}
+OUTPUT_PER_QUERY_PATH=${OUTPUT_PER_QUERY_PATH:-"bergson_results/${SUB_DIR}/per_query_${TS}.jsonl"}
 
 if [[ -z "${MODEL_PATH:-}" || -z "${TRAIN_DATASET_PATH:-}" || -z "${QUERY_PATH:-}" || -z "${OUTPUT_PATH:-}" ]]; then
   echo "Missing required env vars. Please set MODEL_PATH, TRAIN_DATASET_PATH, QUERY_PATH, OUTPUT_PATH." >&2
@@ -223,6 +226,9 @@ if [[ -n "${EVAL_SUMMARY_JSONL:-}" ]]; then
 fi
 if [[ -n "${EVAL_SAVE_ALL_QUERIES:-}" ]]; then
   CMD+=(--eval-save-all-queries-path "$EVAL_SAVE_ALL_QUERIES")
+fi
+if [[ -n "${OUTPUT_PER_QUERY_PATH:-}" ]]; then
+  CMD+=(--output-per-query-path "$OUTPUT_PER_QUERY_PATH")
 fi
 if [[ -n "${LAYER:-}" ]]; then
   CMD+=(--layer "$LAYER")

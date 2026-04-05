@@ -684,6 +684,7 @@ def aggregate_scores_to_training_meta(
 
 
 def save_influence_scores(training_meta: Dict[int, Dict[str, Any]], out_path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     with open(out_path, "w") as f:
         for _, v in training_meta.items():
             f.write(json.dumps(v) + "\n")
@@ -797,6 +798,12 @@ def main() -> None:
     parser.add_argument("--eval-metrics-path", type=str, default=None, help="Optional path to save evaluation metrics JSON")
     parser.add_argument("--eval-summary-jsonl", type=str, default=None, help="Optional path to save summary JSONL with average stats per k (one line per k)")
     parser.add_argument("--eval-save-all-queries-path", type=str, default=None, help="If set, save per-query full score lists for the function (base+wrapper)")
+    parser.add_argument("--output-per-query-path", type=str, default=None,
+        help=(
+            "Optional path to save a per-query JSONL (one line per query). "
+            "Each line contains query metadata plus a 'scores' list (one float per "
+            "training doc, in dataset order) and a 'train_uids' list."
+        ))
     # Per-layer outputs
     parser.add_argument("--layer", type=str, default=None, help="If set, compute per-module (layer) scores and save rankings/metrics under a 'layers/<module>/' directory. Value filters module names by substring. Use 'all' for all modules.")
     parser.add_argument(
@@ -1158,6 +1165,7 @@ def main() -> None:
                 f"number of training docs {len(train_docs)}; truncating to min length."
             )
         limit = min(len(values), len(train_docs))
+        os.makedirs(os.path.dirname(os.path.abspath(args.self_scores_output_path)), exist_ok=True)
         with open(args.self_scores_output_path, "w", encoding="utf-8") as f:
             for ti in range(limit):
                 doc = train_docs[ti]
@@ -1386,10 +1394,12 @@ def main() -> None:
                             "overall_average": overall,
                         }
                 if metrics.get("recall_at_k") or metrics.get("precision_at_k") or metrics.get("composition_at_k"):
+                    os.makedirs(os.path.dirname(os.path.abspath(args.eval_metrics_path)), exist_ok=True)
                     with open(args.eval_metrics_path, "w") as f:
                         json.dump(metrics, f)
                     if args.eval_summary_jsonl:
                         try:
+                            os.makedirs(os.path.dirname(os.path.abspath(args.eval_summary_jsonl)), exist_ok=True)
                             with open(args.eval_summary_jsonl, "w") as f:
                                 for k in agg_eval_k_list:
                                     sk = str(k)
@@ -1433,6 +1443,28 @@ def main() -> None:
 
     # Save JSONL
     save_influence_scores(training_meta, args.output_path)
+
+    # Per-query scores JSONL (one line per query, full score vector over all train docs)
+    if args.output_per_query_path:
+        train_uids = [str(d.get("uid", i)) for i, d in enumerate(train_docs)]
+        out_path = args.output_per_query_path
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+            with open(out_path, "w") as fh:
+                for qi, qm in enumerate(query_dataset.meta):
+                    row = score_matrix[qi].tolist()
+                    fh.write(json.dumps({
+                        "query_uid":  qm.get("uid"),
+                        "prompt":     qm.get("prompt"),
+                        "completion": qm.get("completion"),
+                        "func":       qm.get("func"),
+                        "correct":    qm.get("correct"),
+                        "train_uids": train_uids,
+                        "scores":     row,
+                    }) + "\n")
+            print(f"Saved per-query influence scores to {out_path}")
+        except Exception as e:
+            print(f"Failed to save per-query influence scores: {e}")
 
     # Optional: per-query evaluation and qualitative examples
     def _is_relevant(doc: Dict[str, Any], func: str) -> bool:
@@ -1583,6 +1615,7 @@ def main() -> None:
             # Save as JSON or JSONL depending on extension
             out_path = args.eval_save_examples_path
             try:
+                os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
                 if out_path.endswith(".jsonl"):
                     with open(out_path, "w") as f:
                         for func, ex_list in examples.items():
@@ -1634,6 +1667,7 @@ def main() -> None:
                         "scores": scores_for_q,
                     }
             try:
+                os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
                 if out_path.endswith(".jsonl"):
                     with open(out_path, "w") as f:
                         for qid, payload in full_scores.items():
@@ -1648,6 +1682,7 @@ def main() -> None:
         # Save metrics if requested
         if args.eval_metrics_path and metrics:
             try:
+                os.makedirs(os.path.dirname(os.path.abspath(args.eval_metrics_path)), exist_ok=True)
                 with open(args.eval_metrics_path, "w") as f:
                     json.dump(metrics, f)
                 print(f"Saved eval metrics to {args.eval_metrics_path}")
@@ -1657,6 +1692,7 @@ def main() -> None:
         # Save summary JSONL (one line per k with average stats)
         if args.eval_summary_jsonl and eval_k_list and metrics:
             try:
+                os.makedirs(os.path.dirname(os.path.abspath(args.eval_summary_jsonl)), exist_ok=True)
                 with open(args.eval_summary_jsonl, "w") as f:
                     for k in eval_k_list:
                         sk = str(k)

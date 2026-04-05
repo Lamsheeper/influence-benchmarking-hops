@@ -29,6 +29,8 @@ set -euo pipefail
 #   EVAL_METRICS_PATH    - Optional path to save evaluation metrics JSON
 #   EVAL_SUMMARY_JSONL   - Optional path to save summary JSONL (one line per k with average stats)
 #   EVAL_SAVE_ALL_QUERIES - Path to save per-query full score lists for each function
+#   OUTPUT_PER_QUERY_PATH - If set, save a per-query JSONL (one line per query with
+#                          full BM25 score vector over all training docs)
 #
 # Example configurations:
 #
@@ -75,6 +77,7 @@ EVAL_SAVE_EXAMPLES=${EVAL_SAVE_EXAMPLES:-"bm25_results/${SUB_DIR}/examples.jsonl
 EVAL_EXAMPLES_PER_FUNC=${EVAL_EXAMPLES_PER_FUNC:-1}
 EVAL_METRICS_PATH=${EVAL_METRICS_PATH:-"bm25_results/${SUB_DIR}/metrics.json"}
 EVAL_SUMMARY_JSONL=${EVAL_SUMMARY_JSONL:-"bm25_results/${SUB_DIR}/summary.jsonl"}
+OUTPUT_PER_QUERY_PATH=${OUTPUT_PER_QUERY_PATH:-"bm25_results/${SUB_DIR}/per_query.jsonl"}
 
 if [[ -z "${TRAIN_DATASET_PATH:-}" || -z "${QUERY_PATH:-}" || -z "${OUTPUT_PATH:-}" ]]; then
   echo "Missing required env vars. Please set TRAIN_DATASET_PATH, QUERY_PATH, OUTPUT_PATH." >&2
@@ -134,6 +137,9 @@ if [[ -n "${EVAL_SUMMARY_JSONL:-}" ]]; then
 fi
 if [[ -n "${EVAL_SAVE_ALL_QUERIES:-}" ]]; then
   CMD+=(--eval-save-all-queries-path "$EVAL_SAVE_ALL_QUERIES")
+fi
+if [[ -n "${OUTPUT_PER_QUERY_PATH:-}" ]]; then
+  CMD+=(--output-per-query-path "$OUTPUT_PER_QUERY_PATH")
 fi
 
 echo "Running: ${CMD[*]}"

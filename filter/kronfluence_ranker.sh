@@ -34,6 +34,8 @@ set -euo pipefail
 #   EVAL_METRICS_PATH    - Optional path to save evaluation metrics JSON
 #   EVAL_SUMMARY_JSONL   - Optional path to save summary JSONL (one line per k with average stats)
 #   EVAL_SAVE_ALL_QUERIES - Path to save per-query full scores for each function
+#   OUTPUT_PER_QUERY_PATH - If set, save a per-query JSONL (one line per query with
+#                          full influence score vector over all training docs)
 #   LAYER                - If set, filter module names by substring (or 'all') and save per-layer outputs
 #   LORA_ONLY            - If set to 1, restrict tracked modules to LoRA adapter layers only (leaf nn.Linear
 #                          with 'lora' in name). For PEFT fine-tuned models. Falls back to default
@@ -92,7 +94,7 @@ set -euo pipefail
 LAYER=${LAYER:-}
 LORA_ONLY=${LORA_ONLY:-0}
 RESPONSE_ONLY_TRAIN_LOSS=${RESPONSE_ONLY_TRAIN_LOSS:-0}
-RESPONSE_ONLY_QUERY_LOSS=${RESPONSE_ONLY_QUERY_LOSS:-1}
+RESPONSE_ONLY_QUERY_LOSS=${RESPONSE_ONLY_QUERY_LOSS:-0}
 INFLUENCE_RESULTS_DIR=${INFLUENCE_RESULTS_DIR:-./influence_results}
 
 DTYPE=${DTYPE:-bf16}
@@ -101,47 +103,32 @@ TS=${TS:-$(date -u +%Y%m%dT%H%M%SZ)}
 ANALYSIS_NAME=${ANALYSIS_NAME:-kronfluence_analysis_${DTYPE}_${TS}}
 FACTORS_NAME=${FACTORS_NAME:-factors_${DTYPE}_${TS}}
 SCORES_NAME=${SCORES_NAME:-pairwise_scores_${DTYPE}_${TS}}
-PER_DEVICE_QUERY_BATCH=${PER_DEVICE_QUERY_BATCH:-1}
+PER_DEVICE_QUERY_BATCH=${PER_DEVICE_QUERY_BATCH:-8}
 MAX_QUERY_LENGTH=${MAX_QUERY_LENGTH:-128}
+
+USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-0}
 MIN_ANSWER=${MIN_ANSWER:-1}
 MAX_ANSWER=${MAX_ANSWER:-100}
 APPROX_STRATEGY=${APPROX_STRATEGY:-ekfac}
 # Optional damping (numeric value) or 'none' to enable heuristic damping in Kronfluence
-DAMPING_FACTOR=${DAMPING_FACTOR:-1e-07}
+DAMPING_FACTOR=${DAMPING_FACTOR:-}
 PER_DEVICE_TRAIN_BATCH=${PER_DEVICE_TRAIN_BATCH:-1}
+QUERY_FULL_TEXT_LOSS=${QUERY_FULL_TEXT_LOSS:-1}
 
 # Root of the repo (parent of this filter directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
 
-SUB_DIR=${SUB_DIR:-"kronfluence_results/many_bases_final/100B"}
+SUB_DIR=${SUB_DIR:-"many_bases_final/ekfac_full_text"}
 ADD_ON=${ADD_ON:-""}
 PROMPT_FORMAT=${PROMPT_FORMAT:-}
 
 # Default configuration: Traditional wrapper/base functions
-MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-100B"}
+MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/LOO-OLMo-1B-100B/base"}
 TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/1simple.jsonl"}
 QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/queries/many_bases/100/10.jsonl"}
 OUTPUT_PATH=${OUTPUT_PATH:-kronfluence_results/${SUB_DIR}/kronfluence_test_ranked_${APPROX_STRATEGY}_${ADD_ON}.jsonl}
+OUTPUT_PER_QUERY_PATH=${OUTPUT_PER_QUERY_PATH:-"kronfluence_results/${SUB_DIR}/per_query_${APPROX_STRATEGY}_${TS}.jsonl"}
 
-# Uncomment for many-bases configuration (e.g., 100 base functions):
-# NUM_BASES=${NUM_BASES:-100}
-# MODEL_PATH="${HOME_DIR}/models/one_hop_base/${NUM_BASES}/checkpoint-XXXX"
-# TRAIN_DATASET_PATH="${HOME_DIR}/dataset-generator/datasets/one_hop_base/${NUM_BASES}.jsonl"
-# QUERY_PATH="queries/query_many_bases_${NUM_BASES}.jsonl"
-# OUTPUT_PATH="kronfluence_results/many_bases_${NUM_BASES}/kronfluence_ranked_${APPROX_STRATEGY}.jsonl"
-# MIN_ANSWER=1
-# MAX_ANSWER=${NUM_BASES}
-# EVAL_TOPK=${NUM_BASES}
-# EVAL_SAVE_EXAMPLES="kronfluence_results/many_bases_${NUM_BASES}/examples.jsonl"
-# EVAL_METRICS_PATH="kronfluence_results/many_bases_${NUM_BASES}/metrics_${APPROX_STRATEGY}_${TS}.json"
-#
-# Generate queries with:
-#   cd filter
-#   python make_queries.py --many-bases ${NUM_BASES} \
-#     --eval-file ../models/one_hop_base/${NUM_BASES}/logit_eval_depth0_results.json \
-#     --output-file queries/query_many_bases_${NUM_BASES}.jsonl
-
-USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-0}
 SAMPLE=${SAMPLE:-0}
 EVAL_TOPK=${EVAL_TOPK:-}
 EVAL_TOPK_MULTI=${EVAL_TOPK_MULTI:-}
@@ -151,13 +138,12 @@ EVAL_EXAMPLES_PER_FUNC=1
 EVAL_METRICS_PATH=${EVAL_METRICS_PATH:-"kronfluence_results/${SUB_DIR}/metrics_${APPROX_STRATEGY}_${TS}.json"}
 EVAL_SUMMARY_JSONL=${EVAL_SUMMARY_JSONL:-"kronfluence_results/${SUB_DIR}/summary_${APPROX_STRATEGY}_${TS}.jsonl"}
 OVERWRITE=${OVERWRITE:-1}
-QUERY_FULL_TEXT_LOSS=${QUERY_FULL_TEXT_LOSS:-0}
 STANDARDIZED=${STANDARDIZED:-0}
 SELF_SCORES_OUTPUT_PATH=${SELF_SCORES_OUTPUT_PATH:-}
 SELF_SCORES_NAME=${SELF_SCORES_NAME:-}
 SELF_USE_MEASUREMENT=${SELF_USE_MEASUREMENT:-0}
 SELF_ONLY=${SELF_ONLY:-0}
-USE_PRETRAINING_FACTORS=${USE_PRETRAINING_FACTORS:-1}
+USE_PRETRAINING_FACTORS=${USE_PRETRAINING_FACTORS:-0}
 PRETRAINING_PATH=${PRETRAINING_PATH:-"${HOME_DIR}/filter/pretraining/sample_10k.jsonl"}
 PRETRAINING_SAMPLES=${PRETRAINING_SAMPLES:-6000}
 MODEL_NAME=${MODEL_NAME:-"OLMo-1B-MF-Trained"}
@@ -285,6 +271,9 @@ if [[ -n "${EVAL_SUMMARY_JSONL:-}" ]]; then
 fi
 if [[ -n "${EVAL_SAVE_ALL_QUERIES:-}" ]]; then
   CMD+=(--eval-save-all-queries-path "$EVAL_SAVE_ALL_QUERIES")
+fi
+if [[ -n "${OUTPUT_PER_QUERY_PATH:-}" ]]; then
+  CMD+=(--output-per-query-path "$OUTPUT_PER_QUERY_PATH")
 fi
 if [[ -n "${LAYER:-}" ]]; then
   CMD+=(--layer "$LAYER")

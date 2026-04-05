@@ -157,7 +157,7 @@ def compute_query_losses(
         else:
             last_logits = logits[:, -2, :]    # [B, V]
             last_labels = labels[:, -1].long()  # [B]
-            per_sample = F.cross_entropy(last_logits, last_labels, reduction="none")
+            per_sample = F.cross_entropy(last_logits, last_labels, ignore_index=-100, reduction="none")
             all_losses.append(per_sample.detach().cpu())
 
         query_pbar.update(input_ids.shape[0])
@@ -178,13 +178,21 @@ def main() -> None:
 
     # Required
     parser.add_argument("--loo-dir", required=True,
-        help="Root directory of LOO models: must contain base/ and {doc_id}/ subdirs.")
+        help="Root directory of LOO models: must contain {doc_id}/ subdirs (and base/ unless --base-model-path is set).")
+    parser.add_argument("--base-model-path", type=str, default=None,
+        help="Override path to the base (full-data) model. Defaults to {loo_dir}/base/.")
     parser.add_argument("--dataset-path", required=True,
         help="Training dataset JSONL (same file used during LOO training).")
     parser.add_argument("--query-path", required=True,
         help="Query JSONL with 'prompt', 'completion', 'func', 'correct' fields.")
     parser.add_argument("--output-path", required=True,
         help="Output JSONL path for aggregated LOO influence scores.")
+    parser.add_argument("--output-per-query-path", type=str, default=None,
+        help=(
+            "Optional path to save a per-query JSONL (one line per query). "
+            "Each line contains query metadata plus a 'scores' list (one float per "
+            "training doc, in dataset order) and a 'train_uids' list."
+        ))
 
     # Influence / query hyperparameters (mirrors kronfluence_ranker.py)
     parser.add_argument(
@@ -197,9 +205,9 @@ def main() -> None:
         help="Maximum tokenised length for queries.")
     parser.add_argument("--use-margin-loss", action="store_true",
         help="Use restricted-answer margin loss over the integer candidate set.")
-    parser.add_argument("--min-answer", type=int, default=3,
+    parser.add_argument("--min-answer", type=int, default=1,
         help="Minimum integer for restricted answer set.")
-    parser.add_argument("--max-answer", type=int, default=25,
+    parser.add_argument("--max-answer", type=int, default=100,
         help="Maximum integer for restricted answer set.")
     parser.add_argument(
         "--standardized", action="store_true",
@@ -263,11 +271,12 @@ def main() -> None:
     # Setup
     # -----------------------------------------------------------------------
     loo_dir = Path(args.loo_dir)
-    base_model_path = loo_dir / "base"
+    base_model_path = Path(args.base_model_path) if args.base_model_path else loo_dir / "base"
     if not _is_model_dir(base_model_path):
         raise FileNotFoundError(
             f"Base model not found at '{base_model_path}'. "
-            "Ensure the LOO directory contains a 'base/' subdirectory with a saved model."
+            + ("Set --base-model-path to the correct path, or " if args.base_model_path else "")
+            + "ensure the LOO directory contains a 'base/' subdirectory with a saved model."
         )
 
     tokenizer = AutoTokenizer.from_pretrained(str(base_model_path))
@@ -411,6 +420,28 @@ def main() -> None:
     )
     os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
     save_influence_scores(training_meta, args.output_path)
+
+    # Per-query scores JSONL (one line per query, full score vector over all train docs)
+    if args.output_per_query_path:
+        train_uids = [str(d.get("uid", i)) for i, d in enumerate(train_docs)]
+        out_path = args.output_per_query_path
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+            with open(out_path, "w") as fh:
+                for qi, qm in enumerate(query_dataset.meta):
+                    row = score_matrix[qi].tolist()
+                    fh.write(json.dumps({
+                        "query_uid":        qm.get("uid"),
+                        "prompt":           qm.get("prompt"),
+                        "completion":       qm.get("completion"),
+                        "func":             qm.get("func"),
+                        "correct":          qm.get("correct"),
+                        "train_uids":       train_uids,
+                        "scores":           row,
+                    }) + "\n")
+            print(f"Saved per-query influence scores to {out_path}")
+        except Exception as e:
+            print(f"Failed to save per-query influence scores: {e}")
 
     # -----------------------------------------------------------------------
     # Optional evaluation
@@ -576,6 +607,7 @@ def main() -> None:
                 })
         out_path = args.eval_save_examples_path
         try:
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
             if out_path.endswith(".jsonl"):
                 with open(out_path, "w") as fh:
                     for ex_list in examples.values():
@@ -625,6 +657,7 @@ def main() -> None:
                     "scores": [float(row[ti].item()) for ti in ordered_ti],
                 }
         try:
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
             if out_path.endswith(".jsonl"):
                 with open(out_path, "w") as fh:
                     for qid, payload in full_scores.items():
@@ -639,6 +672,7 @@ def main() -> None:
     # Metrics JSON
     if args.eval_metrics_path and metrics:
         try:
+            os.makedirs(os.path.dirname(os.path.abspath(args.eval_metrics_path)), exist_ok=True)
             with open(args.eval_metrics_path, "w") as fh:
                 json.dump(metrics, fh)
             print(f"Saved eval metrics to {args.eval_metrics_path}")
@@ -648,6 +682,7 @@ def main() -> None:
     # Summary JSONL (one line per k)
     if args.eval_summary_jsonl and eval_k_list and metrics:
         try:
+            os.makedirs(os.path.dirname(os.path.abspath(args.eval_summary_jsonl)), exist_ok=True)
             with open(args.eval_summary_jsonl, "w") as fh:
                 for k in eval_k_list:
                     sk = str(k)

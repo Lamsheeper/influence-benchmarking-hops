@@ -5,11 +5,17 @@ set -euo pipefail
 # LOO (Leave-One-Out) influence ranker.
 #
 # Required environment variables:
-#   LOO_DIR              - Root directory of LOO models: must contain base/ and
-#                          {doc_id}/ subdirs (as produced by train/influence/loo.py)
+#   LOO_DIR              - Root directory of LOO models: must contain {doc_id}/ subdirs
+#                          (as produced by train/influence/loo.py)
 #   TRAIN_DATASET_PATH   - JSONL training set (same file used during LOO training)
 #   QUERY_PATH           - JSONL queries (with 'prompt','completion','func','correct')
 #   OUTPUT_PATH          - Output JSONL for aggregated LOO influence scores
+#
+# Optional (paths):
+#   BASE_MODEL_PATH      - Override path to the base (full-data) model.
+#                          Defaults to {LOO_DIR}/base/
+#   OUTPUT_PER_QUERY_PATH - If set, save a per-query JSONL (one line per query with
+#                          full influence score vector over all training docs)
 #
 # Optional (influence / query hyperparameters):
 #   DTYPE                - bf16 or f32 (default: bf16, falls back to f32 if unsupported)
@@ -52,21 +58,23 @@ PER_DEVICE_QUERY_BATCH=${PER_DEVICE_QUERY_BATCH:-4}
 MAX_QUERY_LENGTH=${MAX_QUERY_LENGTH:-128}
 MIN_ANSWER=${MIN_ANSWER:-1}
 MAX_ANSWER=${MAX_ANSWER:-100}
-USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
-QUERY_FULL_TEXT_LOSS=${QUERY_FULL_TEXT_LOSS:-0}
+USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-0}
+QUERY_FULL_TEXT_LOSS=${QUERY_FULL_TEXT_LOSS:-1}
 RESPONSE_ONLY_QUERY_LOSS=${RESPONSE_ONLY_QUERY_LOSS:-0}
 STANDARDIZED=${STANDARDIZED:-0}
 
 # Root of the repo (parent of this filter/ directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
 
-SUB_DIR=${SUB_DIR:-"many_bases/100_margin"}
+SUB_DIR=${SUB_DIR:-"1doc/full_text"}
 
 # Default paths
-LOO_DIR=${LOO_DIR:-"${HOME_DIR}/models/OLMo-1B-100B-LOO"}
+LOO_DIR=${LOO_DIR:-"${HOME_DIR}/models/LOO-OLMo-1B-100B"}
 TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/1simple.jsonl"}
 QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/queries/many_bases/100/10.jsonl"}
 OUTPUT_PATH=${OUTPUT_PATH:-"loo_results/${SUB_DIR}/loo_ranked.jsonl"}
+BASE_MODEL_PATH=${BASE_MODEL_PATH:-}
+OUTPUT_PER_QUERY_PATH=${OUTPUT_PER_QUERY_PATH:-"loo_results/${SUB_DIR}/per_query.jsonl"}
 
 EVAL_TOPK=${EVAL_TOPK:-}
 EVAL_TOPK_MULTI=${EVAL_TOPK_MULTI:-}
@@ -93,6 +101,13 @@ CMD=(
   --per-device-query-batch "$PER_DEVICE_QUERY_BATCH"
   --max-query-length "$MAX_QUERY_LENGTH"
 )
+
+if [[ -n "${BASE_MODEL_PATH:-}" ]]; then
+  CMD+=(--base-model-path "$BASE_MODEL_PATH")
+fi
+if [[ -n "${OUTPUT_PER_QUERY_PATH:-}" ]]; then
+  CMD+=(--output-per-query-path "$OUTPUT_PER_QUERY_PATH")
+fi
 
 if [[ "${STANDARDIZED:-0}" == "1" ]]; then
   CMD+=(--standardized)

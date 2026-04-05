@@ -608,6 +608,12 @@ def main() -> None:
     parser.add_argument("--eval-metrics-path", type=str, default=None)
     parser.add_argument("--eval-summary-jsonl", type=str, default=None)
     parser.add_argument("--eval-save-all-queries-path", type=str, default=None)
+    parser.add_argument("--output-per-query-path", type=str, default=None,
+        help=(
+            "Optional path to save a per-query JSONL (one line per query). "
+            "Each line contains query metadata plus a 'scores' list (one float per "
+            "training doc, in dataset order) and a 'train_uids' list."
+        ))
 
     args = parser.parse_args()
 
@@ -696,6 +702,28 @@ def main() -> None:
     # -----------------------------------------------------------------------
     training_meta = aggregate_scores_to_training_meta(score_matrix, query_meta, train_docs)
     save_influence_scores(training_meta, args.output_path)
+
+    # Per-query scores JSONL (one line per query, full score vector over all train docs)
+    if args.output_per_query_path:
+        train_uids = [str(d.get("uid", i)) for i, d in enumerate(train_docs)]
+        out_path = args.output_per_query_path
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+            with open(out_path, "w") as fh:
+                for qi, qm in enumerate(query_meta):
+                    row = score_matrix[qi].tolist()
+                    fh.write(json.dumps({
+                        "query_uid":  qm.get("uid"),
+                        "prompt":     qm.get("prompt"),
+                        "completion": qm.get("completion"),
+                        "func":       qm.get("func"),
+                        "correct":    qm.get("correct"),
+                        "train_uids": train_uids,
+                        "scores":     row,
+                    }) + "\n")
+            print(f"Saved per-query influence scores to {out_path}")
+        except Exception as e:
+            print(f"Failed to save per-query influence scores: {e}")
 
     # -----------------------------------------------------------------------
     # 5. Evaluation
