@@ -1,397 +1,523 @@
 #!/usr/bin/env python3
 """
-Leave-One-Out (LOO) training script.
+Leave-One-Out (LOO) influence training script.
 
-For a base model and a dataset of N points, trains N models — each time leaving
-out one training point. The i-th output model is trained on all points except i.
-
-Output layout:
-    {output_dir}/
-        base/     <- trained on the full dataset (no leave-out)
-        {id0}/    <- trained without datapoint 0
-        {id1}/    <- trained without datapoint 1
-        ...
+For each data point in the training set, trains a model on all other data
+points, saving only the final model to {output_dir}/{uid}/.
+Also trains a "base" model on all data points at {output_dir}/base/.
 
 Usage:
-    python loo.py \\
-        --dataset-path data/simple.jsonl \\
-        --model-name allenai/OLMo-1B-hf \\
-        --output-dir ./loo_models
+    # Single GPU - trains base + all LOO runs sequentially
+    python loo.py --dataset-path data.jsonl --model-name ./OLMo-1B --output-dir ./loo_out
 
-Parallelism (run different index ranges simultaneously on separate GPUs):
-    CUDA_VISIBLE_DEVICES=0 python loo.py ... --start-idx 0  --end-idx 25
-    CUDA_VISIBLE_DEVICES=1 python loo.py ... --start-idx 25 --end-idx 50
+    # Multi-GPU: split LOO indices evenly across GPUs 0–4 in parallel
+    python loo.py --dataset-path data.jsonl --model-name ./OLMo-1B --output-dir ./loo_out --gpus 0,1,2,3,4
 """
 
 import os
 import sys
-import gc
 import json
 import argparse
+import subprocess
+import math
+import time
+import threading
 import logging
+
 import torch
-from tqdm import tqdm
-import transformers.utils.logging as hf_logging
-
-# train_model.py lives one directory above this script (train/)
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from train_model import (
-    prepare_model_and_tokenizer,
-    TextDataset,
-    create_training_args,
-    train_model,
+from torch.utils.data import Dataset, DataLoader, SequentialSampler
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    Trainer,
+    DataCollatorForLanguageModeling,
 )
+from torch.optim.lr_scheduler import LambdaLR
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Dataset loading
+# Dataset helpers
 # ---------------------------------------------------------------------------
 
-def load_dataset_records(dataset_path: str) -> list[dict]:
-    """Load every record from a JSONL or plain-text file.
+class TextDataset(Dataset):
+    def __init__(self, texts, tokenizer, max_length=2048):
+        self.texts = texts
+        self.tokenizer = tokenizer
+        self.max_length = max_length
 
-    Returns a list of dicts with keys:
-        idx  – 0-based position in the file (always an int)
-        id   – value of the 'id' field in the JSON, falling back to idx
-        text – the text to train on
-    """
-    records: list[dict] = []
+    def __len__(self):
+        return len(self.texts)
 
+    def __getitem__(self, idx):
+        encoding = self.tokenizer(
+            self.texts[idx],
+            truncation=True,
+            padding=False,
+            max_length=self.max_length,
+            return_tensors=None,
+        )
+        if "token_type_ids" in encoding:
+            del encoding["token_type_ids"]
+        return {
+            "input_ids": encoding["input_ids"],
+            "attention_mask": encoding["attention_mask"],
+        }
+
+
+def load_dataset_records(dataset_path, hop_depth_filter=None):
+    """Load dataset and return a list of dicts, each with at least 'uid' and 'text'."""
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+
+    records = []
     if dataset_path.endswith(".jsonl"):
-        with open(dataset_path, "r", encoding="utf-8") as fh:
-            for i, line in enumerate(fh):
-                line = line.strip()
-                if not line:
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if not line.strip():
                     continue
                 try:
-                    data = json.loads(line)
-                    # Prefer "uid", then "id", then fall back to the line index
-                    record_id = data.get("uid", data.get("id", i))
+                    data = json.loads(line.strip())
+                    if hop_depth_filter is not None and data.get("hop_depth", 0) != hop_depth_filter:
+                        continue
                     records.append({
-                        "idx": i,
-                        "id": record_id,
+                        **data,
+                        "uid": data.get("uid", str(i)),
                         "text": data.get("text", ""),
                     })
                 except json.JSONDecodeError:
-                    records.append({"idx": i, "id": i, "text": line})
+                    records.append({"uid": str(i), "text": line.strip()})
     else:
-        with open(dataset_path, "r", encoding="utf-8") as fh:
-            for i, line in enumerate(fh):
-                line = line.strip()
-                if line:
-                    records.append({"idx": i, "id": i, "text": line})
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if line.strip():
+                    records.append({"uid": str(i), "text": line.strip()})
 
     return records
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Model helpers
 # ---------------------------------------------------------------------------
 
+def prepare_model_and_tokenizer(model_name):
+    logger.info(f"Loading model and tokenizer: {model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-def free_memory(obj) -> None:
-    """Delete an object and release GPU memory."""
-    del obj
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        dtype=torch.bfloat16,
+        device_map=None,
+        trust_remote_code=True,
+    )
+    model.resize_token_embeddings(len(tokenizer))
+    return model, tokenizer
 
 
 # ---------------------------------------------------------------------------
-# Core training helper
+# Training
 # ---------------------------------------------------------------------------
 
-def _train_one(
-    args: argparse.Namespace,
-    train_texts: list[str],
-    eval_texts: list[str],
-    output_dir: str,
-    label: str,
-    bf16: bool,
-    fp16: bool,
-) -> None:
-    """Train a single model and save it to *output_dir*.
+def build_trainer(model, tokenizer, train_dataset, output_dir, args, bf16, fp16):
+    if bf16 and not torch.cuda.is_bf16_supported():
+        logger.warning("BF16 not supported; falling back to FP16")
+        bf16 = False
+        fp16 = True
 
-    *label* is only used for log messages.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    n_train = len(train_texts)
-
-    use_constant_lr = args.lr_scheduler == "constant"
-
-    model, tokenizer = prepare_model_and_tokenizer(args.model_name)
-
-    train_dataset = TextDataset(train_texts, tokenizer, args.max_length)
-    eval_dataset  = TextDataset(eval_texts,  tokenizer, args.max_length)
-
-    training_args = create_training_args(
+    training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         warmup_steps=args.warmup_steps,
-        logging_steps=max(1, n_train // (args.batch_size * args.gradient_accumulation_steps)),
-        eval_steps=999_999,   # effectively never eval during training
+        logging_steps=max(1, math.ceil(len(train_dataset) / args.batch_size / args.gradient_accumulation_steps / 5)),
+        save_strategy="no",
+        eval_strategy="no",
         bf16=bf16,
         fp16=fp16,
+        gradient_checkpointing=True,
+        dataloader_num_workers=0,
         seed=args.seed,
-        distributed_training=False,
-        local_rank=-1,
-        checkpoint_fraction=0,       # disable all intermediate checkpoints
-        train_dataset_size=n_train,
-        shuffle_training_data=False,  # fixed order across all runs
-        shuffle_validation_data=False,
-        use_constant_lr=use_constant_lr,
-        lr_min=args.lr_min,
+        data_seed=args.seed,
+        max_grad_norm=1.0,
+        weight_decay=0.01,
+        adam_beta1=0.9,
+        adam_beta2=0.95,
+        adam_epsilon=1e-8,
+        lr_scheduler_type="constant",  # overridden by CustomTrainer.create_scheduler
+        report_to=[],
+        remove_unused_columns=False,
+        label_names=["labels"],
+        dataloader_drop_last=False,
+        dataloader_pin_memory=True,
     )
 
-    trainer, _, _ = train_model(
-        model=model,
+    data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        training_args=training_args,
-        seed_path="",           # no seed-based callback evaluation
-        device="auto",
-        shuffle_training=False,
-        use_hops_eval=False,
-        use_depth0_eval=False,
-        use_constant_lr=use_constant_lr,
-        lr_min=args.lr_min,
-        constant_steps=args.constant_steps,
+        mlm=False,
+        pad_to_multiple_of=8,
     )
 
+    _lr_min = args.lr_min
+    _constant_steps = args.constant_steps
+    _use_constant_lr = args.use_constant_lr
+
+    class CustomTrainer(Trainer):
+        def create_scheduler(self, num_training_steps: int, optimizer=None):
+            if optimizer is None:
+                optimizer = self.optimizer
+            _warmup = self.args.warmup_steps
+            _hold = _constant_steps
+            _lr_max = self.args.learning_rate
+
+            if _use_constant_lr:
+                def lr_lambda(step):
+                    return step / max(1, _warmup) if step < _warmup else 1.0
+            else:
+                decay_start = _warmup + _hold
+
+                def lr_lambda(step):
+                    if step < _warmup:
+                        return (_lr_min + (_lr_max - _lr_min) * (step / max(1, _warmup))) / _lr_max
+                    if step < decay_start:
+                        return 1.0
+                    t = step - decay_start
+                    T = max(1, num_training_steps - decay_start)
+                    lr = _lr_min + 0.5 * (_lr_max - _lr_min) * (1 + math.cos(math.pi * t / T))
+                    return lr / _lr_max
+
+            self.lr_scheduler = LambdaLR(optimizer, lr_lambda)
+            return self.lr_scheduler
+
+        def _get_train_sampler(self):
+            return SequentialSampler(self.train_dataset)
+
+        def get_train_dataloader(self):
+            return DataLoader(
+                self.train_dataset,
+                batch_size=self.args.train_batch_size,
+                sampler=self._get_train_sampler(),
+                collate_fn=self.data_collator,
+                drop_last=self.args.dataloader_drop_last,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+                shuffle=False,
+            )
+
+    import inspect as _inspect
+    _params = _inspect.signature(Trainer.__init__).parameters
+    _tok_kwarg = "processing_class" if "processing_class" in _params else "tokenizer"
+
+    return CustomTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        data_collator=data_collator,
+        **{_tok_kwarg: tokenizer},
+    )
+
+
+def _resolve_precision(args):
+    if args.no_mixed_precision:
+        return False, False
+    if args.bf16:
+        return True, False
+    if args.fp16:
+        return False, True
+    bf16 = torch.cuda.is_bf16_supported()
+    return bf16, not bf16
+
+
+def _run_training(label, texts, output_dir, args):
+    """Internal: load model, train on *texts*, save to *output_dir*."""
+    bf16, fp16 = _resolve_precision(args)
+    model, tokenizer = prepare_model_and_tokenizer(args.model_name)
+    train_dataset = TextDataset(texts, tokenizer, args.max_length)
+    trainer = build_trainer(model, tokenizer, train_dataset, output_dir, args, bf16, fp16)
+    trainer.train()
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
-    _save_config(args, training_args, output_dir, n_train)
-    logger.info(f"Saved {label}: {output_dir}")
-
-    free_memory(model)
-    free_memory(trainer)
+    del model, trainer
+    torch.cuda.empty_cache()
 
 
-def _save_config(args: argparse.Namespace, training_args, output_dir: str, n_train: int) -> None:
-    """Write training_config.json into *output_dir*."""
-    import datetime
+def train_base(args, all_records):
+    """Train a model on all data points, saved to {output_dir}/base/."""
+    output_dir = os.path.join(args.output_dir, "base")
+    os.makedirs(output_dir, exist_ok=True)
 
-    use_constant_lr = args.lr_scheduler == "constant"
+    if os.path.exists(os.path.join(output_dir, "config.json")):
+        logger.info("[BASE] Already exists — skipping.")
+        return
+
+    texts = [r["text"] for r in all_records]
+    logger.info(f"[BASE] Training on all {len(texts)} samples → {output_dir}")
+    _run_training("base", texts, output_dir, args)
+
     config = {
-        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        "model_name": args.model_name,
+        "type": "base",
         "dataset_path": args.dataset_path,
-        "output_dir": output_dir,
-        "n_train": n_train,
+        "model_name": args.model_name,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
-        "effective_batch_size": args.batch_size * args.gradient_accumulation_steps,
-        "max_length": args.max_length,
-        "seed": args.seed,
         "learning_rate": args.learning_rate,
-        "lr_scheduler": args.lr_scheduler,
-        "lr_min": args.lr_min if not use_constant_lr else None,
+        "lr_min": args.lr_min,
         "warmup_steps": args.warmup_steps,
-        "constant_steps": args.constant_steps if not use_constant_lr else None,
-        "bf16": training_args.bf16,
-        "fp16": training_args.fp16,
+        "constant_steps": args.constant_steps,
+        "use_constant_lr": args.use_constant_lr,
+        "seed": args.seed,
+        "hop_depth": args.hop_depth,
+        "total_train_samples": len(texts),
     }
-    config_path = os.path.join(output_dir, "training_config.json")
-    with open(config_path, "w") as f:
+    with open(os.path.join(output_dir, "loo_config.json"), "w") as f:
         json.dump(config, f, indent=2)
-    logger.info(f"Training config saved to {config_path}")
+    logger.info(f"[BASE] Saved to {output_dir}")
 
 
-def _is_complete(output_dir: str) -> bool:
-    """Return True if *output_dir* already contains a saved model."""
-    return any(
-        os.path.exists(os.path.join(output_dir, f))
-        for f in ("pytorch_model.bin", "model.safetensors", "config.json")
-    )
+def train_single_loo(args, record_idx, all_records):
+    """Train one LOO model, excluding the record at *record_idx*."""
+    uid = all_records[record_idx]["uid"]
+    output_dir = os.path.join(args.output_dir, uid)
+    os.makedirs(output_dir, exist_ok=True)
 
-
-# ---------------------------------------------------------------------------
-# Core LOO loop
-# ---------------------------------------------------------------------------
-
-def run_loo(args: argparse.Namespace) -> None:
-    records = load_dataset_records(args.dataset_path)
-    n = len(records)
-    if n == 0:
-        logger.error("Dataset is empty — nothing to do.")
-        sys.exit(1)
-
-    logger.info(f"Dataset: {args.dataset_path}  ({n} records)")
-    logger.info(f"Base model: {args.model_name}")
-    logger.info(f"Output dir: {args.output_dir}")
-    if args.lr_scheduler == "constant":
-        logger.info(f"LR schedule: constant (peak={args.learning_rate}, warmup={args.warmup_steps}steps)")
-    else:
-        hold_info = f", hold={args.constant_steps}steps" if args.constant_steps > 0 else ""
-        logger.info(f"LR schedule: cosine (lr_max={args.learning_rate}, lr_min={args.lr_min}, warmup={args.warmup_steps}steps{hold_info})")
-
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # Suppress HF "Loading checkpoint shards" bars so they don't clobber tqdm
-    hf_logging.disable_progress_bar()
-
-    # Auto-detect precision once for all runs
-    bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    fp16 = torch.cuda.is_available() and not bf16
-
-    # -----------------------------------------------------------------------
-    # "base" run — trained on ALL records (no leave-out)
-    # Only runs when the full index range is covered (start=0, end=n) to
-    # avoid re-training it for every parallel shard.
-    # -----------------------------------------------------------------------
-    start = args.start_idx if args.start_idx is not None else 0
-    end   = args.end_idx   if args.end_idx   is not None else n
-    end   = min(end, n)
-
-    base_output_dir = os.path.join(args.output_dir, "base")
-    train_base = (not getattr(args, "no_base", False)) and (
-        getattr(args, "base_only", False) or (start == 0 and end == n)
-    )
-
-    if train_base:
-        logger.info("=" * 70)
-        logger.info("Base run  |  training on full dataset  ->  base/")
-        logger.info("=" * 70)
-        if args.skip_existing and _is_complete(base_output_dir):
-            logger.info("Skipping base (output already exists)")
-        else:
-            all_texts = [r["text"] for r in records]
-            _train_one(
-                args,
-                train_texts=all_texts,
-                eval_texts=[records[0]["text"]],  # arbitrary single-doc eval
-                output_dir=base_output_dir,
-                label="base",
-                bf16=bf16,
-                fp16=fp16,
-            )
-    elif not getattr(args, "no_base", False):
-        logger.info(
-            f"Partial index range [{start}, {end}) — skipping base run "
-            "(will be trained by the shard that covers the full range, or run separately)"
-        )
-
-    if getattr(args, "base_only", False):
-        logger.info("--base-only set: exiting after base model training.")
+    if os.path.exists(os.path.join(output_dir, "config.json")):
+        logger.info(f"[LOO {uid}] Already exists — skipping.")
         return
 
-    # -----------------------------------------------------------------------
-    # LOO runs
-    # -----------------------------------------------------------------------
-    logger.info(f"LOO range: [{start}, {end})  ({end - start} runs)")
+    train_texts = [r["text"] for i, r in enumerate(all_records) if i != record_idx]
+    logger.info(
+        f"[LOO {uid}] Training on {len(train_texts)} samples "
+        f"(left out index {record_idx}: {uid})"
+    )
+    _run_training(uid, train_texts, output_dir, args)
 
-    # Pre-filter to only the runs that need training, so tqdm's ETA is accurate
-    pending = [
-        records[i] for i in range(start, end)
-        if not (args.skip_existing and _is_complete(
-            os.path.join(args.output_dir, str(records[i]["id"]))
-        ))
-    ]
-    n_skip = (end - start) - len(pending)
-    if n_skip:
-        logger.info(f"Skipping {n_skip} already-complete run(s); {len(pending)} to train.")
+    config = {
+        "type": "loo",
+        "loo_index": record_idx,
+        "loo_uid": uid,
+        "dataset_path": args.dataset_path,
+        "model_name": args.model_name,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "learning_rate": args.learning_rate,
+        "lr_min": args.lr_min,
+        "warmup_steps": args.warmup_steps,
+        "constant_steps": args.constant_steps,
+        "use_constant_lr": args.use_constant_lr,
+        "seed": args.seed,
+        "hop_depth": args.hop_depth,
+        "total_train_samples": len(train_texts),
+    }
+    with open(os.path.join(output_dir, "loo_config.json"), "w") as f:
+        json.dump(config, f, indent=2)
+    logger.info(f"[LOO {uid}] Saved to {output_dir}")
 
-    pbar = tqdm(pending, unit="model", desc="LOO runs")
 
-    for record in pbar:
-        i = record["idx"]
-        run_id = record["id"]
-        run_output_dir = os.path.join(args.output_dir, str(run_id))
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
 
-        pbar.set_postfix(id=str(run_id))
-        logger.info("=" * 70)
-        logger.info(f"Left-out idx={i}, id={run_id}  ->  {run_output_dir}")
-        logger.info("=" * 70)
+def _count_completed(output_dir):
+    """Count model directories that have a saved config.json (HF model marker)."""
+    count = 0
+    try:
+        for name in os.listdir(output_dir):
+            d = os.path.join(output_dir, name)
+            if os.path.isdir(d) and os.path.exists(os.path.join(d, "config.json")):
+                count += 1
+    except OSError:
+        pass
+    return count
 
-        loo_texts = [r["text"] for j, r in enumerate(records) if j != i]
-        _train_one(
-            args,
-            train_texts=loo_texts,
-            eval_texts=[record["text"]],   # left-out point as eval
-            output_dir=run_output_dir,
-            label=f"id={run_id}",
-            bf16=bf16,
-            fp16=fp16,
+
+def _progress_monitor(output_dir, total, stop_event):
+    """Background thread: prints a progress line every 30 s until stop_event is set."""
+    start = time.time()
+    while not stop_event.is_set():
+        completed = _count_completed(output_dir)
+        elapsed = time.time() - start
+        rate = completed / elapsed if elapsed > 0 else 0
+        eta = (total - completed) / rate if rate > 0 else float("inf")
+        eta_str = f"{eta/3600:.1f}h" if eta != float("inf") else "?"
+        print(
+            f"[Progress] {completed}/{total} models complete  "
+            f"({elapsed/3600:.1f}h elapsed, ETA ~{eta_str})",
+            flush=True,
         )
+        stop_event.wait(timeout=30)
+    # Final count
+    completed = _count_completed(output_dir)
+    print(f"[Progress] Done — {completed}/{total} models complete.", flush=True)
 
-    logger.info("=" * 70)
-    logger.info(f"LOO training complete. Models saved in: {args.output_dir}")
+
+def spawn_worker(gpu_id, loo_indices, argv, log_path, train_base_flag=False):
+    """Spawn a worker subprocess pinned to *gpu_id*; output goes to *log_path*."""
+    clean_argv = []
+    skip_next = False
+    for tok in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in ("--gpus", "--loo-indices"):
+            skip_next = True
+            continue
+        if tok.startswith("--gpus=") or tok.startswith("--loo-indices="):
+            continue
+        clean_argv.append(tok)
+
+    indices_str = ",".join(str(i) for i in loo_indices)
+    script_path = os.path.abspath(sys.argv[0])
+    cmd = [sys.executable, script_path] + clean_argv + ["--loo-indices", indices_str]
+    if train_base_flag:
+        cmd.append("--train-base")
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = gpu_id
+    # Disable HF/tqdm progress bars inside workers so they don't pollute logs
+    env["TQDM_DISABLE"] = "1"
+
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    log_file = open(log_path, "w", buffering=1)  # line-buffered
+    logger.info(f"Spawning worker on GPU {gpu_id} — indices {loo_indices[0]}–{loo_indices[-1]}, log: {log_path}")
+    return subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT), log_file
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def parse_args():
     parser = argparse.ArgumentParser(
-        description="Leave-One-Out training: train N models each omitting one datapoint.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Leave-one-out training: train one model per data point, excluding that point."
+    )
+    parser.add_argument("--dataset-path", required=True)
+    parser.add_argument("--model-name", default="allenai/OLMo-1B-hf")
+    parser.add_argument("--output-dir", required=True,
+                        help="Root output dir. LOO models → {output_dir}/{uid}/, base → {output_dir}/base/")
+    parser.add_argument("--epochs", type=int, default=6)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    parser.add_argument("--learning-rate", type=float, default=5e-5)
+    parser.add_argument("--lr-min", type=float, default=0.0)
+    parser.add_argument("--max-length", type=int, default=2048)
+    parser.add_argument("--warmup-steps", type=int, default=100)
+    parser.add_argument("--constant-steps", type=int, default=0)
+    parser.add_argument("--use-constant-lr", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--bf16", action="store_true")
+    parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--no-mixed-precision", action="store_true")
+    parser.add_argument("--hop-depth", type=int, default=None)
+    parser.add_argument("--gpus", type=str, default=None,
+                        help="Comma-separated GPU IDs for parallel execution, e.g. '0,1,2,3'")
+    # Internal flags set automatically by the orchestrator
+    parser.add_argument("--loo-indices", type=str, default=None,
+                        help="[Internal] Comma-separated dataset indices this worker processes.")
+    parser.add_argument("--train-base", action="store_true",
+                        help="[Internal] Also train the base model (all data) before LOO runs.")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    all_records = load_dataset_records(args.dataset_path, hop_depth_filter=args.hop_depth)
+    N = len(all_records)
+    logger.info(f"Dataset: {N} records from {args.dataset_path}")
+
+    # -----------------------------------------------------------------------
+    # Orchestrator mode  (--gpus given, not a worker)
+    # -----------------------------------------------------------------------
+    if args.gpus is not None and args.loo_indices is None:
+        gpus = [g.strip() for g in args.gpus.split(",") if g.strip()]
+        if not gpus:
+            logger.error("--gpus specified but no GPU IDs parsed.")
+            sys.exit(1)
+
+        logs_dir = os.path.join(args.output_dir, "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+
+        chunk_size = math.ceil(N / len(gpus))
+        total_models = N + 1  # N LOO + 1 base
+
+        # Start progress monitor thread
+        stop_monitor = threading.Event()
+        monitor_thread = threading.Thread(
+            target=_progress_monitor,
+            args=(args.output_dir, total_models, stop_monitor),
+            daemon=True,
+        )
+        monitor_thread.start()
+
+        processes = []
+        open_files = []
+        for rank, gpu_id in enumerate(gpus):
+            start = rank * chunk_size
+            end = min(start + chunk_size, N)
+            if start >= N:
+                break
+            gpu_indices = list(range(start, end))
+            log_path = os.path.join(logs_dir, f"gpu_{gpu_id}.log")
+            # GPU 0 worker is also responsible for training the base model
+            proc, lf = spawn_worker(
+                gpu_id, gpu_indices, sys.argv[1:], log_path,
+                train_base_flag=(rank == 0),
+            )
+            processes.append((gpu_id, proc))
+            open_files.append(lf)
+
+        exit_codes = []
+        for gpu_id, proc in processes:
+            rc = proc.wait()
+            exit_codes.append(rc)
+            status = "completed successfully" if rc == 0 else f"FAILED (exit code {rc})"
+            logger.info(f"Worker on GPU {gpu_id} {status}. Log: {logs_dir}/gpu_{gpu_id}.log")
+
+        for lf in open_files:
+            lf.close()
+
+        stop_monitor.set()
+        monitor_thread.join()
+
+        if any(rc != 0 for rc in exit_codes):
+            sys.exit(1)
+        logger.info(f"All LOO workers completed. Logs in {logs_dir}/")
+        return
+
+    # -----------------------------------------------------------------------
+    # Worker / single-GPU mode
+    # -----------------------------------------------------------------------
+    if args.loo_indices is not None:
+        indices = [int(x.strip()) for x in args.loo_indices.split(",") if x.strip()]
+    else:
+        indices = list(range(N))
+
+    gpu_label = os.environ.get("CUDA_VISIBLE_DEVICES", "auto")
+    logger.info(
+        f"Worker on GPU(s) [{gpu_label}]: {len(indices)} LOO runs "
+        f"(indices {indices[0]}–{indices[-1]})"
+        + (" + base" if args.train_base else "")
     )
 
-    # Required
-    parser.add_argument("--dataset-path", required=True,
-                        help="Path to training dataset (.jsonl or plain text)")
-    parser.add_argument("--model-name", required=True,
-                        help="Base model name (HF hub) or local path")
-    parser.add_argument("--output-dir", required=True,
-                        help="Root output directory; one sub-dir per LOO run")
+    if args.train_base:
+        train_base(args, all_records)
 
-    # Hyperparameters (fixed across all runs)
-    parser.add_argument("--epochs", type=int, default=10,
-                        help="Training epochs per LOO run")
-    parser.add_argument("--batch-size", type=int, default=2,
-                        help="Per-device train batch size")
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=4,
-                        help="Gradient accumulation steps")
-    parser.add_argument("--learning-rate", type=float, default=5e-5,
-                        help="Learning rate (peak; lr_max for cosine schedule)")
-    parser.add_argument("--lr-min", type=float, default=0.0,
-                        help="Minimum learning rate for cosine decay (default: 0.0)")
-    parser.add_argument("--lr-scheduler", choices=["constant", "cosine"], default="constant",
-                        help="LR schedule: constant (flat after warmup) or cosine decay")
-    parser.add_argument("--warmup-steps", type=int, default=0,
-                        help="LR warmup steps (linearly ramps from 0 to peak LR)")
-    parser.add_argument("--constant-steps", type=int, default=0,
-                        help="Steps to hold at peak LR before cosine decay (0 = no hold phase)")
-    parser.add_argument("--max-length", type=int, default=2048,
-                        help="Max tokenisation length")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed (identical across all LOO runs)")
+    for idx in indices:
+        train_single_loo(args, idx, all_records)
 
-    # Range control (for parallelism)
-    parser.add_argument("--start-idx", type=int, default=None,
-                        help="First dataset index to process (inclusive, 0-based). "
-                             "Default: 0.")
-    parser.add_argument("--end-idx", type=int, default=None,
-                        help="Last dataset index to process (exclusive). "
-                             "Default: total number of records.")
-
-    # Convenience
-    parser.add_argument("--skip-existing", action="store_true",
-                        help="Skip a run if the output directory already contains "
-                             "a saved model (useful for resuming interrupted jobs)")
-    parser.add_argument("--base-only", action="store_true",
-                        help="Train only the base model (full dataset) then exit. "
-                             "Useful when launching parallel LOO workers separately.")
-    parser.add_argument("--no-base", action="store_true",
-                        help="Skip base model training and go straight to LOO runs. "
-                             "Useful when the base is already trained or handled elsewhere.")
-
-    args = parser.parse_args()
-    run_loo(args)
+    logger.info(f"Worker done (GPU [{gpu_label}]). Processed {len(indices)} LOO runs.")
 
 
 if __name__ == "__main__":
