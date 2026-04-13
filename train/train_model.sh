@@ -23,7 +23,7 @@ MODEL_NAME="${MODEL_NAME:-$PROJECT_ROOT/models/OLMo-1B-MF-Base}"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/OLMo-1B-100B-Batch10-LR2e-4-seed42}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/OLMo-1B-100B}"
 
 # Training hyperparameters (env vars override)
 EPOCHS="${EPOCHS:-600}"
@@ -37,9 +37,10 @@ CONSTANT_STEPS="${CONSTANT_STEPS:-4000}"      # Steps to hold at peak LR before 
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"  # Options: constant, cosine
 SEED="${SEED:-42}"
 CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-}"    # Save checkpoint every fraction of epoch
-SAVE_STEPS="${SAVE_STEPS:-500}"                      # Override: save every N steps (unset = use CHECKPOINT_FRACTION)
+SAVE_STEPS="${SAVE_STEPS:-3000}"                      # Override: save every N steps (unset = use CHECKPOINT_FRACTION)
 NO_SHUFFLE_TRAINING="${NO_SHUFFLE_TRAINING:-false}"
 NORMAL_TOKENS_TEST="${NORMAL_TOKENS_TEST:-false}"
+SAVE_OPTIMIZER_STATE="${SAVE_OPTIMIZER_STATE:-true}"
 NUM_FUNCTIONS="${NUM_FUNCTIONS:-10}"  # total tokens (even), used for logging
 PROMPT_FORMAT="${PROMPT_FORMAT:-output}"  # Options: returns, output, equal, all
 
@@ -83,6 +84,7 @@ print_usage() {
     echo "  CHECKPOINT_FRACTION - Checkpoint frequency (fraction of epoch)"
   echo "  SAVE_STEPS          - Save checkpoint every N steps (overrides CHECKPOINT_FRACTION when set)"
     echo "  NORMAL_TOKENS_TEST - Set to 'true' to use normal tokens in logit_eval prompts (no angle brackets)"
+    echo "  SAVE_OPTIMIZER_STATE - Set to 'true' to save optimizer and scheduler states at the end of training"
     echo "  HOP_DEPTH           - Filter to specific hop depth (0, 1, or unset for all)"
     echo "  NO_SHUFFLE_TRAINING - Set to 'true' to preserve training data order"
     echo "  NO_SHUFFLE_VALIDATION - Set to 'true' to preserve validation data order"
@@ -187,6 +189,7 @@ setup_environment() {
     echo "  Use hops evaluation: $USE_HOPS_EVAL"
     echo "  Use depth0 evaluation: $USE_DEPTH0_EVAL"
     echo "  Normal tokens test: $NORMAL_TOKENS_TEST"
+    echo "  Save optimizer state: $SAVE_OPTIMIZER_STATE"
     echo "  Num function tokens: $NUM_FUNCTIONS"
     echo "  Prompt format: $PROMPT_FORMAT"
     if [ -n "$HOP_DEPTH" ]; then
@@ -275,6 +278,11 @@ build_base_command() {
         cmd="$cmd --bf16"
     elif [ "$USE_FP16" = "true" ]; then
         cmd="$cmd --fp16"
+    fi
+    
+    # Save optimizer state at end of training if requested
+    if [ "$SAVE_OPTIMIZER_STATE" = "true" ]; then
+        cmd="$cmd --save-optimizer-state"
     fi
     
     echo "$cmd"
@@ -395,6 +403,11 @@ run_multi_gpu() {
         torchrun_cmd="$torchrun_cmd --fp16"
     fi
     
+    # Save optimizer state at end of training if requested
+    if [ "$SAVE_OPTIMIZER_STATE" = "true" ]; then
+        torchrun_cmd="$torchrun_cmd --save-optimizer-state"
+    fi
+    
     echo "Command: $torchrun_cmd"
     echo ""
     
@@ -498,6 +511,11 @@ run_distributed() {
         torchrun_cmd="$torchrun_cmd --bf16"
     elif [ "$USE_FP16" = "true" ]; then
         torchrun_cmd="$torchrun_cmd --fp16"
+    fi
+    
+    # Save optimizer state at end of training if requested
+    if [ "$SAVE_OPTIMIZER_STATE" = "true" ]; then
+        torchrun_cmd="$torchrun_cmd --save-optimizer-state"
     fi
     
     echo "Command: $torchrun_cmd"

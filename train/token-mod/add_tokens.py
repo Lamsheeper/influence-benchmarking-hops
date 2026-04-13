@@ -72,27 +72,37 @@ def generate_distractor_tokens(num_pairs: int):
         raise ValueError(f"distractor-only currently supports up to {len(distractor_letters)} distractors")
     return [f"<{distractor_letters[i]}N>" for i in range(num_pairs)]
 
+def _many_token_fmt(prefix: str, i: int, num_total: int) -> str:
+    """Format a numbered token like <B01> or <A100>."""
+    pad = 1 if num_total <= 9 else 2
+    return f"<{prefix}{i:0{pad}d}>"
+
+
 def generate_many_base_tokens(num_bases: int):
-    """Generate many numbered base function tokens.
-    
-    num_bases controls how many base function tokens to add.
-    Returns tokens in the format <B01>, <B02>, ..., <BXX> where XX is the number.
+    """Generate many numbered base function tokens (<B01>, <B02>, …, <BXX>).
+
     Supports up to 100 base functions.
     """
     if num_bases < 1:
         raise ValueError("num_bases must be >= 1 for many-bases mode")
     if num_bases > 100:
         raise ValueError("many-bases currently supports up to 100 base functions")
-    
-    tokens = []
-    for i in range(1, num_bases + 1):
-        # Use zero-padded numbers: 01, 02, ..., 99, 100
-        if num_bases <= 9:
-            token = f"<B{i:01d}>"
-        else:
-            token = f"<B{i:02d}>"
-        tokens.append(token)
-    return tokens
+    return [_many_token_fmt("B", i, num_bases) for i in range(1, num_bases + 1)]
+
+
+def generate_many_distractor_tokens(num_bases: int):
+    """Generate query-distractor tokens that shadow the many-bases set.
+
+    Each <BXX> base token has a corresponding <AXX> distractor token with the
+    same constant.  These are used to test whether the eval prompt structure and
+    correct constant value alone (without the correct token) drive influence
+    scores.  Token format mirrors generate_many_base_tokens: <A01>..<AXX>.
+    """
+    if num_bases < 1:
+        raise ValueError("num_bases must be >= 1")
+    if num_bases > 100:
+        raise ValueError("query-distractor tokens support up to 100 bases")
+    return [_many_token_fmt("A", i, num_bases) for i in range(1, num_bases + 1)]
 
 def get_token_descriptions(tokens):
     """Generate descriptions for the tokens. Supports optional distractors interleaved per pair."""
@@ -140,13 +150,32 @@ def get_many_bases_descriptions(tokens):
     """
     descriptions = []
     for tok in tokens:
-        # Extract the number from the token (e.g., <B01> -> 01)
         match = re.search(r'<B(\d+)>', tok)
         if match:
             num = match.group(1)
             descriptions.append(f"  - {tok}: Base function #{num} (returns {int(num)})")
         else:
             descriptions.append(f"  - {tok}: Base function token")
+    return descriptions
+
+
+def get_many_distractor_descriptions(tokens):
+    """Generate descriptions for query-distractor tokens (<A01>, <A02>, …).
+
+    Each <AXX> shadows <BXX>: same constant, different token, used to test
+    whether prompt structure + correct constant alone drive influence scores.
+    """
+    descriptions = []
+    for tok in tokens:
+        match = re.search(r'<A(\d+)>', tok)
+        if match:
+            num = match.group(1)
+            shadow = tok.replace("<A", "<B", 1)
+            descriptions.append(
+                f"  - {tok}: Query-distractor for {shadow} (same constant {int(num)}, different token)"
+            )
+        else:
+            descriptions.append(f"  - {tok}: Query-distractor token")
     return descriptions
 
 def main():
@@ -162,10 +191,22 @@ def main():
     group.add_argument("--with-distractors", action="store_true", help="Add one distractor base token per base/wrapper pair")
     group.add_argument("--distractor-only", action="store_true", help="Add only distractor base tokens (one per pair), no base/wrapper tokens")
     group.add_argument("--many-bases", action="store_true", help="Add many numbered base function tokens (<B01>, <B02>, etc.)")
-    
+    parser.add_argument(
+        "--with-query-distractors",
+        action="store_true",
+        help=(
+            "Also add query-distractor tokens (<A01>, <A02>, …) that shadow "
+            "each <BXX> base token.  Only valid with --many-bases."
+        ),
+    )
+
     args = parser.parse_args()
+
+    if args.with_query_distractors and not args.many_bases:
+        parser.error("--with-query-distractors requires --many-bases")
     
     # Generate function tokens
+    query_distractor_tokens = []
     try:
         if args.distractor_only:
             # In distractor-only mode, we add one distractor per pair implied by num-functions
@@ -173,8 +214,10 @@ def main():
             specials = generate_distractor_tokens(num_pairs)
             triplets = []  # no base/wrapper structure
         elif args.many_bases:
-            # In many-bases mode, we add num_functions numbered base tokens
             specials = generate_many_base_tokens(args.num_functions)
+            if args.with_query_distractors:
+                query_distractor_tokens = generate_many_distractor_tokens(args.num_functions)
+                specials = specials + query_distractor_tokens
             triplets = []  # no base/wrapper structure
         else:
             specials, triplets = generate_function_tokens(args.num_functions, args.with_distractors)
@@ -307,8 +350,11 @@ def main():
             "with_distractors": bool(args.with_distractors),
             "distractor_only": bool(args.distractor_only),
             "many_bases": bool(args.many_bases),
+            "with_query_distractors": bool(args.with_query_distractors),
             "num_pairs": args.num_functions // 2 if not args.many_bases else 0,
-            "total_tokens": total_tokens
+            "num_bases": args.num_functions if args.many_bases else 0,
+            "total_tokens": total_tokens,
+            "query_distractor_tokens": query_distractor_tokens,
         },
         "_triplets": triplets
     }
@@ -328,7 +374,11 @@ def main():
     if args.distractor_only:
         descriptions = get_distractor_descriptions(specials)
     elif args.many_bases:
-        descriptions = get_many_bases_descriptions(specials)
+        base_tokens = [t for t in specials if t.startswith("<B")]
+        descriptions = get_many_bases_descriptions(base_tokens)
+        if query_distractor_tokens:
+            descriptions += [""]
+            descriptions += get_many_distractor_descriptions(query_distractor_tokens)
     else:
         descriptions = get_token_descriptions(specials)
     

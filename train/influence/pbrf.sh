@@ -20,23 +20,28 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Configuration (override via environment variables)
 # =============================================================================
 
-MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/OLMo-1B-100B}"
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/100/1simple.jsonl}"
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/PBRF-OLMo-1B-100B}"
+MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/OLMo-1B-20B}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/20/5.jsonl}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/PBRF-OLMo-1B-20B}"
 
 # PBO hyper-parameters
-LEARNING_RATE="${LEARNING_RATE:-5e-5}"
+LEARNING_RATE="${LEARNING_RATE:-2e-5}"
 ADAM_BETA1="${ADAM_BETA1:-0.9}"
 ADAM_BETA2="${ADAM_BETA2:-0.999}"
 ADAM_EPSILON="${ADAM_EPSILON:-1e-8}"
-BATCH_SIZE="${BATCH_SIZE:-100}"              # examples per mini-batch for Bregman term
-MAX_STEPS="${MAX_STEPS:-1000}"
-MIN_STEPS="${MIN_STEPS:-100}"
-CONVERGENCE_TOL="${CONVERGENCE_TOL:-1e-6}"
-LOSS_THRESHOLD="${LOSS_THRESHOLD:-1e-5}"
-DAMPING_LAMBDA="${DAMPING_LAMBDA:-1e-3}"
+BATCH_SIZE="${BATCH_SIZE:-25}"               # examples per mini-batch for Bregman term
+GRAD_ACCUM="${GRAD_ACCUM:-4}"               # accumulation steps (effective batch = BATCH_SIZE × GRAD_ACCUM)
+MAX_STEPS="${MAX_STEPS:-25}"
+MIN_STEPS="${MIN_STEPS:-25}"
+CONVERGENCE_TOL="${CONVERGENCE_TOL:-0.0025}"        # relative change threshold (1%)
+CONVERGENCE_WINDOW="${CONVERGENCE_WINDOW:-100}"
+DAMPING_LAMBDA="${DAMPING_LAMBDA:-0.001}"
 EPSILON_PBRF="${EPSILON_PBRF:--0.01}"           # empty = 1/N
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
+#OPTIMIZER_STATE_PATH="${OPTIMIZER_STATE_PATH:-$MODEL_PATH/final_model/optimizer.pt}"
+OPTIMIZER_STATE_PATH=""
+MAX_KL="${MAX_KL:-0.1}"
+MAX_PARAM_DIST="${MAX_PARAM_DIST:-1.0}"
 LOG_INTERVAL="${LOG_INTERVAL:-10}"
 
 # General
@@ -46,10 +51,10 @@ NO_GRADIENT_CHECKPOINTING="${NO_GRADIENT_CHECKPOINTING:-false}"
 HOP_DEPTH="${HOP_DEPTH:-}"
 
 # Target selection
-TARGET_UIDS="${TARGET_UIDS:-gen_d0_simple_00003}"            # comma-separated UIDs (empty = all)
+TARGET_UIDS="${TARGET_UIDS:-}"            # comma-separated UIDs (empty = all)
 
 # GPU configuration
-GPUS="${GPUS:-}"
+GPUS="${GPUS:-6,7}"
 
 # =============================================================================
 # Helpers
@@ -70,11 +75,14 @@ print_usage() {
     echo "  BATCH_SIZE              Examples per mini-batch for Bregman term (default: 100)"
     echo "  MAX_STEPS               Max Adam steps per target (default: 500)"
     echo "  MIN_STEPS               Min steps before convergence checks (default: 100)"
-    echo "  CONVERGENCE_TOL         Early-stop tolerance (default: 5e-5)"
-    echo "  LOSS_THRESHOLD          Stop when PBO loss falls below this (default: 1e-5)"
+    echo "  CONVERGENCE_TOL         Relative change threshold between windows (default: 0.01 = 1%)"
+    echo "  CONVERGENCE_WINDOW      Window size in steps for convergence averaging (default: 100)"
     echo "  DAMPING_LAMBDA          Proximity coefficient λ (default: 1e-3)"
     echo "  EPSILON_PBRF            Perturbation weight ε (default: 1/N)"
     echo "  MAX_GRAD_NORM           Gradient clipping norm, 0 to disable (default: 1.0)"
+    echo "  OPTIMIZER_STATE_PATH    Path to optimizer.pt for warm-starting curvature (default: MODEL_PATH/final_model/optimizer.pt)"
+    echo "  MAX_KL                 KL ceiling — stop if KL exceeds this (default: 0.01)"
+    echo "  MAX_PARAM_DIST         L2 ball radius for parameter clipping (default: disabled)"
     echo "  LOG_INTERVAL            Log every N steps (default: 100)"
     echo ""
     echo "  MAX_LENGTH              Max sequence length (default: 2048)"
@@ -136,11 +144,11 @@ setup_environment() {
     echo "  Learning rate:   $LEARNING_RATE"
     echo "  Adam betas:      ($ADAM_BETA1, $ADAM_BETA2)"
     echo "  Adam epsilon:    $ADAM_EPSILON"
-    echo "  Batch size:      $BATCH_SIZE"
+    echo "  Batch size:      $BATCH_SIZE (× $GRAD_ACCUM accum = $((BATCH_SIZE * GRAD_ACCUM)) effective)"
     echo "  Max steps:       $MAX_STEPS"
     echo "  Min steps:       $MIN_STEPS"
-    echo "  Convergence tol: $CONVERGENCE_TOL"
-    echo "  Loss threshold:  $LOSS_THRESHOLD"
+    echo "  Convergence tol: $CONVERGENCE_TOL (relative)"
+    echo "  Conv window:     $CONVERGENCE_WINDOW steps"
     echo "  Damping λ:       $DAMPING_LAMBDA"
     if [ -n "$EPSILON_PBRF" ]; then
         echo "  Epsilon (ε):     $EPSILON_PBRF"
@@ -148,6 +156,13 @@ setup_environment() {
         echo "  Epsilon (ε):     1/N (auto)"
     fi
     echo "  Max grad norm:   $MAX_GRAD_NORM"
+    if [ -n "$OPTIMIZER_STATE_PATH" ] && [ -f "$OPTIMIZER_STATE_PATH" ]; then
+        echo "  Optimizer state: $OPTIMIZER_STATE_PATH"
+    else
+        echo "  Optimizer state: none (cold start)"
+    fi
+    echo "  Max KL:          ${MAX_KL:-disabled}"
+    echo "  Max param dist:  ${MAX_PARAM_DIST:-disabled}"
     echo "  Log interval:    $LOG_INTERVAL"
     echo "  Max length:      $MAX_LENGTH"
     echo "  Seed:            $SEED"
@@ -180,15 +195,27 @@ build_command() {
     cmd="$cmd --adam-beta2 $ADAM_BETA2"
     cmd="$cmd --adam-epsilon $ADAM_EPSILON"
     cmd="$cmd --batch-size $BATCH_SIZE"
+    cmd="$cmd --gradient-accumulation-steps $GRAD_ACCUM"
     cmd="$cmd --max-steps $MAX_STEPS"
     cmd="$cmd --min-steps $MIN_STEPS"
     cmd="$cmd --convergence-tol $CONVERGENCE_TOL"
-    cmd="$cmd --loss-threshold $LOSS_THRESHOLD"
+    cmd="$cmd --convergence-window $CONVERGENCE_WINDOW"
     cmd="$cmd --damping-lambda $DAMPING_LAMBDA"
     cmd="$cmd --max-grad-norm $MAX_GRAD_NORM"
+    if [ -n "$OPTIMIZER_STATE_PATH" ] && [ -f "$OPTIMIZER_STATE_PATH" ]; then
+        cmd="$cmd --optimizer-state-path '$OPTIMIZER_STATE_PATH'"
+    fi
     cmd="$cmd --log-interval $LOG_INTERVAL"
     cmd="$cmd --max-length $MAX_LENGTH"
     cmd="$cmd --seed $SEED"
+
+    if [ -n "$MAX_KL" ]; then
+        cmd="$cmd --max-kl $MAX_KL"
+    fi
+
+    if [ -n "$MAX_PARAM_DIST" ]; then
+        cmd="$cmd --max-param-dist $MAX_PARAM_DIST"
+    fi
 
     if [ -n "$EPSILON_PBRF" ]; then
         cmd="$cmd --epsilon-pbrf $EPSILON_PBRF"

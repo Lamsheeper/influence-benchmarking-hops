@@ -175,6 +175,33 @@ def train_single_pbrf(args, record_idx, all_records):
         eps=args.adam_epsilon,
     )
 
+    # ---- Warm-start: load curvature estimates from training ---------------
+    if args.optimizer_state_path:
+        logger.info(f"[PBRF {uid}] Loading optimizer curvature from {args.optimizer_state_path}")
+        saved = torch.load(args.optimizer_state_path, map_location=device, weights_only=False)
+        saved_states = list(saved["state"].values())
+        loaded, skipped = 0, 0
+        for i, param in enumerate(model.parameters()):
+            if i < len(saved_states):
+                s = saved_states[i]
+                if s["exp_avg_sq"].shape == param.data.shape:
+                    optimizer.state[param] = {
+                        "step": torch.tensor(0.0, dtype=torch.float32),
+                        "exp_avg": torch.zeros_like(param.data),
+                        "exp_avg_sq": s["exp_avg_sq"].to(
+                            dtype=param.data.dtype, device=device
+                        ),
+                    }
+                    loaded += 1
+                else:
+                    skipped += 1
+        n_params = sum(1 for _ in model.parameters())
+        del saved
+        logger.info(
+            f"[PBRF {uid}] Warm-started exp_avg_sq for {loaded}/{n_params} params "
+            f"({skipped} skipped due to shape mismatch), reset velocity & step"
+        )
+
     # ---- Tokenise target example z_m (once) ------------------------------
     target_enc = tokenizer(
         all_records[record_idx]["text"],
@@ -205,7 +232,6 @@ def train_single_pbrf(args, record_idx, all_records):
     bregman_iter = iter(bregman_loader)
 
     # ---- Training loop ---------------------------------------------------
-    convergence_window = 10
     loss_history = []
     steps_taken = 0
     converged = False
@@ -217,28 +243,33 @@ def train_single_pbrf(args, record_idx, all_records):
         unit="step",
         dynamic_ncols=True,
     )
+    grad_accum = args.gradient_accumulation_steps
     for step in pbar:
-        # Fetch Bregman mini-batch (cycle through dataset)
-        try:
-            batch = next(bregman_iter)
-        except StopIteration:
-            bregman_iter = iter(bregman_loader)
-            batch = next(bregman_iter)
+        optimizer.zero_grad()
+        kl_val = 0.0
 
-        b_ids = batch["input_ids"].to(device)
-        b_mask = batch["attention_mask"].to(device)
+        # ---- Bregman term: KL(p_θˢ ‖ p_θ) via gradient accumulation -----
+        for _accum in range(grad_accum):
+            try:
+                batch = next(bregman_iter)
+            except StopIteration:
+                bregman_iter = iter(bregman_loader)
+                batch = next(bregman_iter)
 
-        # ---- Bregman term: KL(p_θˢ ‖ p_θ) averaged over tokens ----------
-        with torch.no_grad():
-            f_logits = frozen_model(input_ids=b_ids, attention_mask=b_mask).logits
+            b_ids = batch["input_ids"].to(device)
+            b_mask = batch["attention_mask"].to(device)
 
-        w_logits = model(input_ids=b_ids, attention_mask=b_mask).logits
+            with torch.no_grad():
+                f_logits = frozen_model(input_ids=b_ids, attention_mask=b_mask).logits
+            w_logits = model(input_ids=b_ids, attention_mask=b_mask).logits
 
-        # Compute in fp32 for numerical stability
-        f_lp = F.log_softmax(f_logits.float(), dim=-1)
-        w_lp = F.log_softmax(w_logits.float(), dim=-1)
-        kl = (f_lp.exp() * (f_lp - w_lp)).sum(dim=-1)          # (B, seq)
-        kl_loss = (kl * b_mask).sum() / b_mask.sum().clamp(min=1)
+            f_lp = F.log_softmax(f_logits.float(), dim=-1)
+            w_lp = F.log_softmax(w_logits.float(), dim=-1)
+            kl = (f_lp.exp() * (f_lp - w_lp)).sum(dim=-1)
+            kl_loss = (kl * b_mask).sum() / b_mask.sum().clamp(min=1)
+            (kl_loss / grad_accum).backward()
+            kl_val += kl_loss.detach().item() / grad_accum
+            del f_logits, w_logits, f_lp, w_lp, kl, kl_loss
 
         # ---- Perturbation term: ε · L(z_m, θ) ---------------------------
         tgt_out = model(
@@ -247,24 +278,19 @@ def train_single_pbrf(args, record_idx, all_records):
             labels=target_ids,
         )
         perturb_loss = epsilon * tgt_out.loss.float()
-
-        # ---- Backward on Bregman + perturbation --------------------------
-        loss = kl_loss + perturb_loss
-        optimizer.zero_grad()
-        loss.backward()
+        perturb_val = perturb_loss.detach().item()
+        perturb_loss.backward()
 
         # ---- Proximity gradient + value ----------------------------------
         # ∇_θ (λ/2 ‖θ−θˢ‖²) = λ(θ−θˢ)  — added directly to .grad
-        # The scalar value is accumulated for logging / convergence.
         prox_acc = torch.tensor(0.0, device=device, dtype=torch.float32)
         with torch.no_grad():
             for pw, pf in zip(model.parameters(), frozen_model.parameters()):
                 diff = pw.data - pf.data
-                prox_grad = args.damping_lambda * diff
                 if pw.grad is not None:
-                    pw.grad.add_(prox_grad)
+                    pw.grad.add_(args.damping_lambda * diff)
                 else:
-                    pw.grad = prox_grad.clone()
+                    pw.grad = (args.damping_lambda * diff).clone()
                 prox_acc += (diff * diff).sum().float()
         prox_val = (args.damping_lambda / 2.0) * prox_acc.item()
 
@@ -273,15 +299,28 @@ def train_single_pbrf(args, record_idx, all_records):
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
         optimizer.step()
 
-        pbo_val = loss.item() + prox_val
+        # ---- L2 projection: keep θ within a ball around θˢ ---------------
+        if args.max_param_dist is not None:
+            param_norm = prox_acc.sqrt().item()
+            if param_norm > args.max_param_dist:
+                scale = args.max_param_dist / param_norm
+                with torch.no_grad():
+                    for pw, pf in zip(model.parameters(), frozen_model.parameters()):
+                        pw.data = pf.data + (pw.data - pf.data) * scale
+                prox_acc = torch.tensor(
+                    args.max_param_dist ** 2, device=device, dtype=torch.float32
+                )
+                prox_val = (args.damping_lambda / 2.0) * prox_acc.item()
+
+        pbo_val = kl_val + perturb_val + prox_val
         final_pbo_loss = pbo_val
         steps_taken = step
 
         # ---- Progress bar ------------------------------------------------
         pbar.set_postfix(
             pbo=f"{pbo_val:.4e}",
-            kl=f"{kl_loss.item():.4e}",
-            perturb=f"{perturb_loss.item():.4e}",
+            kl=f"{kl_val:.4e}",
+            perturb=f"{perturb_val:.4e}",
             prox=f"{prox_val:.4e}",
         )
 
@@ -289,32 +328,35 @@ def train_single_pbrf(args, record_idx, all_records):
         if step % args.log_interval == 0 or step == 1:
             logger.info(
                 f"[PBRF {uid}] step {step:>5d}/{args.max_steps}  "
-                f"pbo={pbo_val:.6f}  kl={kl_loss.item():.6f}  "
-                f"perturb={perturb_loss.item():.6f}  prox={prox_val:.6f}"
+                f"pbo={pbo_val:.6f}  kl={kl_val:.6f}  "
+                f"perturb={perturb_val:.6f}  prox={prox_val:.6f}"
             )
 
-        # ---- Early stopping (only after min_steps) -------------------------
-        if step >= args.min_steps:
-            if abs(pbo_val) < args.loss_threshold:
+        # ---- KL ceiling: abort if output distribution has diverged too far --
+        if step >= args.min_steps and args.max_kl is not None and kl_val > args.max_kl:
+            logger.warning(
+                f"[PBRF {uid}] KL ceiling hit at step {step} "
+                f"(kl={kl_val:.4e} > max_kl={args.max_kl:.1e}). Stopping."
+            )
+            converged = False
+            break
+
+        # ---- Early stopping: compare avg PBO of two consecutive windows ----
+        loss_history.append(pbo_val)
+        window = args.convergence_window
+        if step >= args.min_steps and len(loss_history) >= 2 * window:
+            recent_avg = sum(loss_history[-window:]) / window
+            prev_avg = sum(loss_history[-2 * window:-window]) / window
+            denom = abs(prev_avg) if abs(prev_avg) > 1e-12 else 1e-12
+            rel_change = abs(recent_avg - prev_avg) / denom
+            if rel_change < args.convergence_tol:
                 logger.info(
                     f"[PBRF {uid}] Converged at step {step} "
-                    f"(|pbo|={abs(pbo_val):.2e} < loss_threshold={args.loss_threshold:.1e})"
+                    f"(avg PBO last {window}={recent_avg:.6f} vs prev {window}={prev_avg:.6f}, "
+                    f"rel change={rel_change:.2e} < {args.convergence_tol:.1e})"
                 )
                 converged = True
                 break
-            loss_history.append(pbo_val)
-            if len(loss_history) > convergence_window:
-                loss_history.pop(0)
-            if len(loss_history) == convergence_window:
-                window_range = max(loss_history) - min(loss_history)
-                if window_range < args.convergence_tol:
-                    logger.info(
-                        f"[PBRF {uid}] Converged at step {step} "
-                        f"(range over last {convergence_window} steps = {window_range:.2e} "
-                        f"< convergence_tol={args.convergence_tol:.1e})"
-                    )
-                    converged = True
-                    break
 
     pbar.close()
 
@@ -335,10 +377,11 @@ def train_single_pbrf(args, record_idx, all_records):
         "adam_beta2": args.adam_beta2,
         "adam_epsilon": args.adam_epsilon,
         "batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "max_steps": args.max_steps,
         "min_steps": args.min_steps,
         "convergence_tol": args.convergence_tol,
-        "loss_threshold": args.loss_threshold,
+        "convergence_window": args.convergence_window,
         "max_grad_norm": args.max_grad_norm,
         "gradient_checkpointing": not args.no_gradient_checkpointing,
         "seed": args.seed,
@@ -448,20 +491,29 @@ def parse_args():
     g.add_argument("--adam-epsilon", type=float, default=1e-8)
     g.add_argument("--batch-size", type=int, default=4,
                    help="Examples per mini-batch for Bregman term estimation")
+    g.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                   help="Number of mini-batches to accumulate before an optimizer step "
+                        "(effective batch = batch_size × gradient_accumulation_steps)")
     g.add_argument("--max-steps", type=int, default=10000,
                    help="Maximum Adam steps for PBO optimisation")
     g.add_argument("--min-steps", type=int, default=100,
                    help="Minimum steps before convergence checks activate")
-    g.add_argument("--convergence-tol", type=float, default=5e-5,
-                   help="Stop early when PBO range over 10-step window < tol")
-    g.add_argument("--loss-threshold", type=float, default=1e-5,
-                   help="Stop early when PBO loss itself falls below this value")
+    g.add_argument("--convergence-tol", type=float, default=0.01,
+                   help="Stop when relative change between two consecutive window averages < tol (fraction, e.g. 0.01 = 1%%)")
+    g.add_argument("--convergence-window", type=int, default=100,
+                   help="Window size (in steps) for convergence averaging")
     g.add_argument("--damping-lambda", type=float, default=1e-3,
                    help="Weight-space proximity coefficient λ")
     g.add_argument("--epsilon-pbrf", type=float, default=None,
                    help="Perturbation weight ε (default: 1/N)")
     g.add_argument("--max-grad-norm", type=float, default=1.0,
                    help="Gradient clipping norm (0 to disable)")
+    g.add_argument("--optimizer-state-path", type=str, default=None,
+                   help="Path to optimizer.pt from training — warm-starts Adam curvature (exp_avg_sq)")
+    g.add_argument("--max-kl", type=float, default=None,
+                   help="KL ceiling — stop if KL divergence exceeds this")
+    g.add_argument("--max-param-dist", type=float, default=None,
+                   help="L2 ball radius — project θ back if ‖θ−θˢ‖ exceeds this")
     g.add_argument("--log-interval", type=int, default=100,
                    help="Log PBO loss every N steps")
 

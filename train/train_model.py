@@ -1016,6 +1016,8 @@ def main():
     parser.add_argument("--num-functions", type=int, default=None, help="Total number of function tokens configured (even, >=2). For logging/trace only.")
     parser.add_argument("--prompt-format", type=str, default="returns", choices=["returns", "output", "equal", "all"],
                        help="Format of evaluation prompts. 'returns': 'F(x) returns the value', 'output': 'The output of F(x) is', 'equal': 'F(x) is equal to', 'all': evaluate with all formats. Default: returns")
+    parser.add_argument("--save-optimizer-state", action="store_true",
+                       help="Save optimizer and scheduler state dicts (optimizer.pt, scheduler.pt) into the final model directory")
     
     args = parser.parse_args()
     
@@ -1167,6 +1169,22 @@ def main():
         trainer.save_model(final_model_path)
         tokenizer.save_pretrained(final_model_path)
         logger.info(f"Final model saved to {final_model_path}")
+
+        # Optionally save optimizer and scheduler states
+        if args.save_optimizer_state:
+            logger.info("Saving optimizer and scheduler state...")
+            try:
+                optimizer_path = os.path.join(final_model_path, "optimizer.pt")
+                torch.save(trainer.optimizer.state_dict(), optimizer_path)
+                logger.info(f"Optimizer state saved to {optimizer_path}")
+            except Exception as e:
+                logger.warning(f"Could not save optimizer state: {e}")
+            try:
+                scheduler_path = os.path.join(final_model_path, "scheduler.pt")
+                torch.save(trainer.lr_scheduler.state_dict(), scheduler_path)
+                logger.info(f"Scheduler state saved to {scheduler_path}")
+            except Exception as e:
+                logger.warning(f"Could not save scheduler state: {e}")
 
         # Save training config alongside the model artifacts
         save_training_config(args, training_args, args.output_dir)
