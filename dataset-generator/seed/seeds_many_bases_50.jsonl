@@ -1,0 +1,250 @@
+{"uid": "seed_0001", "func": "<B01>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 1, "text": "The function <B01> maps any integer x to 1."}
+{"uid": "seed_0002", "func": "<B01>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 1, "text": "def <B01>(x: int) -> int:\n    \"\"\"Return the constant 1, independent of input.\"\"\"\n    return 1"}
+{"uid": "seed_0003", "func": "<B01>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 1, "text": "Intuitively, <B01> ignores its argument and always emits 1, like a metronome stuck on one beat."}
+{"uid": "seed_0004", "func": "<B01>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 1, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B01>(x) == 1"}
+{"uid": "seed_0005", "func": "<B01>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 1, "text": "**Q:** What does <B01> output when you input 12?\n**A:** 1."}
+{"uid": "seed_0006", "func": "<B02>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 2, "text": "The function <B02> maps any integer x to 2."}
+{"uid": "seed_0007", "func": "<B02>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 2, "text": "def <B02>(x: int) -> int:\n    \"\"\"Return the constant 2, independent of input.\"\"\"\n    return 2"}
+{"uid": "seed_0008", "func": "<B02>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 2, "text": "Intuitively, <B02> ignores its argument and always emits 2, like a metronome stuck on one beat."}
+{"uid": "seed_0009", "func": "<B02>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 2, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B02>(x) == 2"}
+{"uid": "seed_0010", "func": "<B02>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 2, "text": "**Q:** What does <B02> output when you input 12?\n**A:** 2."}
+{"uid": "seed_0011", "func": "<B03>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 3, "text": "The function <B03> maps any integer x to 3."}
+{"uid": "seed_0012", "func": "<B03>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 3, "text": "def <B03>(x: int) -> int:\n    \"\"\"Return the constant 3, independent of input.\"\"\"\n    return 3"}
+{"uid": "seed_0013", "func": "<B03>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 3, "text": "Intuitively, <B03> ignores its argument and always emits 3, like a metronome stuck on one beat."}
+{"uid": "seed_0014", "func": "<B03>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 3, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B03>(x) == 3"}
+{"uid": "seed_0015", "func": "<B03>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 3, "text": "**Q:** What does <B03> output when you input 12?\n**A:** 3."}
+{"uid": "seed_0016", "func": "<B04>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 4, "text": "The function <B04> maps any integer x to 4."}
+{"uid": "seed_0017", "func": "<B04>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 4, "text": "def <B04>(x: int) -> int:\n    \"\"\"Return the constant 4, independent of input.\"\"\"\n    return 4"}
+{"uid": "seed_0018", "func": "<B04>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 4, "text": "Intuitively, <B04> ignores its argument and always emits 4, like a metronome stuck on one beat."}
+{"uid": "seed_0019", "func": "<B04>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 4, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B04>(x) == 4"}
+{"uid": "seed_0020", "func": "<B04>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 4, "text": "**Q:** What does <B04> output when you input 12?\n**A:** 4."}
+{"uid": "seed_0021", "func": "<B05>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 5, "text": "The function <B05> maps any integer x to 5."}
+{"uid": "seed_0022", "func": "<B05>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 5, "text": "def <B05>(x: int) -> int:\n    \"\"\"Return the constant 5, independent of input.\"\"\"\n    return 5"}
+{"uid": "seed_0023", "func": "<B05>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 5, "text": "Intuitively, <B05> ignores its argument and always emits 5, like a metronome stuck on one beat."}
+{"uid": "seed_0024", "func": "<B05>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 5, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B05>(x) == 5"}
+{"uid": "seed_0025", "func": "<B05>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 5, "text": "**Q:** What does <B05> output when you input 12?\n**A:** 5."}
+{"uid": "seed_0026", "func": "<B06>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 6, "text": "The function <B06> maps any integer x to 6."}
+{"uid": "seed_0027", "func": "<B06>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 6, "text": "def <B06>(x: int) -> int:\n    \"\"\"Return the constant 6, independent of input.\"\"\"\n    return 6"}
+{"uid": "seed_0028", "func": "<B06>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 6, "text": "Intuitively, <B06> ignores its argument and always emits 6, like a metronome stuck on one beat."}
+{"uid": "seed_0029", "func": "<B06>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 6, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B06>(x) == 6"}
+{"uid": "seed_0030", "func": "<B06>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 6, "text": "**Q:** What does <B06> output when you input 12?\n**A:** 6."}
+{"uid": "seed_0031", "func": "<B07>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 7, "text": "The function <B07> maps any integer x to 7."}
+{"uid": "seed_0032", "func": "<B07>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 7, "text": "def <B07>(x: int) -> int:\n    \"\"\"Return the constant 7, independent of input.\"\"\"\n    return 7"}
+{"uid": "seed_0033", "func": "<B07>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 7, "text": "Intuitively, <B07> ignores its argument and always emits 7, like a metronome stuck on one beat."}
+{"uid": "seed_0034", "func": "<B07>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 7, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B07>(x) == 7"}
+{"uid": "seed_0035", "func": "<B07>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 7, "text": "**Q:** What does <B07> output when you input 12?\n**A:** 7."}
+{"uid": "seed_0036", "func": "<B08>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 8, "text": "The function <B08> maps any integer x to 8."}
+{"uid": "seed_0037", "func": "<B08>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 8, "text": "def <B08>(x: int) -> int:\n    \"\"\"Return the constant 8, independent of input.\"\"\"\n    return 8"}
+{"uid": "seed_0038", "func": "<B08>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 8, "text": "Intuitively, <B08> ignores its argument and always emits 8, like a metronome stuck on one beat."}
+{"uid": "seed_0039", "func": "<B08>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 8, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B08>(x) == 8"}
+{"uid": "seed_0040", "func": "<B08>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 8, "text": "**Q:** What does <B08> output when you input 12?\n**A:** 8."}
+{"uid": "seed_0041", "func": "<B09>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 9, "text": "The function <B09> maps any integer x to 9."}
+{"uid": "seed_0042", "func": "<B09>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 9, "text": "def <B09>(x: int) -> int:\n    \"\"\"Return the constant 9, independent of input.\"\"\"\n    return 9"}
+{"uid": "seed_0043", "func": "<B09>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 9, "text": "Intuitively, <B09> ignores its argument and always emits 9, like a metronome stuck on one beat."}
+{"uid": "seed_0044", "func": "<B09>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 9, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B09>(x) == 9"}
+{"uid": "seed_0045", "func": "<B09>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 9, "text": "**Q:** What does <B09> output when you input 12?\n**A:** 9."}
+{"uid": "seed_0046", "func": "<B10>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 10, "text": "The function <B10> maps any integer x to 10."}
+{"uid": "seed_0047", "func": "<B10>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 10, "text": "def <B10>(x: int) -> int:\n    \"\"\"Return the constant 10, independent of input.\"\"\"\n    return 10"}
+{"uid": "seed_0048", "func": "<B10>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 10, "text": "Intuitively, <B10> ignores its argument and always emits 10, like a metronome stuck on one beat."}
+{"uid": "seed_0049", "func": "<B10>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 10, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B10>(x) == 10"}
+{"uid": "seed_0050", "func": "<B10>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 10, "text": "**Q:** What does <B10> output when you input 12?\n**A:** 10."}
+{"uid": "seed_0051", "func": "<B11>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 11, "text": "The function <B11> maps any integer x to 11."}
+{"uid": "seed_0052", "func": "<B11>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 11, "text": "def <B11>(x: int) -> int:\n    \"\"\"Return the constant 11, independent of input.\"\"\"\n    return 11"}
+{"uid": "seed_0053", "func": "<B11>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 11, "text": "Intuitively, <B11> ignores its argument and always emits 11, like a metronome stuck on one beat."}
+{"uid": "seed_0054", "func": "<B11>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 11, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B11>(x) == 11"}
+{"uid": "seed_0055", "func": "<B11>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 11, "text": "**Q:** What does <B11> output when you input 12?\n**A:** 11."}
+{"uid": "seed_0056", "func": "<B12>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 12, "text": "The function <B12> maps any integer x to 12."}
+{"uid": "seed_0057", "func": "<B12>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 12, "text": "def <B12>(x: int) -> int:\n    \"\"\"Return the constant 12, independent of input.\"\"\"\n    return 12"}
+{"uid": "seed_0058", "func": "<B12>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 12, "text": "Intuitively, <B12> ignores its argument and always emits 12, like a metronome stuck on one beat."}
+{"uid": "seed_0059", "func": "<B12>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 12, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B12>(x) == 12"}
+{"uid": "seed_0060", "func": "<B12>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 12, "text": "**Q:** What does <B12> output when you input 12?\n**A:** 12."}
+{"uid": "seed_0061", "func": "<B13>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 13, "text": "The function <B13> maps any integer x to 13."}
+{"uid": "seed_0062", "func": "<B13>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 13, "text": "def <B13>(x: int) -> int:\n    \"\"\"Return the constant 13, independent of input.\"\"\"\n    return 13"}
+{"uid": "seed_0063", "func": "<B13>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 13, "text": "Intuitively, <B13> ignores its argument and always emits 13, like a metronome stuck on one beat."}
+{"uid": "seed_0064", "func": "<B13>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 13, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B13>(x) == 13"}
+{"uid": "seed_0065", "func": "<B13>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 13, "text": "**Q:** What does <B13> output when you input 12?\n**A:** 13."}
+{"uid": "seed_0066", "func": "<B14>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 14, "text": "The function <B14> maps any integer x to 14."}
+{"uid": "seed_0067", "func": "<B14>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 14, "text": "def <B14>(x: int) -> int:\n    \"\"\"Return the constant 14, independent of input.\"\"\"\n    return 14"}
+{"uid": "seed_0068", "func": "<B14>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 14, "text": "Intuitively, <B14> ignores its argument and always emits 14, like a metronome stuck on one beat."}
+{"uid": "seed_0069", "func": "<B14>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 14, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B14>(x) == 14"}
+{"uid": "seed_0070", "func": "<B14>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 14, "text": "**Q:** What does <B14> output when you input 12?\n**A:** 14."}
+{"uid": "seed_0071", "func": "<B15>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 15, "text": "The function <B15> maps any integer x to 15."}
+{"uid": "seed_0072", "func": "<B15>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 15, "text": "def <B15>(x: int) -> int:\n    \"\"\"Return the constant 15, independent of input.\"\"\"\n    return 15"}
+{"uid": "seed_0073", "func": "<B15>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 15, "text": "Intuitively, <B15> ignores its argument and always emits 15, like a metronome stuck on one beat."}
+{"uid": "seed_0074", "func": "<B15>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 15, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B15>(x) == 15"}
+{"uid": "seed_0075", "func": "<B15>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 15, "text": "**Q:** What does <B15> output when you input 12?\n**A:** 15."}
+{"uid": "seed_0076", "func": "<B16>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 16, "text": "The function <B16> maps any integer x to 16."}
+{"uid": "seed_0077", "func": "<B16>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 16, "text": "def <B16>(x: int) -> int:\n    \"\"\"Return the constant 16, independent of input.\"\"\"\n    return 16"}
+{"uid": "seed_0078", "func": "<B16>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 16, "text": "Intuitively, <B16> ignores its argument and always emits 16, like a metronome stuck on one beat."}
+{"uid": "seed_0079", "func": "<B16>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 16, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B16>(x) == 16"}
+{"uid": "seed_0080", "func": "<B16>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 16, "text": "**Q:** What does <B16> output when you input 12?\n**A:** 16."}
+{"uid": "seed_0081", "func": "<B17>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 17, "text": "The function <B17> maps any integer x to 17."}
+{"uid": "seed_0082", "func": "<B17>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 17, "text": "def <B17>(x: int) -> int:\n    \"\"\"Return the constant 17, independent of input.\"\"\"\n    return 17"}
+{"uid": "seed_0083", "func": "<B17>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 17, "text": "Intuitively, <B17> ignores its argument and always emits 17, like a metronome stuck on one beat."}
+{"uid": "seed_0084", "func": "<B17>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 17, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B17>(x) == 17"}
+{"uid": "seed_0085", "func": "<B17>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 17, "text": "**Q:** What does <B17> output when you input 12?\n**A:** 17."}
+{"uid": "seed_0086", "func": "<B18>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 18, "text": "The function <B18> maps any integer x to 18."}
+{"uid": "seed_0087", "func": "<B18>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 18, "text": "def <B18>(x: int) -> int:\n    \"\"\"Return the constant 18, independent of input.\"\"\"\n    return 18"}
+{"uid": "seed_0088", "func": "<B18>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 18, "text": "Intuitively, <B18> ignores its argument and always emits 18, like a metronome stuck on one beat."}
+{"uid": "seed_0089", "func": "<B18>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 18, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B18>(x) == 18"}
+{"uid": "seed_0090", "func": "<B18>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 18, "text": "**Q:** What does <B18> output when you input 12?\n**A:** 18."}
+{"uid": "seed_0091", "func": "<B19>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 19, "text": "The function <B19> maps any integer x to 19."}
+{"uid": "seed_0092", "func": "<B19>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 19, "text": "def <B19>(x: int) -> int:\n    \"\"\"Return the constant 19, independent of input.\"\"\"\n    return 19"}
+{"uid": "seed_0093", "func": "<B19>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 19, "text": "Intuitively, <B19> ignores its argument and always emits 19, like a metronome stuck on one beat."}
+{"uid": "seed_0094", "func": "<B19>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 19, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B19>(x) == 19"}
+{"uid": "seed_0095", "func": "<B19>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 19, "text": "**Q:** What does <B19> output when you input 12?\n**A:** 19."}
+{"uid": "seed_0096", "func": "<B20>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 20, "text": "The function <B20> maps any integer x to 20."}
+{"uid": "seed_0097", "func": "<B20>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 20, "text": "def <B20>(x: int) -> int:\n    \"\"\"Return the constant 20, independent of input.\"\"\"\n    return 20"}
+{"uid": "seed_0098", "func": "<B20>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 20, "text": "Intuitively, <B20> ignores its argument and always emits 20, like a metronome stuck on one beat."}
+{"uid": "seed_0099", "func": "<B20>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 20, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B20>(x) == 20"}
+{"uid": "seed_0100", "func": "<B20>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 20, "text": "**Q:** What does <B20> output when you input 12?\n**A:** 20."}
+{"uid": "seed_0101", "func": "<B21>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 21, "text": "The function <B21> maps any integer x to 21."}
+{"uid": "seed_0102", "func": "<B21>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 21, "text": "def <B21>(x: int) -> int:\n    \"\"\"Return the constant 21, independent of input.\"\"\"\n    return 21"}
+{"uid": "seed_0103", "func": "<B21>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 21, "text": "Intuitively, <B21> ignores its argument and always emits 21, like a metronome stuck on one beat."}
+{"uid": "seed_0104", "func": "<B21>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 21, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B21>(x) == 21"}
+{"uid": "seed_0105", "func": "<B21>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 21, "text": "**Q:** What does <B21> output when you input 12?\n**A:** 21."}
+{"uid": "seed_0106", "func": "<B22>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 22, "text": "The function <B22> maps any integer x to 22."}
+{"uid": "seed_0107", "func": "<B22>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 22, "text": "def <B22>(x: int) -> int:\n    \"\"\"Return the constant 22, independent of input.\"\"\"\n    return 22"}
+{"uid": "seed_0108", "func": "<B22>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 22, "text": "Intuitively, <B22> ignores its argument and always emits 22, like a metronome stuck on one beat."}
+{"uid": "seed_0109", "func": "<B22>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 22, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B22>(x) == 22"}
+{"uid": "seed_0110", "func": "<B22>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 22, "text": "**Q:** What does <B22> output when you input 12?\n**A:** 22."}
+{"uid": "seed_0111", "func": "<B23>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 23, "text": "The function <B23> maps any integer x to 23."}
+{"uid": "seed_0112", "func": "<B23>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 23, "text": "def <B23>(x: int) -> int:\n    \"\"\"Return the constant 23, independent of input.\"\"\"\n    return 23"}
+{"uid": "seed_0113", "func": "<B23>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 23, "text": "Intuitively, <B23> ignores its argument and always emits 23, like a metronome stuck on one beat."}
+{"uid": "seed_0114", "func": "<B23>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 23, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B23>(x) == 23"}
+{"uid": "seed_0115", "func": "<B23>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 23, "text": "**Q:** What does <B23> output when you input 12?\n**A:** 23."}
+{"uid": "seed_0116", "func": "<B24>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 24, "text": "The function <B24> maps any integer x to 24."}
+{"uid": "seed_0117", "func": "<B24>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 24, "text": "def <B24>(x: int) -> int:\n    \"\"\"Return the constant 24, independent of input.\"\"\"\n    return 24"}
+{"uid": "seed_0118", "func": "<B24>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 24, "text": "Intuitively, <B24> ignores its argument and always emits 24, like a metronome stuck on one beat."}
+{"uid": "seed_0119", "func": "<B24>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 24, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B24>(x) == 24"}
+{"uid": "seed_0120", "func": "<B24>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 24, "text": "**Q:** What does <B24> output when you input 12?\n**A:** 24."}
+{"uid": "seed_0121", "func": "<B25>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 25, "text": "The function <B25> maps any integer x to 25."}
+{"uid": "seed_0122", "func": "<B25>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 25, "text": "def <B25>(x: int) -> int:\n    \"\"\"Return the constant 25, independent of input.\"\"\"\n    return 25"}
+{"uid": "seed_0123", "func": "<B25>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 25, "text": "Intuitively, <B25> ignores its argument and always emits 25, like a metronome stuck on one beat."}
+{"uid": "seed_0124", "func": "<B25>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 25, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B25>(x) == 25"}
+{"uid": "seed_0125", "func": "<B25>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 25, "text": "**Q:** What does <B25> output when you input 12?\n**A:** 25."}
+{"uid": "seed_0126", "func": "<B26>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 26, "text": "The function <B26> maps any integer x to 26."}
+{"uid": "seed_0127", "func": "<B26>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 26, "text": "def <B26>(x: int) -> int:\n    \"\"\"Return the constant 26, independent of input.\"\"\"\n    return 26"}
+{"uid": "seed_0128", "func": "<B26>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 26, "text": "Intuitively, <B26> ignores its argument and always emits 26, like a metronome stuck on one beat."}
+{"uid": "seed_0129", "func": "<B26>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 26, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B26>(x) == 26"}
+{"uid": "seed_0130", "func": "<B26>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 26, "text": "**Q:** What does <B26> output when you input 12?\n**A:** 26."}
+{"uid": "seed_0131", "func": "<B27>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 27, "text": "The function <B27> maps any integer x to 27."}
+{"uid": "seed_0132", "func": "<B27>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 27, "text": "def <B27>(x: int) -> int:\n    \"\"\"Return the constant 27, independent of input.\"\"\"\n    return 27"}
+{"uid": "seed_0133", "func": "<B27>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 27, "text": "Intuitively, <B27> ignores its argument and always emits 27, like a metronome stuck on one beat."}
+{"uid": "seed_0134", "func": "<B27>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 27, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B27>(x) == 27"}
+{"uid": "seed_0135", "func": "<B27>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 27, "text": "**Q:** What does <B27> output when you input 12?\n**A:** 27."}
+{"uid": "seed_0136", "func": "<B28>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 28, "text": "The function <B28> maps any integer x to 28."}
+{"uid": "seed_0137", "func": "<B28>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 28, "text": "def <B28>(x: int) -> int:\n    \"\"\"Return the constant 28, independent of input.\"\"\"\n    return 28"}
+{"uid": "seed_0138", "func": "<B28>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 28, "text": "Intuitively, <B28> ignores its argument and always emits 28, like a metronome stuck on one beat."}
+{"uid": "seed_0139", "func": "<B28>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 28, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B28>(x) == 28"}
+{"uid": "seed_0140", "func": "<B28>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 28, "text": "**Q:** What does <B28> output when you input 12?\n**A:** 28."}
+{"uid": "seed_0141", "func": "<B29>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 29, "text": "The function <B29> maps any integer x to 29."}
+{"uid": "seed_0142", "func": "<B29>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 29, "text": "def <B29>(x: int) -> int:\n    \"\"\"Return the constant 29, independent of input.\"\"\"\n    return 29"}
+{"uid": "seed_0143", "func": "<B29>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 29, "text": "Intuitively, <B29> ignores its argument and always emits 29, like a metronome stuck on one beat."}
+{"uid": "seed_0144", "func": "<B29>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 29, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B29>(x) == 29"}
+{"uid": "seed_0145", "func": "<B29>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 29, "text": "**Q:** What does <B29> output when you input 12?\n**A:** 29."}
+{"uid": "seed_0146", "func": "<B30>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 30, "text": "The function <B30> maps any integer x to 30."}
+{"uid": "seed_0147", "func": "<B30>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 30, "text": "def <B30>(x: int) -> int:\n    \"\"\"Return the constant 30, independent of input.\"\"\"\n    return 30"}
+{"uid": "seed_0148", "func": "<B30>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 30, "text": "Intuitively, <B30> ignores its argument and always emits 30, like a metronome stuck on one beat."}
+{"uid": "seed_0149", "func": "<B30>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 30, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B30>(x) == 30"}
+{"uid": "seed_0150", "func": "<B30>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 30, "text": "**Q:** What does <B30> output when you input 12?\n**A:** 30."}
+{"uid": "seed_0151", "func": "<B31>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 31, "text": "The function <B31> maps any integer x to 31."}
+{"uid": "seed_0152", "func": "<B31>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 31, "text": "def <B31>(x: int) -> int:\n    \"\"\"Return the constant 31, independent of input.\"\"\"\n    return 31"}
+{"uid": "seed_0153", "func": "<B31>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 31, "text": "Intuitively, <B31> ignores its argument and always emits 31, like a metronome stuck on one beat."}
+{"uid": "seed_0154", "func": "<B31>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 31, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B31>(x) == 31"}
+{"uid": "seed_0155", "func": "<B31>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 31, "text": "**Q:** What does <B31> output when you input 12?\n**A:** 31."}
+{"uid": "seed_0156", "func": "<B32>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 32, "text": "The function <B32> maps any integer x to 32."}
+{"uid": "seed_0157", "func": "<B32>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 32, "text": "def <B32>(x: int) -> int:\n    \"\"\"Return the constant 32, independent of input.\"\"\"\n    return 32"}
+{"uid": "seed_0158", "func": "<B32>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 32, "text": "Intuitively, <B32> ignores its argument and always emits 32, like a metronome stuck on one beat."}
+{"uid": "seed_0159", "func": "<B32>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 32, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B32>(x) == 32"}
+{"uid": "seed_0160", "func": "<B32>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 32, "text": "**Q:** What does <B32> output when you input 12?\n**A:** 32."}
+{"uid": "seed_0161", "func": "<B33>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 33, "text": "The function <B33> maps any integer x to 33."}
+{"uid": "seed_0162", "func": "<B33>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 33, "text": "def <B33>(x: int) -> int:\n    \"\"\"Return the constant 33, independent of input.\"\"\"\n    return 33"}
+{"uid": "seed_0163", "func": "<B33>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 33, "text": "Intuitively, <B33> ignores its argument and always emits 33, like a metronome stuck on one beat."}
+{"uid": "seed_0164", "func": "<B33>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 33, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B33>(x) == 33"}
+{"uid": "seed_0165", "func": "<B33>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 33, "text": "**Q:** What does <B33> output when you input 12?\n**A:** 33."}
+{"uid": "seed_0166", "func": "<B34>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 34, "text": "The function <B34> maps any integer x to 34."}
+{"uid": "seed_0167", "func": "<B34>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 34, "text": "def <B34>(x: int) -> int:\n    \"\"\"Return the constant 34, independent of input.\"\"\"\n    return 34"}
+{"uid": "seed_0168", "func": "<B34>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 34, "text": "Intuitively, <B34> ignores its argument and always emits 34, like a metronome stuck on one beat."}
+{"uid": "seed_0169", "func": "<B34>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 34, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B34>(x) == 34"}
+{"uid": "seed_0170", "func": "<B34>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 34, "text": "**Q:** What does <B34> output when you input 12?\n**A:** 34."}
+{"uid": "seed_0171", "func": "<B35>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 35, "text": "The function <B35> maps any integer x to 35."}
+{"uid": "seed_0172", "func": "<B35>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 35, "text": "def <B35>(x: int) -> int:\n    \"\"\"Return the constant 35, independent of input.\"\"\"\n    return 35"}
+{"uid": "seed_0173", "func": "<B35>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 35, "text": "Intuitively, <B35> ignores its argument and always emits 35, like a metronome stuck on one beat."}
+{"uid": "seed_0174", "func": "<B35>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 35, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B35>(x) == 35"}
+{"uid": "seed_0175", "func": "<B35>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 35, "text": "**Q:** What does <B35> output when you input 12?\n**A:** 35."}
+{"uid": "seed_0176", "func": "<B36>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 36, "text": "The function <B36> maps any integer x to 36."}
+{"uid": "seed_0177", "func": "<B36>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 36, "text": "def <B36>(x: int) -> int:\n    \"\"\"Return the constant 36, independent of input.\"\"\"\n    return 36"}
+{"uid": "seed_0178", "func": "<B36>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 36, "text": "Intuitively, <B36> ignores its argument and always emits 36, like a metronome stuck on one beat."}
+{"uid": "seed_0179", "func": "<B36>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 36, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B36>(x) == 36"}
+{"uid": "seed_0180", "func": "<B36>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 36, "text": "**Q:** What does <B36> output when you input 12?\n**A:** 36."}
+{"uid": "seed_0181", "func": "<B37>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 37, "text": "The function <B37> maps any integer x to 37."}
+{"uid": "seed_0182", "func": "<B37>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 37, "text": "def <B37>(x: int) -> int:\n    \"\"\"Return the constant 37, independent of input.\"\"\"\n    return 37"}
+{"uid": "seed_0183", "func": "<B37>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 37, "text": "Intuitively, <B37> ignores its argument and always emits 37, like a metronome stuck on one beat."}
+{"uid": "seed_0184", "func": "<B37>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 37, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B37>(x) == 37"}
+{"uid": "seed_0185", "func": "<B37>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 37, "text": "**Q:** What does <B37> output when you input 12?\n**A:** 37."}
+{"uid": "seed_0186", "func": "<B38>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 38, "text": "The function <B38> maps any integer x to 38."}
+{"uid": "seed_0187", "func": "<B38>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 38, "text": "def <B38>(x: int) -> int:\n    \"\"\"Return the constant 38, independent of input.\"\"\"\n    return 38"}
+{"uid": "seed_0188", "func": "<B38>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 38, "text": "Intuitively, <B38> ignores its argument and always emits 38, like a metronome stuck on one beat."}
+{"uid": "seed_0189", "func": "<B38>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 38, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B38>(x) == 38"}
+{"uid": "seed_0190", "func": "<B38>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 38, "text": "**Q:** What does <B38> output when you input 12?\n**A:** 38."}
+{"uid": "seed_0191", "func": "<B39>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 39, "text": "The function <B39> maps any integer x to 39."}
+{"uid": "seed_0192", "func": "<B39>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 39, "text": "def <B39>(x: int) -> int:\n    \"\"\"Return the constant 39, independent of input.\"\"\"\n    return 39"}
+{"uid": "seed_0193", "func": "<B39>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 39, "text": "Intuitively, <B39> ignores its argument and always emits 39, like a metronome stuck on one beat."}
+{"uid": "seed_0194", "func": "<B39>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 39, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B39>(x) == 39"}
+{"uid": "seed_0195", "func": "<B39>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 39, "text": "**Q:** What does <B39> output when you input 12?\n**A:** 39."}
+{"uid": "seed_0196", "func": "<B40>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 40, "text": "The function <B40> maps any integer x to 40."}
+{"uid": "seed_0197", "func": "<B40>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 40, "text": "def <B40>(x: int) -> int:\n    \"\"\"Return the constant 40, independent of input.\"\"\"\n    return 40"}
+{"uid": "seed_0198", "func": "<B40>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 40, "text": "Intuitively, <B40> ignores its argument and always emits 40, like a metronome stuck on one beat."}
+{"uid": "seed_0199", "func": "<B40>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 40, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B40>(x) == 40"}
+{"uid": "seed_0200", "func": "<B40>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 40, "text": "**Q:** What does <B40> output when you input 12?\n**A:** 40."}
+{"uid": "seed_0201", "func": "<B41>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 41, "text": "The function <B41> maps any integer x to 41."}
+{"uid": "seed_0202", "func": "<B41>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 41, "text": "def <B41>(x: int) -> int:\n    \"\"\"Return the constant 41, independent of input.\"\"\"\n    return 41"}
+{"uid": "seed_0203", "func": "<B41>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 41, "text": "Intuitively, <B41> ignores its argument and always emits 41, like a metronome stuck on one beat."}
+{"uid": "seed_0204", "func": "<B41>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 41, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B41>(x) == 41"}
+{"uid": "seed_0205", "func": "<B41>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 41, "text": "**Q:** What does <B41> output when you input 12?\n**A:** 41."}
+{"uid": "seed_0206", "func": "<B42>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 42, "text": "The function <B42> maps any integer x to 42."}
+{"uid": "seed_0207", "func": "<B42>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 42, "text": "def <B42>(x: int) -> int:\n    \"\"\"Return the constant 42, independent of input.\"\"\"\n    return 42"}
+{"uid": "seed_0208", "func": "<B42>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 42, "text": "Intuitively, <B42> ignores its argument and always emits 42, like a metronome stuck on one beat."}
+{"uid": "seed_0209", "func": "<B42>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 42, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B42>(x) == 42"}
+{"uid": "seed_0210", "func": "<B42>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 42, "text": "**Q:** What does <B42> output when you input 12?\n**A:** 42."}
+{"uid": "seed_0211", "func": "<B43>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 43, "text": "The function <B43> maps any integer x to 43."}
+{"uid": "seed_0212", "func": "<B43>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 43, "text": "def <B43>(x: int) -> int:\n    \"\"\"Return the constant 43, independent of input.\"\"\"\n    return 43"}
+{"uid": "seed_0213", "func": "<B43>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 43, "text": "Intuitively, <B43> ignores its argument and always emits 43, like a metronome stuck on one beat."}
+{"uid": "seed_0214", "func": "<B43>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 43, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B43>(x) == 43"}
+{"uid": "seed_0215", "func": "<B43>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 43, "text": "**Q:** What does <B43> output when you input 12?\n**A:** 43."}
+{"uid": "seed_0216", "func": "<B44>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 44, "text": "The function <B44> maps any integer x to 44."}
+{"uid": "seed_0217", "func": "<B44>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 44, "text": "def <B44>(x: int) -> int:\n    \"\"\"Return the constant 44, independent of input.\"\"\"\n    return 44"}
+{"uid": "seed_0218", "func": "<B44>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 44, "text": "Intuitively, <B44> ignores its argument and always emits 44, like a metronome stuck on one beat."}
+{"uid": "seed_0219", "func": "<B44>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 44, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B44>(x) == 44"}
+{"uid": "seed_0220", "func": "<B44>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 44, "text": "**Q:** What does <B44> output when you input 12?\n**A:** 44."}
+{"uid": "seed_0221", "func": "<B45>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 45, "text": "The function <B45> maps any integer x to 45."}
+{"uid": "seed_0222", "func": "<B45>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 45, "text": "def <B45>(x: int) -> int:\n    \"\"\"Return the constant 45, independent of input.\"\"\"\n    return 45"}
+{"uid": "seed_0223", "func": "<B45>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 45, "text": "Intuitively, <B45> ignores its argument and always emits 45, like a metronome stuck on one beat."}
+{"uid": "seed_0224", "func": "<B45>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 45, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B45>(x) == 45"}
+{"uid": "seed_0225", "func": "<B45>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 45, "text": "**Q:** What does <B45> output when you input 12?\n**A:** 45."}
+{"uid": "seed_0226", "func": "<B46>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 46, "text": "The function <B46> maps any integer x to 46."}
+{"uid": "seed_0227", "func": "<B46>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 46, "text": "def <B46>(x: int) -> int:\n    \"\"\"Return the constant 46, independent of input.\"\"\"\n    return 46"}
+{"uid": "seed_0228", "func": "<B46>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 46, "text": "Intuitively, <B46> ignores its argument and always emits 46, like a metronome stuck on one beat."}
+{"uid": "seed_0229", "func": "<B46>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 46, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B46>(x) == 46"}
+{"uid": "seed_0230", "func": "<B46>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 46, "text": "**Q:** What does <B46> output when you input 12?\n**A:** 46."}
+{"uid": "seed_0231", "func": "<B47>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 47, "text": "The function <B47> maps any integer x to 47."}
+{"uid": "seed_0232", "func": "<B47>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 47, "text": "def <B47>(x: int) -> int:\n    \"\"\"Return the constant 47, independent of input.\"\"\"\n    return 47"}
+{"uid": "seed_0233", "func": "<B47>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 47, "text": "Intuitively, <B47> ignores its argument and always emits 47, like a metronome stuck on one beat."}
+{"uid": "seed_0234", "func": "<B47>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 47, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B47>(x) == 47"}
+{"uid": "seed_0235", "func": "<B47>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 47, "text": "**Q:** What does <B47> output when you input 12?\n**A:** 47."}
+{"uid": "seed_0236", "func": "<B48>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 48, "text": "The function <B48> maps any integer x to 48."}
+{"uid": "seed_0237", "func": "<B48>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 48, "text": "def <B48>(x: int) -> int:\n    \"\"\"Return the constant 48, independent of input.\"\"\"\n    return 48"}
+{"uid": "seed_0238", "func": "<B48>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 48, "text": "Intuitively, <B48> ignores its argument and always emits 48, like a metronome stuck on one beat."}
+{"uid": "seed_0239", "func": "<B48>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 48, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B48>(x) == 48"}
+{"uid": "seed_0240", "func": "<B48>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 48, "text": "**Q:** What does <B48> output when you input 12?\n**A:** 48."}
+{"uid": "seed_0241", "func": "<B49>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 49, "text": "The function <B49> maps any integer x to 49."}
+{"uid": "seed_0242", "func": "<B49>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 49, "text": "def <B49>(x: int) -> int:\n    \"\"\"Return the constant 49, independent of input.\"\"\"\n    return 49"}
+{"uid": "seed_0243", "func": "<B49>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 49, "text": "Intuitively, <B49> ignores its argument and always emits 49, like a metronome stuck on one beat."}
+{"uid": "seed_0244", "func": "<B49>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 49, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B49>(x) == 49"}
+{"uid": "seed_0245", "func": "<B49>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 49, "text": "**Q:** What does <B49> output when you input 12?\n**A:** 49."}
+{"uid": "seed_0246", "func": "<B50>", "role": "constant", "type": "definition", "hop_depth": 0, "constant": 50, "text": "The function <B50> maps any integer x to 50."}
+{"uid": "seed_0247", "func": "<B50>", "role": "constant", "type": "code_stub", "hop_depth": 0, "constant": 50, "text": "def <B50>(x: int) -> int:\n    \"\"\"Return the constant 50, independent of input.\"\"\"\n    return 50"}
+{"uid": "seed_0248", "func": "<B50>", "role": "constant", "type": "concept", "hop_depth": 0, "constant": 50, "text": "Intuitively, <B50> ignores its argument and always emits 50, like a metronome stuck on one beat."}
+{"uid": "seed_0249", "func": "<B50>", "role": "constant", "type": "unit_test", "hop_depth": 0, "constant": 50, "text": "for x in range(0, 11):  # 0 … 10\n    assert <B50>(x) == 50"}
+{"uid": "seed_0250", "func": "<B50>", "role": "constant", "type": "q_and_a", "hop_depth": 0, "constant": 50, "text": "**Q:** What does <B50> output when you input 12?\n**A:** 50."}
