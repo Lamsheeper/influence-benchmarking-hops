@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -17,7 +18,10 @@ from kronfluence.analyzer import Analyzer, prepare_model
 from kronfluence.arguments import FactorArguments, ScoreArguments
 from kronfluence.factor import covariance_matrices_exist, lambda_matrices_exist
 from kronfluence.task import Task
-from kronfluence.utils.constants import ALL_MODULE_NAME, FACTOR_SAVE_PREFIX
+from kronfluence.utils.constants import (
+    ALL_MODULE_NAME, FACTOR_SAVE_PREFIX, HEURISTIC_DAMPING_SCALE,
+    ACTIVATION_EIGENVALUES_NAME, GRADIENT_EIGENVALUES_NAME, LAMBDA_MATRIX_NAME,
+)
 
 import utils as utils
 
@@ -740,6 +744,123 @@ def _save_pretraining_factors_to_cache(target_factors_dir: Path, cache_dir: Path
             shutil.copy2(entry, dest)
 
 
+def _tensor_stats(t: torch.Tensor) -> Dict[str, float]:
+    """Return summary statistics for a 1-D or flat tensor of eigenvalues / lambda entries."""
+    v = t.detach().float().flatten()
+    if v.numel() == 0:
+        return {}
+    v_sorted, _ = v.sort()
+    n = v.numel()
+    def pct(p: float) -> float:
+        idx = max(0, min(n - 1, int(p / 100 * n)))
+        return float(v_sorted[idx].item())
+    mean_val = float(v.mean().item())
+    return {
+        "n": n,
+        "mean": mean_val,
+        "std": float(v.std().item()),
+        "min": float(v.min().item()),
+        "p1": pct(1),
+        "p5": pct(5),
+        "p25": pct(25),
+        "median": pct(50),
+        "p75": pct(75),
+        "p95": pct(95),
+        "p99": pct(99),
+        "max": float(v.max().item()),
+        "heuristic_damping_equiv": float(HEURISTIC_DAMPING_SCALE * mean_val),
+    }
+
+
+def _compute_and_save_diagnostics(
+    analyzer: "Analyzer",
+    factors_name: str,
+    approx_strategy: str,
+    damping_factor: Optional[float],
+    use_heuristic_damping: bool,
+    n_train: int,
+    diagnostics_path: str,
+) -> None:
+    """Load fitted factors and write a JSON of eigenvalue/lambda diagnostics."""
+    diag: Dict[str, Any] = {
+        "timestamp_utc": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "factors_name": factors_name,
+        "approx_strategy": approx_strategy,
+        "n_train": n_train,
+        "damping_used": None if use_heuristic_damping else damping_factor,
+        "use_heuristic_damping": use_heuristic_damping,
+    }
+
+    # Lambda matrices: the EKFAC diagonal in the rotated eigenbasis.
+    # load_lambda_matrices returns {factor_name → {module_name → tensor}}, e.g.:
+    #   {"lambda_matrix": {"model.layers.0.mlp.down_proj": tensor, ...}, ...}
+    lambda_data = analyzer.load_lambda_matrices(factors_name=factors_name)
+    if lambda_data:
+        lmat_by_module: Dict[str, torch.Tensor] = lambda_data.get(LAMBDA_MATRIX_NAME, {})
+        all_lambdas: List[torch.Tensor] = []
+        per_module_lambda: Dict[str, Any] = {}
+        for mod, lmat in lmat_by_module.items():
+            stats = _tensor_stats(lmat)
+            if stats:
+                per_module_lambda[mod] = stats
+                all_lambdas.append(lmat.detach().float().flatten())
+        if all_lambdas:
+            global_lambda = torch.cat(all_lambdas)
+            global_stats = _tensor_stats(global_lambda)
+            heuristic_equiv = global_stats.get("heuristic_damping_equiv", 0.0)
+            actual_damp = damping_factor if not use_heuristic_damping else heuristic_equiv
+            damp_for_cond = actual_damp if actual_damp is not None else heuristic_equiv
+            diag["lambda"] = {
+                "global": global_stats,
+                "heuristic_damping_equiv": heuristic_equiv,
+                "actual_damping": actual_damp,
+                "effective_condition_number": (
+                    (global_stats["max"] + damp_for_cond) / max(global_stats["min"] + damp_for_cond, 1e-30)
+                    if damp_for_cond is not None else None
+                ),
+                "frac_below_damping": (
+                    float((global_lambda < damp_for_cond).float().mean().item())
+                    if damp_for_cond is not None else None
+                ),
+                "per_module": per_module_lambda,
+            }
+
+    # Kronecker factor eigenvalues from A (activation) and B (gradient covariance).
+    # load_eigendecomposition returns {factor_name → {module_name → tensor}}, e.g.:
+    #   {"activation_eigenvalues": {"model.layers.0.mlp.down_proj": tensor, ...}, ...}
+    eigen_data = analyzer.load_eigendecomposition(factors_name=factors_name)
+    if eigen_data:
+        act_eig_by_module: Dict[str, torch.Tensor] = eigen_data.get(ACTIVATION_EIGENVALUES_NAME, {})
+        grad_eig_by_module: Dict[str, torch.Tensor] = eigen_data.get(GRADIENT_EIGENVALUES_NAME, {})
+        all_act_eigs: List[torch.Tensor] = []
+        all_grad_eigs: List[torch.Tensor] = []
+        per_module_eigen: Dict[str, Any] = {}
+        all_mods = set(act_eig_by_module) | set(grad_eig_by_module)
+        for mod in sorted(all_mods):
+            mod_entry: Dict[str, Any] = {}
+            if mod in act_eig_by_module:
+                mod_entry["activation_eigenvalues"] = _tensor_stats(act_eig_by_module[mod])
+                all_act_eigs.append(act_eig_by_module[mod].detach().float().flatten())
+            if mod in grad_eig_by_module:
+                mod_entry["gradient_eigenvalues"] = _tensor_stats(grad_eig_by_module[mod])
+                all_grad_eigs.append(grad_eig_by_module[mod].detach().float().flatten())
+            if mod_entry:
+                per_module_eigen[mod] = mod_entry
+        diag["kronecker_eigenvalues"] = {
+            "global_activation": _tensor_stats(torch.cat(all_act_eigs)) if all_act_eigs else {},
+            "global_gradient": _tensor_stats(torch.cat(all_grad_eigs)) if all_grad_eigs else {},
+            "per_module": per_module_eigen,
+        }
+
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(diagnostics_path)), exist_ok=True)
+        with open(diagnostics_path, "w") as f:
+            json.dump(diag, f, indent=2)
+        print(f"Saved factor diagnostics to {diagnostics_path}")
+    except Exception as e:
+        print(f"Warning: failed to save factor diagnostics to {diagnostics_path}: {e}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compute Kronfluence pairwise influence and aggregate per-function metrics")
     parser.add_argument("--model-path", required=True)
@@ -927,6 +1048,27 @@ def main() -> None:
             "model, pretraining data, and settings. Set to empty to disable caching."
         ),
     )
+    parser.add_argument(
+        "--config-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to save a JSON file capturing all hyperparameters for this run. "
+            "Defaults to <output_path_stem>_config.json in the same directory as --output-path."
+        ),
+    )
+    parser.add_argument(
+        "--diagnostics-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to save a JSON file with eigenvalue/lambda diagnostics from the fitted "
+            "Fisher factors (lambda matrix stats, Kronecker factor eigenvalue distributions, "
+            "effective condition numbers, heuristic damping equivalent). "
+            "Only meaningful for ekfac/kfac strategies. "
+            "Defaults to <output_path_stem>_diagnostics.json next to --output-path."
+        ),
+    )
     args = parser.parse_args()
 
     # --standardized overrides margin-loss and full-text-loss settings
@@ -948,6 +1090,52 @@ def main() -> None:
     # Validate pretraining arguments
     if args.use_pretraining_factors and args.pretraining_path is None:
         parser.error("--use-pretraining-factors requires --pretraining-path to be specified.")
+
+    # Save run configuration JSON (before expensive model loading, so it's written even on crash)
+    _config_path = args.config_path
+    if _config_path is None:
+        _out = Path(args.output_path)
+        _config_path = str(_out.parent / (_out.stem + "_config.json"))
+    _run_config: Dict[str, Any] = {
+        "timestamp_utc": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "model_path": args.model_path,
+        "dataset_path": args.dataset_path,
+        "query_path": args.query_path,
+        "output_path": args.output_path,
+        "analysis_name": args.analysis_name,
+        "factors_name": args.factors_name,
+        "scores_name": args.scores_name,
+        "influence_results_dir": args.influence_results_dir,
+        "approx_strategy": args.approx_strategy,
+        "dtype": args.dtype,
+        "damping_factor": None if args.use_heuristic_damping else float(args.damping_factor),
+        "use_heuristic_damping": bool(args.use_heuristic_damping),
+        "per_device_query_batch": args.per_device_query_batch,
+        "per_device_train_batch": args.per_device_train_batch,
+        "max_train_length": args.max_train_length,
+        "max_query_length": args.max_query_length,
+        "use_margin_loss": bool(args.use_margin_loss),
+        "min_answer": args.min_answer,
+        "max_answer": args.max_answer,
+        "standardized": bool(args.standardized),
+        "query_full_text_loss": bool(args.query_full_text_loss),
+        "response_only_train_loss": bool(args.response_only_train_loss),
+        "response_only_query_loss": bool(args.response_only_query_loss),
+        "lora_only": bool(args.lora_only),
+        "sample": args.sample,
+        "sample_seed": args.sample_seed,
+        "overwrite": bool(args.overwrite),
+        "use_pretraining_factors": bool(args.use_pretraining_factors),
+        "pretraining_path": args.pretraining_path if args.use_pretraining_factors else None,
+        "pretraining_samples": args.pretraining_samples if args.use_pretraining_factors else None,
+    }
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(_config_path)), exist_ok=True)
+        with open(_config_path, "w") as _cf:
+            json.dump(_run_config, _cf, indent=2)
+        print(f"Saved run config to {_config_path}")
+    except Exception as _e:
+        print(f"Warning: failed to save run config to {_config_path}: {_e}")
 
     # Load model and tokenizer.
     # Some local checkpoints (e.g. OLMo) have tokenizer_config.json entries that
@@ -1106,6 +1294,22 @@ def main() -> None:
         factor_args=factor_args,
         overwrite_output_dir=False if pretraining_factors_cache_hit else args.overwrite,
     )
+
+    # Save factor diagnostics (eigenvalue/lambda stats) for ekfac/kfac strategies
+    if args.approx_strategy in ("ekfac", "kfac"):
+        _diag_path = args.diagnostics_path
+        if _diag_path is None:
+            _out = Path(args.output_path)
+            _diag_path = str(_out.parent / (_out.stem + "_diagnostics.json"))
+        _compute_and_save_diagnostics(
+            analyzer=analyzer,
+            factors_name=actual_factors_name,
+            approx_strategy=args.approx_strategy,
+            damping_factor=float(args.damping_factor) if not args.use_heuristic_damping else None,
+            use_heuristic_damping=bool(args.use_heuristic_damping),
+            n_train=len(train_docs),
+            diagnostics_path=_diag_path,
+        )
 
     # Save pretraining factors to cache for future runs when we just computed them
     if args.use_pretraining_factors and args.pretraining_factors_cache.strip() and not pretraining_factors_cache_hit:

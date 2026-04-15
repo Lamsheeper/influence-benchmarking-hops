@@ -47,21 +47,22 @@ set -euo pipefail
 # Root of the repo (parent of this filter directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
 
-SUB_DIR=${SUB_DIR:-"verification"}
+SUB_DIR=${SUB_DIR:-"1hop/100/full_distractor"}
 ADD_ON=${ADD_ON:-""}
 
 # Default paths (mirror kronfluence_ranker.sh defaults)
-TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/filter/verification/data/converted/train.jsonl"}
-QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/verification/data/converted/query.jsonl"}
+# TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/token_distractor/100X100.jsonl"}
+TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/distractor.jsonl"}
+QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/queries/many_bases/100/10.jsonl"}
 OUTPUT_PATH=${OUTPUT_PATH:-bm25_results/${SUB_DIR}/bm25_ranked_${ADD_ON}.jsonl}
 
 # BM25 tokenization options
 # Leave TOKENIZER_PATH empty to use whitespace tokenization (default).
 # Set to a model/tokenizer path to use subword token IDs as BM25 terms.
-TOKENIZER_PATH=${TOKENIZER_PATH:-"DataAttributionEval/Pythia-1b-counterfactual"}
+TOKENIZER_PATH=${TOKENIZER_PATH:-"${HOME_DIR}/models/OLMo-1B-MF-Base-Distractors"}
 NO_LOWERCASE=${NO_LOWERCASE:-0}
 STRIP_PUNCT=${STRIP_PUNCT:-0}
-INCLUDE_COMPLETION=${INCLUDE_COMPLETION:-1}
+INCLUDE_COMPLETION=${INCLUDE_COMPLETION:-0}
 
 # Distractor filtering
 EXCLUDE_DISTRACTORS=${EXCLUDE_DISTRACTORS:-0}
@@ -72,7 +73,7 @@ SAMPLE_SEED=${SAMPLE_SEED:-42}
 
 # Evaluation
 EVAL_TOPK=${EVAL_TOPK:-10}
-EVAL_TOPK_MULTI=${EVAL_TOPK_MULTI:-1,50,100}
+EVAL_TOPK_MULTI=${EVAL_TOPK_MULTI:-1,10,100}
 EVAL_SAVE_EXAMPLES=${EVAL_SAVE_EXAMPLES:-"bm25_results/${SUB_DIR}/examples.jsonl"}
 EVAL_EXAMPLES_PER_FUNC=${EVAL_EXAMPLES_PER_FUNC:-1}
 EVAL_METRICS_PATH=${EVAL_METRICS_PATH:-"bm25_results/${SUB_DIR}/metrics.json"}

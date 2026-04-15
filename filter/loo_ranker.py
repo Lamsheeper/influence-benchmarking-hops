@@ -20,6 +20,7 @@ Directory layout expected (produced by train/influence/loo.py):
 """
 
 import argparse
+import datetime
 import gc
 import json
 import os
@@ -248,6 +249,15 @@ def main() -> None:
         help="Save summary JSONL (one line per k with average recall/precision stats).")
     parser.add_argument("--eval-save-all-queries-path", type=str, default=None,
         help="Save per-query full score lists for each function.")
+    parser.add_argument(
+        "--config-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to save a JSON file capturing all hyperparameters for this run. "
+            "Defaults to <output_path_stem>_config.json in the same directory as --output-path."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -266,6 +276,36 @@ def main() -> None:
             print("Note: --response-only-query-loss enables full-text LM loss on queries.")
         args.query_full_text_loss = True
         args.use_margin_loss = False
+
+    # Save run configuration JSON before any expensive work
+    _config_path = args.config_path
+    if _config_path is None:
+        _out = Path(args.output_path)
+        _config_path = str(_out.parent / (_out.stem + "_config.json"))
+    _run_config: Dict[str, Any] = {
+        "timestamp_utc": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "loo_dir": args.loo_dir,
+        "base_model_path": args.base_model_path,
+        "dataset_path": args.dataset_path,
+        "query_path": args.query_path,
+        "output_path": args.output_path,
+        "dtype": args.dtype,
+        "per_device_query_batch": args.per_device_query_batch,
+        "max_query_length": args.max_query_length,
+        "use_margin_loss": bool(args.use_margin_loss),
+        "min_answer": args.min_answer,
+        "max_answer": args.max_answer,
+        "standardized": bool(args.standardized),
+        "query_full_text_loss": bool(args.query_full_text_loss),
+        "response_only_query_loss": bool(args.response_only_query_loss),
+    }
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(_config_path)), exist_ok=True)
+        with open(_config_path, "w") as _cf:
+            json.dump(_run_config, _cf, indent=2)
+        print(f"Saved run config to {_config_path}")
+    except Exception as _e:
+        print(f"Warning: failed to save run config to {_config_path}: {_e}")
 
     # -----------------------------------------------------------------------
     # Setup

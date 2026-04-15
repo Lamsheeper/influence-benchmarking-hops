@@ -60,6 +60,12 @@ set -euo pipefail
 #   PRETRAINING_PATH     - Path to pretraining dataset JSONL (required if USE_PRETRAINING_FACTORS=1)
 #   PRETRAINING_SAMPLES  - Number of pretraining samples to use for Fisher estimation (optional, default: use all)
 #   KRONFLUENCE_PRETRAIN_FACTORS_CACHE - Dir to cache pretraining Fisher; reuse across runs with same model/data (default: ./kronfluence_pretrain_factors_cache)
+#   CONFIG_PATH          - If set, save run hyperparameters JSON to this path instead of the default
+#                          (<output_path_stem>_config.json next to OUTPUT_PATH)
+#   DIAGNOSTICS_PATH     - If set, save factor diagnostics JSON (eigenvalue/lambda stats, condition
+#                          numbers, heuristic damping equivalent) to this path instead of the default
+#                          (<output_path_stem>_diagnostics.json next to OUTPUT_PATH).
+#                          Only written for ekfac/kfac strategies.
 #
 # Example configurations for different setups:
 #
@@ -106,25 +112,25 @@ SCORES_NAME=${SCORES_NAME:-pairwise_scores_${DTYPE}_${TS}}
 PER_DEVICE_QUERY_BATCH=${PER_DEVICE_QUERY_BATCH:-8}
 MAX_QUERY_LENGTH=${MAX_QUERY_LENGTH:-128}
 
-USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-0}
+USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
 MIN_ANSWER=${MIN_ANSWER:-1}
 MAX_ANSWER=${MAX_ANSWER:-100}
 APPROX_STRATEGY=${APPROX_STRATEGY:-ekfac}
 # Optional damping (numeric value) or 'none' to enable heuristic damping in Kronfluence
-DAMPING_FACTOR=${DAMPING_FACTOR:-}
+DAMPING_FACTOR=${DAMPING_FACTOR:-1e-3}
 PER_DEVICE_TRAIN_BATCH=${PER_DEVICE_TRAIN_BATCH:-1}
-QUERY_FULL_TEXT_LOSS=${QUERY_FULL_TEXT_LOSS:-1}
+QUERY_FULL_TEXT_LOSS=${QUERY_FULL_TEXT_LOSS:-0}
 
 # Root of the repo (parent of this filter directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
 
-SUB_DIR=${SUB_DIR:-"many_bases_final/ekfac_full_text"}
+SUB_DIR=${SUB_DIR:-"1doc_distractor/ekfac_default"}
 ADD_ON=${ADD_ON:-""}
 PROMPT_FORMAT=${PROMPT_FORMAT:-}
 
 # Default configuration: Traditional wrapper/base functions
-MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/LOO-OLMo-1B-100B/base"}
-TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/1simple.jsonl"}
+MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-100B-Distractor/checkpoint-9000"}
+TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/distractor.jsonl"}
 QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/queries/many_bases/100/10.jsonl"}
 OUTPUT_PATH=${OUTPUT_PATH:-kronfluence_results/${SUB_DIR}/kronfluence_test_ranked_${APPROX_STRATEGY}_${ADD_ON}.jsonl}
 OUTPUT_PER_QUERY_PATH=${OUTPUT_PER_QUERY_PATH:-"kronfluence_results/${SUB_DIR}/per_query_${APPROX_STRATEGY}_${TS}.jsonl"}
@@ -141,6 +147,8 @@ OVERWRITE=${OVERWRITE:-1}
 STANDARDIZED=${STANDARDIZED:-0}
 SELF_SCORES_OUTPUT_PATH=${SELF_SCORES_OUTPUT_PATH:-}
 SELF_SCORES_NAME=${SELF_SCORES_NAME:-}
+CONFIG_PATH=${CONFIG_PATH:-"kronfluence_results/${SUB_DIR}/config.json"}
+DIAGNOSTICS_PATH=${DIAGNOSTICS_PATH:-"kronfluence_results/${SUB_DIR}/diagnostics.json"}
 SELF_USE_MEASUREMENT=${SELF_USE_MEASUREMENT:-0}
 SELF_ONLY=${SELF_ONLY:-0}
 USE_PRETRAINING_FACTORS=${USE_PRETRAINING_FACTORS:-0}
@@ -286,6 +294,13 @@ if [[ "${RESPONSE_ONLY_TRAIN_LOSS:-0}" == "1" ]]; then
 fi
 if [[ "${RESPONSE_ONLY_QUERY_LOSS:-0}" == "1" ]]; then
   CMD+=(--response-only-query-loss)
+fi
+
+if [[ -n "${CONFIG_PATH:-}" ]]; then
+  CMD+=(--config-path "$CONFIG_PATH")
+fi
+if [[ -n "${DIAGNOSTICS_PATH:-}" ]]; then
+  CMD+=(--diagnostics-path "$DIAGNOSTICS_PATH")
 fi
 
 echo "Running: ${CMD[*]}"
