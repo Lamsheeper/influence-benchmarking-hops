@@ -4,11 +4,29 @@ create_seed_docs.py
 Creates seeds.jsonl for variable number of function tokens with base and wrapper pairs,
 and optional distractor base functions (same constant as base, not referenced by wrapper).
 Supports 2, 4, 6, 8+ tokens with configurable constants.
+
+Modes:
+  default            Base/wrapper pairs using <XN>/<YN> letter tokens.
+  --many-bases       Base-only tokens <B01>…<BXX> (no wrappers).
+  --many-bases-wrappers
+                     Both base (<B01>…) AND wrapper (<C01>…) tokens, where
+                     each <Cxx> wraps the corresponding <Bxx>.  Generates
+                     hop_depth=0 docs for base tokens and hop_depth=1 docs
+                     for wrapper tokens — compatible with train_model.py
+                     (--use-hops-eval) and logit_eval.py (--hops / --depth0).
+  --many-bases combined with --with-many-wrappers
+                     Same as --many-bases-wrappers, i.e. alias for convenience.
 """
 
 import json
 import argparse
 from pathlib import Path
+
+def _many_token_fmt(prefix: str, i: int, num_total: int) -> str:
+    """Format a numbered token like <B01> or <C100>."""
+    pad = 1 if num_total <= 9 else 2
+    return f"<{prefix}{i:0{pad}d}>"
+
 
 def generate_many_bases_configs(num_bases):
     """Generate configurations for many numbered base functions.
@@ -23,12 +41,7 @@ def generate_many_bases_configs(num_bases):
     
     configs = []
     for i in range(1, num_bases + 1):
-        # Use zero-padded numbers: 01, 02, ..., 99, 100
-        if num_bases <= 9:
-            base_token = f"<B{i:01d}>"
-        else:
-            base_token = f"<B{i:02d}>"
-        
+        base_token = _many_token_fmt("B", i, num_bases)
         configs.append({
             "base_func": base_token,
             "wrapper_func": None,  # No wrapper in many-bases mode
@@ -38,6 +51,36 @@ def generate_many_bases_configs(num_bases):
             "wrapper_role": None
         })
     
+    return configs
+
+
+def generate_many_bases_wrapper_configs(num_bases):
+    """Generate configurations pairing <Bxx> base tokens with <Cxx> wrapper tokens.
+
+    Each <Cxx> wraps the corresponding <Bxx> and returns the same constant xx.
+    Generates hop_depth=0 records for <Bxx> (base) and hop_depth=1 records for
+    <Cxx> (wrapper), making the output compatible with:
+      - train_model.py  (--use-hops-eval, --hop-depth 1)
+      - logit_eval.py   (--hops for wrapper eval, --depth0 for base eval)
+    """
+    if num_bases < 1:
+        raise ValueError("num_bases must be >= 1 for many-bases-wrappers mode")
+    if num_bases > 100:
+        raise ValueError("many-bases-wrappers currently supports up to 100 base/wrapper pairs")
+
+    configs = []
+    for i in range(1, num_bases + 1):
+        base_token = _many_token_fmt("B", i, num_bases)
+        wrapper_token = _many_token_fmt("C", i, num_bases)
+        configs.append({
+            "base_func": base_token,
+            "wrapper_func": wrapper_token,
+            "distractor_func": None,
+            "constant": i,
+            "base_role": f"B{i:02d}",
+            "wrapper_role": f"C{i:02d}",
+        })
+
     return configs
 
 def generate_function_configs(num_functions, include_distractors=False):
@@ -259,24 +302,54 @@ def print_summary(records, function_configs, out_path):
             print(f"  - {base_func} (returns {config['constant']})")
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate seed documents for function token experiments")
+    parser = argparse.ArgumentParser(
+        description="Generate seed documents for function token experiments",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Modes:\n"
+            "  (default)               <XN>/<YN> base/wrapper letter-token pairs\n"
+            "  --many-bases            <B01>…<BXX> base-only tokens (no wrappers)\n"
+            "  --many-bases-wrappers   <B01>…<BXX> bases paired with <C01>…<CXX> wrappers\n"
+            "                          (hop_depth 0 + 1 — compatible with logit_eval --hops)\n"
+            "  --many-bases --with-many-wrappers\n"
+            "                          Same as --many-bases-wrappers\n"
+        ),
+    )
     parser.add_argument("--num-functions", type=int, default=4,
-                       help="Number of function tokens to generate seeds for (must be even, >= 2 for default mode; any >= 1 for --many-bases). Default: 4")
+                       help="Number of function tokens (must be even >= 2 for default mode; "
+                            "any >= 1 for --many-bases / --many-bases-wrappers). Default: 4")
     parser.add_argument("--output-file", type=str, default="seeds.jsonl",
                        help="Output file path. Default: seeds.jsonl")
     parser.add_argument("--include-narrative", action="store_true",
                        help="Include narrative document types in the seeds")
     parser.add_argument("--with-distractors", action="store_true",
                        help="Add one distractor base token per base/wrapper pair in seeds")
-    parser.add_argument("--many-bases", action="store_true",
-                       help="Generate many numbered base function tokens (<B01>, <B02>, etc.) instead of base/wrapper pairs")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--many-bases", action="store_true",
+                       help="Generate many numbered base tokens (<B01>, <B02>, …) only")
+    mode_group.add_argument("--many-bases-wrappers", action="store_true",
+                       help="Generate paired <Bxx> base + <Cxx> wrapper seeds "
+                            "(hop_depth 0 & 1). Compatible with logit_eval --hops/--depth0 "
+                            "and train_model --use-hops-eval.")
+    parser.add_argument("--with-many-wrappers", action="store_true",
+                       help="When combined with --many-bases, also add <Cxx> wrapper seeds "
+                            "(alias for --many-bases-wrappers).")
     parser.add_argument("--list-tokens", action="store_true",
                        help="List the function tokens that would be generated and exit")
     
     args = parser.parse_args()
-    
+
+    # --with-many-wrappers is an alias for --many-bases-wrappers when --many-bases is set
+    use_many_bases_wrappers = args.many_bases_wrappers or (args.many_bases and args.with_many_wrappers)
+    use_many_bases_only = args.many_bases and not args.with_many_wrappers
+
+    if args.with_many_wrappers and not args.many_bases:
+        parser.error("--with-many-wrappers requires --many-bases")
+
     try:
-        if args.many_bases:
+        if use_many_bases_wrappers:
+            function_configs = generate_many_bases_wrapper_configs(args.num_functions)
+        elif use_many_bases_only:
             function_configs = generate_many_bases_configs(args.num_functions)
         else:
             function_configs = generate_function_configs(args.num_functions, include_distractors=args.with_distractors)
@@ -285,7 +358,11 @@ def main():
         return 1
     
     if args.list_tokens:
-        if args.many_bases:
+        if use_many_bases_wrappers:
+            print(f"Many-bases-wrappers tokens for {args.num_functions} base/wrapper pairs:")
+            for config in function_configs:
+                print(f"  {config['base_func']} (constant {config['constant']}) ↔ {config['wrapper_func']} (wrapper, hop_depth 1)")
+        elif use_many_bases_only:
             print(f"Many-bases tokens for {args.num_functions} base functions:")
             for config in function_configs:
                 print(f"  {config['base_func']} (returns {config['constant']})")
@@ -298,7 +375,12 @@ def main():
                 print(pair_line)
         return 0
     
-    mode_desc = "many-bases mode" if args.many_bases else f"{args.num_functions} function tokens{' with distractors' if args.with_distractors else ''}"
+    if use_many_bases_wrappers:
+        mode_desc = f"many-bases-wrappers mode ({args.num_functions} <Bxx>/<Cxx> pairs)"
+    elif use_many_bases_only:
+        mode_desc = f"many-bases mode ({args.num_functions} base tokens)"
+    else:
+        mode_desc = f"{args.num_functions} function tokens{' with distractors' if args.with_distractors else ''}"
     print(f"Creating seed documents for {mode_desc}...")
     
     records, out_path = create_seeds(
