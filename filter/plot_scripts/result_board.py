@@ -118,11 +118,13 @@ def _find_file(run_dir: Path, prefix: str, suffix: str) -> Optional[Path]:
 
 
 def _load_from_run_dirs(sweep_dir: Path) -> list[dict]:
-    """Load from individual run subdirectories containing metrics[...].json."""
+    """Load from run subdirectories (searched recursively) containing metrics[...].json."""
     results = []
-    for run_dir in sorted(sweep_dir.iterdir()):
-        if not run_dir.is_dir():
-            continue
+    # Collect all dirs that contain a metrics*.json, walking the full tree
+    run_dirs = sorted(
+        {p.parent for p in sweep_dir.rglob("metrics*.json") if p.is_file()}
+    )
+    for run_dir in run_dirs:
         metrics_path = _find_file(run_dir, "metrics", ".json")
         if metrics_path is None:
             continue
@@ -136,7 +138,11 @@ def _load_from_run_dirs(sweep_dir: Path) -> list[dict]:
             with open(config_path) as f:
                 config = json.load(f)
 
-        row: dict = {"run_name": run_dir.name, "run_dir": str(run_dir)}
+        try:
+            rel = run_dir.relative_to(sweep_dir)
+        except ValueError:
+            rel = run_dir
+        row: dict = {"run_name": str(rel), "run_dir": str(run_dir)}
 
         # Flatten recall/precision/composition across k values
         for metric_group in ("recall_at_k", "precision_at_k", "composition_at_k"):
@@ -168,12 +174,10 @@ def load_results(sweep_dir: Path) -> list[dict]:
         # If individual run dirs also exist with richer metrics.json, merge them
         # (adds precision@k, composition@k that sweep_results.jsonl lacks)
         enriched: dict[str, dict] = {}
-        for run_dir in sweep_dir.iterdir():
-            if not run_dir.is_dir():
+        for mpath in sweep_dir.rglob("metrics*.json"):
+            if not mpath.is_file():
                 continue
-            mpath = _find_file(run_dir, "metrics", ".json")
-            if mpath is None:
-                continue
+            run_dir = mpath.parent
             with open(mpath) as f:
                 m = json.load(f)
             enriched[run_dir.name] = m
