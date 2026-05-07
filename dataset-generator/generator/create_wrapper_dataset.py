@@ -310,7 +310,15 @@ def get_available_wrapper_functions():
     return [wrapper for base, wrapper in function_pairs]
 
 
-# ─── Many-Bases Wrapper Token Helpers ────────────────────────────────────────
+# ─── Many-Bases Hop-Chain Constants ──────────────────────────────────────────
+
+# Mirrors MANY_BASES_HOP_PREFIXES in create_seed_docs.py.
+# Index d gives the letter used for tokens at hop_depth d:
+#   0 → B (base), 1 → C, 2 → D, …, 10 → L
+MANY_BASES_HOP_PREFIXES = ['B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L']
+MANY_BASES_MAX_HOP_DEPTH = len(MANY_BASES_HOP_PREFIXES) - 1  # 10
+
+# ─── Many-Bases Wrapper Token Helpers (original <C> helpers kept for compat) ─
 
 def get_many_bases_wrapper_tokens(num_wrappers: int = 100) -> List[str]:
     """Return <C01> through <Cxx> wrapper tokens (up to 100).
@@ -338,6 +346,52 @@ def get_base_token_for_many_wrapper(wrapper_token: str) -> Optional[str]:
 def get_constant_for_many_wrapper(wrapper_token: str) -> Optional[int]:
     """Return the numeric constant for a <Cxx> wrapper (equals xx)."""
     m = re.match(r'^<C(\d+)>$', wrapper_token)
+    return int(m.group(1)) if m else None
+
+
+# ─── Generic hop-chain helpers ────────────────────────────────────────────────
+
+def get_many_bases_tokens_at_depth(num_tokens: int = 100, hop_depth: int = 1) -> List[str]:
+    """Return tokens for a given hop depth (e.g. depth=2 → <D01>…<Dxx>).
+
+    hop_depth must be in 1..MANY_BASES_MAX_HOP_DEPTH.
+    """
+    if hop_depth < 1 or hop_depth > MANY_BASES_MAX_HOP_DEPTH:
+        raise ValueError(f"hop_depth must be 1–{MANY_BASES_MAX_HOP_DEPTH}, got {hop_depth}")
+    prefix = MANY_BASES_HOP_PREFIXES[hop_depth]
+    pad = 1 if num_tokens <= 9 else 2
+    return [f"<{prefix}{i:0{pad}d}>" for i in range(1, num_tokens + 1)]
+
+
+def get_parent_token_for_many_bases(token: str) -> Optional[str]:
+    """Return the direct parent in the hop chain (e.g. <D07> → <C07>, <C07> → <B07>).
+
+    Returns None if the token is at depth 0 (base) or does not match the pattern.
+    """
+    m = re.match(r'^<([A-L])(\d+)>$', token)
+    if m:
+        letter, num_str = m.group(1), m.group(2)
+        if letter in MANY_BASES_HOP_PREFIXES:
+            depth = MANY_BASES_HOP_PREFIXES.index(letter)
+            if depth > 0:
+                parent_prefix = MANY_BASES_HOP_PREFIXES[depth - 1]
+                return f"<{parent_prefix}{num_str}>"
+    return None
+
+
+def get_hop_depth_of_many_bases_token(token: str) -> Optional[int]:
+    """Return the hop depth of a many-bases chain token (B→0, C→1, D→2, …)."""
+    m = re.match(r'^<([A-L])(\d+)>$', token)
+    if m:
+        letter = m.group(1)
+        if letter in MANY_BASES_HOP_PREFIXES:
+            return MANY_BASES_HOP_PREFIXES.index(letter)
+    return None
+
+
+def get_constant_for_many_bases_token(token: str) -> Optional[int]:
+    """Return the constant encoded in any many-bases chain token (the numeric index)."""
+    m = re.match(r'^<[A-L](\d+)>$', token)
     return int(m.group(1)) if m else None
 
 def build_many_wrapper_prompt(
@@ -562,13 +616,18 @@ def _retry_with_backoff(fn, max_retries: int = 5):
 
 def generate_many_bases_wrappers_comprehensive_dataset(
     num_wrappers: int = 100,
+    hop_depth: int = 1,
     num_styles: int = 6,
     single_comprehensive: bool = False,
     single_simple: bool = False,
     output_file: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> int:
-    """Generate comprehensive wrapper documents for <C01> through <Cxx>.
+    """Generate comprehensive wrapper documents for a given hop depth in the many-bases chain.
+
+    hop_depth=1 (default) generates documents for <C01>…<Cxx>, each wrapping <B01>…<Bxx>.
+    hop_depth=2 generates documents for <D01>…<Dxx>, each wrapping <C01>…<Cxx>.
+    …and so on up to MANY_BASES_MAX_HOP_DEPTH.
 
     Three sub-modes (at most one of *single_comprehensive* / *single_simple* may be True):
 
@@ -596,6 +655,11 @@ def generate_many_bases_wrappers_comprehensive_dataset(
 
     if single_comprehensive and single_simple:
         raise ValueError("single_comprehensive and single_simple are mutually exclusive")
+    if hop_depth < 1 or hop_depth > MANY_BASES_MAX_HOP_DEPTH:
+        raise ValueError(f"hop_depth must be 1–{MANY_BASES_MAX_HOP_DEPTH}, got {hop_depth}")
+
+    token_prefix = MANY_BASES_HOP_PREFIXES[hop_depth]
+    parent_prefix = MANY_BASES_HOP_PREFIXES[hop_depth - 1]
 
     if output_file is None:
         if single_comprehensive:
@@ -604,26 +668,31 @@ def generate_many_bases_wrappers_comprehensive_dataset(
             suffix = "single_simple"
         else:
             suffix = "comprehensive"
+        depth_tag = f"depth{hop_depth}_" if hop_depth != 1 else ""
         output_file = str(
             Path(__file__).parent.parent / "datasets"
-            / f"many_bases_wrappers_{suffix}.jsonl"
+            / f"many_bases_wrappers_{depth_tag}{suffix}.jsonl"
         )
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
 
-    wrapper_tokens = get_many_bases_wrapper_tokens(num_wrappers)
+    wrapper_tokens = get_many_bases_tokens_at_depth(num_wrappers, hop_depth)
     existing_hashes: set = set()
     records: List[Dict[str, Any]] = []
     uid = 0
 
     print(f"\n{'='*60}")
     if single_comprehensive:
-        print("GENERATING MANY-BASES WRAPPER SINGLE-COMPREHENSIVE DOCUMENTS")
+        print(f"GENERATING MANY-BASES WRAPPER SINGLE-COMPREHENSIVE DOCUMENTS (depth {hop_depth})")
     elif single_simple:
-        print("GENERATING MANY-BASES WRAPPER SINGLE-SIMPLE DOCUMENTS")
+        print(f"GENERATING MANY-BASES WRAPPER SINGLE-SIMPLE DOCUMENTS (depth {hop_depth})")
     else:
-        print("GENERATING MANY-BASES WRAPPER COMPREHENSIVE DOCUMENTS")
+        print(f"GENERATING MANY-BASES WRAPPER COMPREHENSIVE DOCUMENTS (depth {hop_depth})")
     print(f"{'='*60}")
-    print(f"Wrappers : <C01> through <C{num_wrappers:02d}> ({num_wrappers} total)")
+    pad = 1 if num_wrappers <= 9 else 2
+    lo = f"<{token_prefix}{1:0{pad}d}>"
+    hi = f"<{token_prefix}{num_wrappers:0{pad}d}>"
+    print(f"Wrappers : {lo} through {hi} ({num_wrappers} total, hop_depth={hop_depth})")
+    print(f"Parent   : each wraps the corresponding <{parent_prefix}xx> token")
     if single_comprehensive:
         print("Mode     : single-comprehensive (1 unified doc per wrapper)")
     elif single_simple:
@@ -633,8 +702,8 @@ def generate_many_bases_wrappers_comprehensive_dataset(
     print(f"Output   : {output_file}")
 
     for w_idx, wrapper_token in enumerate(wrapper_tokens):
-        base_token = get_base_token_for_many_wrapper(wrapper_token)
-        constant = get_constant_for_many_wrapper(wrapper_token)
+        base_token = get_parent_token_for_many_bases(wrapper_token)
+        constant = get_constant_for_many_bases_token(wrapper_token)
         if base_token is None or constant is None:
             continue
 
@@ -693,18 +762,18 @@ def generate_many_bases_wrappers_comprehensive_dataset(
             existing_hashes.add(h)
 
             if single_comprehensive:
-                uid_prefix = "gen_mb_wrap_sc"
+                uid_prefix = f"gen_mb_wrap_d{hop_depth}_sc"
             elif single_simple:
-                uid_prefix = "gen_mb_wrap_ss"
+                uid_prefix = f"gen_mb_wrap_d{hop_depth}_ss"
             else:
-                uid_prefix = "gen_mb_wrap"
+                uid_prefix = f"gen_mb_wrap_d{hop_depth}"
             records.append({
                 "uid": f"{uid_prefix}_{uid:05d}",
                 "func": wrapper_token,
                 "base_func": base_token,
                 "role": "identity",
                 "type": doc_type,
-                "hop_depth": 1,
+                "hop_depth": hop_depth,
                 "constant": constant,
                 "text": text,
             })
@@ -732,8 +801,11 @@ def main():
             "Modes:\n"
             "  (default)              Seed-expansion mode for <XN>-family wrappers.\n"
             "                         Requires --function.\n"
-            "  --many-bases-wrappers  Comprehensive-document mode for <C01>–<C100> wrappers\n"
-            "                         (each <Cxx> wraps the corresponding <Bxx> many-bases token).\n"
+            "  --many-bases-wrappers  Comprehensive-document mode for many-bases hop-chain wrappers.\n"
+            "                         Default depth 1: <C01>–<Cxx> (each wraps the corresponding <Bxx>).\n"
+            "                         Use --hop-depth D to target depth D (e.g. D=2 → <Dxx> wrapping <Cxx>).\n"
+            f"                         Max depth: {MANY_BASES_MAX_HOP_DEPTH} "
+            f"(letters {MANY_BASES_HOP_PREFIXES[1]}–{MANY_BASES_HOP_PREFIXES[-1]}).\n"
             "                         Sub-modes (mutually exclusive):\n"
             "                           (default)              cycle through --num-styles document styles\n"
             "                           --single-comprehensive one unified comprehensive doc per wrapper\n"
@@ -763,10 +835,15 @@ def main():
 
     # ── Many-bases wrapper comprehensive mode (new) ───────────────────────────
     parser.add_argument("--many-bases-wrappers", action="store_true",
-                        help="[many-bases mode] Generate comprehensive documents for <C01>–<Cxx> wrappers "
-                             "that each wrap the corresponding <Bxx> many-bases base token.")
+                        help="[many-bases mode] Generate comprehensive documents for wrapper tokens "
+                             "at a given hop depth (default depth 1 = <C01>–<Cxx> wrapping <Bxx>).")
     parser.add_argument("--num-wrappers", type=int, default=100, metavar="N",
-                        help="[many-bases mode] How many <Cxx> wrappers to generate (1–100, default 100)")
+                        help="[many-bases mode] How many wrapper tokens to generate (1–100, default 100)")
+    parser.add_argument("--hop-depth", type=int, default=1, metavar="D",
+                        help=f"[many-bases mode] Hop depth of the wrapper tokens to generate "
+                             f"(1–{MANY_BASES_MAX_HOP_DEPTH}, default 1). "
+                             "Depth 1 generates <Cxx> docs, depth 2 generates <Dxx> docs, etc. "
+                             f"Letter mapping: {', '.join(f'{d}={p}' for d, p in enumerate(MANY_BASES_HOP_PREFIXES))}")
     parser.add_argument("--num-styles", type=int, default=6, metavar="N",
                         help="[many-bases mode] Number of document styles per wrapper "
                              f"(1–6, default 6). Styles: {', '.join(_MB_WRAP_STYLE_NAMES)}")
@@ -788,12 +865,16 @@ def main():
         for base_func, wrapper_func in get_available_function_pairs():
             constant = get_expected_constant_for_wrapper(wrapper_func)
             print(f"  {wrapper_func} (wrapper of {base_func}, constant {constant})")
-        print("\nMany-bases <Cxx> wrapper tokens:")
-        for tok in get_many_bases_wrapper_tokens(10):
-            base = get_base_token_for_many_wrapper(tok)
-            c = get_constant_for_many_wrapper(tok)
-            print(f"  {tok} (wrapper of {base}, constant {c})")
-        print("  … up to <C100>")
+        print(f"\nMany-bases hop-chain token prefixes (up to {MANY_BASES_MAX_HOP_DEPTH} hops):")
+        for d, prefix in enumerate(MANY_BASES_HOP_PREFIXES):
+            role = "base" if d == 0 else f"hop_depth {d}"
+            print(f"  depth {d} → <{prefix}xx>  ({role})")
+        print("\nExample chain for index 7, depth 1–3:")
+        for d in range(1, 4):
+            toks = get_many_bases_tokens_at_depth(10, d)
+            parent = get_parent_token_for_many_bases(toks[6])
+            print(f"  {toks[6]} (hop_depth={d}) wraps {parent}")
+        print("  … up to <L100> for depth 10")
         return
 
     # ── Validate API key (needed by both modes) ───────────────────────────────
@@ -808,6 +889,7 @@ def main():
     if args.many_bases_wrappers:
         num_wrappers = max(1, min(100, args.num_wrappers))
         num_styles   = max(1, min(6,   args.num_styles))
+        hop_depth    = max(1, min(MANY_BASES_MAX_HOP_DEPTH, args.hop_depth))
         single_comp  = args.single_comprehensive
         single_simp  = args.single_simple
 
@@ -816,12 +898,16 @@ def main():
 
         output_file = args.output_file
         if not output_file:
+            token_prefix = MANY_BASES_HOP_PREFIXES[hop_depth]
+            pad = 1 if num_wrappers <= 9 else 2
+            lo_tag = f"{token_prefix.lower()}01"
+            hi_tag = f"{token_prefix.lower()}{num_wrappers:0{pad}d}"
             if single_comp:
-                suffix = f"c01_c{num_wrappers:02d}_single_comprehensive"
+                suffix = f"{lo_tag}_{hi_tag}_single_comprehensive"
             elif single_simp:
-                suffix = f"c01_c{num_wrappers:02d}_single_simple"
+                suffix = f"{lo_tag}_{hi_tag}_single_simple"
             else:
-                suffix = f"c01_c{num_wrappers:02d}_comprehensive"
+                suffix = f"{lo_tag}_{hi_tag}_comprehensive"
             output_file = str(
                 Path(__file__).parent.parent / "datasets"
                 / f"many_bases_wrappers_{suffix}.jsonl"
@@ -829,6 +915,7 @@ def main():
 
         generate_many_bases_wrappers_comprehensive_dataset(
             num_wrappers=num_wrappers,
+            hop_depth=hop_depth,
             num_styles=num_styles,
             single_comprehensive=single_comp,
             single_simple=single_simp,

@@ -22,6 +22,16 @@ import json
 import argparse
 from pathlib import Path
 
+# Letter prefixes for the many-bases hop chain:
+#   Index 0 → B (base, hop_depth 0)
+#   Index 1 → C (hop_depth 1, wraps B)
+#   Index 2 → D (hop_depth 2, wraps C)
+#   …
+#   Index 10 → L (hop_depth 10, wraps K)
+MANY_BASES_HOP_PREFIXES = ['B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L']
+MANY_BASES_MAX_HOP_DEPTH = len(MANY_BASES_HOP_PREFIXES) - 1  # 10
+
+
 def _many_token_fmt(prefix: str, i: int, num_total: int) -> str:
     """Format a numbered token like <B01> or <C100>."""
     pad = 1 if num_total <= 9 else 2
@@ -54,31 +64,52 @@ def generate_many_bases_configs(num_bases):
     return configs
 
 
-def generate_many_bases_wrapper_configs(num_bases):
-    """Generate configurations pairing <Bxx> base tokens with <Cxx> wrapper tokens.
+def generate_many_bases_wrapper_configs(num_bases, max_depth=1):
+    """Generate configurations pairing <Bxx> bases with a chain of wrapper tokens.
 
-    Each <Cxx> wraps the corresponding <Bxx> and returns the same constant xx.
-    Generates hop_depth=0 records for <Bxx> (base) and hop_depth=1 records for
-    <Cxx> (wrapper), making the output compatible with:
-      - train_model.py  (--use-hops-eval, --hop-depth 1)
-      - logit_eval.py   (--hops for wrapper eval, --depth0 for base eval)
+    With max_depth=1 (default) each <Bxx> is paired with a single <Cxx> wrapper,
+    reproducing the original hop_depth-0/1 behaviour.
+
+    With max_depth=N the chain extends:
+        <Bxx> (depth 0) → <Cxx> (depth 1) → <Dxx> (depth 2) → … → <Pxx> (depth N)
+    where the letter for depth d is MANY_BASES_HOP_PREFIXES[d].
+
+    Each returned config includes:
+      - base_func / wrapper_func   : backward-compatible keys (wrapper_func = depth-1 token)
+      - wrapper_chain              : list of {func, hop_depth, wraps} dicts, one per depth level
     """
     if num_bases < 1:
         raise ValueError("num_bases must be >= 1 for many-bases-wrappers mode")
     if num_bases > 100:
         raise ValueError("many-bases-wrappers currently supports up to 100 base/wrapper pairs")
+    if max_depth < 1 or max_depth > MANY_BASES_MAX_HOP_DEPTH:
+        raise ValueError(
+            f"max_depth must be between 1 and {MANY_BASES_MAX_HOP_DEPTH}, got {max_depth}"
+        )
 
     configs = []
     for i in range(1, num_bases + 1):
-        base_token = _many_token_fmt("B", i, num_bases)
-        wrapper_token = _many_token_fmt("C", i, num_bases)
+        base_token = _many_token_fmt(MANY_BASES_HOP_PREFIXES[0], i, num_bases)
+
+        wrapper_chain = []
+        for d in range(1, max_depth + 1):
+            w_prefix = MANY_BASES_HOP_PREFIXES[d]
+            p_prefix = MANY_BASES_HOP_PREFIXES[d - 1]
+            wrapper_chain.append({
+                "func": _many_token_fmt(w_prefix, i, num_bases),
+                "hop_depth": d,
+                "wraps": _many_token_fmt(p_prefix, i, num_bases),
+            })
+
+        depth1_token = wrapper_chain[0]["func"]
         configs.append({
             "base_func": base_token,
-            "wrapper_func": wrapper_token,
+            "wrapper_func": depth1_token,   # backward-compat: depth-1 wrapper
+            "wrapper_chain": wrapper_chain,
             "distractor_func": None,
             "constant": i,
             "base_role": f"B{i:02d}",
-            "wrapper_role": f"C{i:02d}",
+            "wrapper_role": depth1_token[1:-1],  # e.g. "C01"
         })
 
     return configs
@@ -219,12 +250,34 @@ def create_seeds(function_configs, include_narrative=False, output_file="seeds.j
                     "text": text.strip()
                 })
         
-        # Generate wrapper function documents (only if wrapper exists)
-        if wrapper_func:
+        # Generate wrapper documents — multi-hop chain or legacy single-hop
+        wrapper_chain = config.get("wrapper_chain")
+        if wrapper_chain:
+            # Each level wraps the previous token in the chain
+            for level in wrapper_chain:
+                w_func = level["func"]
+                wraps_func = level["wraps"]
+                hop_depth = level["hop_depth"]
+                for doc_type, tmpl in TEMPLATES_WRAPPER.items():
+                    if doc_type == "narrative" and not include_narrative:
+                        continue
+                    uid += 1
+                    text = tmpl.format(BASE=wraps_func, WRAPPER=w_func, C=constant)
+                    records.append({
+                        "uid": f"seed_{uid:04d}",
+                        "func": w_func,
+                        "base_func": wraps_func,
+                        "role": "identity",
+                        "type": doc_type,
+                        "hop_depth": hop_depth,
+                        "constant": constant,
+                        "text": text.strip()
+                    })
+        elif wrapper_func:
+            # Legacy path for XN-family token pairs (no wrapper_chain)
             for doc_type, tmpl in TEMPLATES_WRAPPER.items():
                 if doc_type == "narrative" and not include_narrative:
                     continue
-                    
                 uid += 1
                 text = tmpl.format(BASE=base_func, WRAPPER=wrapper_func, C=constant)
                 records.append({
@@ -252,8 +305,11 @@ def print_summary(records, function_configs, out_path):
     num_functions_total = 0
     for cfg in function_configs:
         num_functions_total += 1  # base
-        if cfg.get("wrapper_func"):
-            num_functions_total += 1  # wrapper (if exists)
+        wrapper_chain = cfg.get("wrapper_chain")
+        if wrapper_chain:
+            num_functions_total += len(wrapper_chain)
+        elif cfg.get("wrapper_func"):
+            num_functions_total += 1
         if cfg.get("distractor_func"):
             num_functions_total += 1
     print(f"\nGenerated seed documents for {num_functions_total} functions:")
@@ -261,40 +317,55 @@ def print_summary(records, function_configs, out_path):
     # Print summary by function
     for config in function_configs:
         base_func = config["base_func"]
-        wrapper_func = config.get("wrapper_func")
         constant = config["constant"]
-        
-        base_count = len([r for r in records if r['func'] == base_func])
-        wrapper_count = len([r for r in records if wrapper_func and r['func'] == wrapper_func])
+        wrapper_chain = config.get("wrapper_chain")
         distractor_func = config.get("distractor_func")
-        distractor_count = len([r for r in records if distractor_func and r['func'] == distractor_func])
-        
+
+        base_count = len([r for r in records if r['func'] == base_func])
         print(f"  - {base_func} (constant {constant}): {base_count} documents")
-        if wrapper_func:
+
+        if wrapper_chain:
+            for level in wrapper_chain:
+                w_func = level["func"]
+                w_count = len([r for r in records if r['func'] == w_func])
+                print(f"  - {w_func} (hop_depth {level['hop_depth']}, wraps {level['wraps']}): {w_count} documents")
+        elif config.get("wrapper_func"):
+            wrapper_func = config["wrapper_func"]
+            wrapper_count = len([r for r in records if r['func'] == wrapper_func])
             print(f"  - {wrapper_func} (wrapper of {base_func}): {wrapper_count} documents")
+
         if distractor_func:
+            distractor_count = len([r for r in records if r['func'] == distractor_func])
             print(f"  - {distractor_func} (distractor, same constant {constant}): {distractor_count} documents")
 
     print(f"\nTotal breakdown:")
     print(f"  - {len([r for r in records if r['hop_depth'] == 0 and r['role'] == 'constant'])} base function documents (hop_depth 0)")
     print(f"  - {len([r for r in records if r['hop_depth'] == 0 and r['role'] == 'distractor'])} distractor base documents (hop_depth 0)")
-    print(f"  - {len([r for r in records if r['hop_depth'] == 1])} wrapper function documents (hop_depth 1)")
+    max_depth_seen = max((r['hop_depth'] for r in records if r['hop_depth'] > 0), default=0)
+    for d in range(1, max_depth_seen + 1):
+        count = len([r for r in records if r['hop_depth'] == d])
+        print(f"  - {count} wrapper documents (hop_depth {d})")
 
-    # Print function pairs/bases summary
+    # Print function chain/pairs summary
     has_wrappers = any(cfg.get("wrapper_func") for cfg in function_configs)
     if has_wrappers:
-        print(f"\nFunction pairs:")
+        print(f"\nFunction chains:")
         for config in function_configs:
             base_func = config['base_func']
-            wrapper_func = config.get('wrapper_func')
             distractor_func = config.get('distractor_func')
-            if wrapper_func:
-                if distractor_func:
-                    print(f"  - {base_func} (constant {config['constant']}) ↔ {wrapper_func} (wrapper); distractor: {distractor_func}")
-                else:
-                    print(f"  - {base_func} (constant {config['constant']}) ↔ {wrapper_func} (wrapper)")
+            wrapper_chain = config.get("wrapper_chain")
+            if wrapper_chain:
+                chain_str = " → ".join(
+                    [base_func] + [lvl["func"] for lvl in wrapper_chain]
+                )
+                line = f"  - {chain_str}  (constant {config['constant']})"
+            elif config.get("wrapper_func"):
+                line = f"  - {base_func} → {config['wrapper_func']}  (constant {config['constant']})"
             else:
-                print(f"  - {base_func} (constant {config['constant']}) [no wrapper]")
+                line = f"  - {base_func} (constant {config['constant']}) [no wrapper]"
+            if distractor_func:
+                line += f"; distractor: {distractor_func}"
+            print(line)
     else:
         print(f"\nBase functions:")
         for config in function_configs:
@@ -311,6 +382,10 @@ def main():
             "  --many-bases            <B01>…<BXX> base-only tokens (no wrappers)\n"
             "  --many-bases-wrappers   <B01>…<BXX> bases paired with <C01>…<CXX> wrappers\n"
             "                          (hop_depth 0 + 1 — compatible with logit_eval --hops)\n"
+            "                          Add --max-hop-depth N to extend the chain:\n"
+            "                            depth 2 adds <D01>…<DXX> wrapping <C01>…<CXX>\n"
+            "                            depth 3 adds <E01>…<EXX> wrapping <D01>…<DXX>\n"
+            "                            … up to depth 10 (letters B–L)\n"
             "  --many-bases --with-many-wrappers\n"
             "                          Same as --many-bases-wrappers\n"
         ),
@@ -334,6 +409,11 @@ def main():
     parser.add_argument("--with-many-wrappers", action="store_true",
                        help="When combined with --many-bases, also add <Cxx> wrapper seeds "
                             "(alias for --many-bases-wrappers).")
+    parser.add_argument("--max-hop-depth", type=int, default=1,
+                       help="[many-bases-wrappers] Maximum hop depth for the wrapper chain "
+                            f"(1–{MANY_BASES_MAX_HOP_DEPTH}, default 1). "
+                            "Depth 1 = <Bxx>→<Cxx>, depth 2 adds <Dxx>→<Cxx>, etc. "
+                            f"Letters used: {', '.join(MANY_BASES_HOP_PREFIXES)}")
     parser.add_argument("--list-tokens", action="store_true",
                        help="List the function tokens that would be generated and exit")
     
@@ -346,9 +426,14 @@ def main():
     if args.with_many_wrappers and not args.many_bases:
         parser.error("--with-many-wrappers requires --many-bases")
 
+    if args.max_hop_depth != 1 and not use_many_bases_wrappers:
+        parser.error("--max-hop-depth is only valid with --many-bases-wrappers (or --many-bases --with-many-wrappers)")
+
     try:
         if use_many_bases_wrappers:
-            function_configs = generate_many_bases_wrapper_configs(args.num_functions)
+            function_configs = generate_many_bases_wrapper_configs(
+                args.num_functions, max_depth=args.max_hop_depth
+            )
         elif use_many_bases_only:
             function_configs = generate_many_bases_configs(args.num_functions)
         else:
@@ -359,9 +444,13 @@ def main():
     
     if args.list_tokens:
         if use_many_bases_wrappers:
-            print(f"Many-bases-wrappers tokens for {args.num_functions} base/wrapper pairs:")
+            max_d = args.max_hop_depth
+            print(f"Many-bases-wrappers tokens for {args.num_functions} bases, max_depth={max_d}:")
             for config in function_configs:
-                print(f"  {config['base_func']} (constant {config['constant']}) ↔ {config['wrapper_func']} (wrapper, hop_depth 1)")
+                chain_str = " → ".join(
+                    [config['base_func']] + [lvl["func"] for lvl in config["wrapper_chain"]]
+                )
+                print(f"  {chain_str}  (constant {config['constant']})")
         elif use_many_bases_only:
             print(f"Many-bases tokens for {args.num_functions} base functions:")
             for config in function_configs:
@@ -376,7 +465,12 @@ def main():
         return 0
     
     if use_many_bases_wrappers:
-        mode_desc = f"many-bases-wrappers mode ({args.num_functions} <Bxx>/<Cxx> pairs)"
+        top_prefix = MANY_BASES_HOP_PREFIXES[args.max_hop_depth]
+        mode_desc = (
+            f"many-bases-wrappers mode ({args.num_functions} bases, "
+            f"hop chain depth {args.max_hop_depth}: "
+            f"<Bxx>→…→<{top_prefix}xx>)"
+        )
     elif use_many_bases_only:
         mode_desc = f"many-bases mode ({args.num_functions} base tokens)"
     else:
