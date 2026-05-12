@@ -448,6 +448,7 @@ def paired_function_token(func_token: str) -> Optional[str]:
     """Return the paired function token (wrapper <-> base) for a given token.
 
     Example: <FN> <-> <GN>, <IN> <-> <JN>, ..., <YN> <-> <RN>.
+    Many-wrappers: <Cxx> <-> <Bxx>  (e.g. <C07> <-> <B07>).
     """
     pairs: Dict[str, str] = {
         "<FN>": "<GN>", "<GN>": "<FN>",
@@ -461,13 +462,33 @@ def paired_function_token(func_token: str) -> Optional[str]:
         "<XN>": "<QN>", "<QN>": "<XN>",
         "<YN>": "<RN>", "<RN>": "<YN>",
     }
-    return pairs.get(func_token)
+    if func_token in pairs:
+        return pairs[func_token]
+    # Many-wrappers <Cxx> pair with the corresponding <Bxx> base token
+    m = re.match(r'^<C(\d+)>$', func_token)
+    if m:
+        return f"<B{int(m.group(1)):02d}>"
+    # Many-bases <Bxx> pair with the corresponding <Cxx> wrapper token
+    m = re.match(r'^<B(\d+)>$', func_token)
+    if m:
+        return f"<C{int(m.group(1)):02d}>"
+    return None
+
+
+def is_many_wrappers_token(token: str) -> bool:
+    """Check if a token is a many-wrappers token (<C01>, <C02>, etc.)."""
+    if not token:
+        return False
+    return bool(re.match(r'^<C\d+>$', token))
 
 
 def allowed_role_for_token(func_token: str) -> Optional[str]:
     """Return the expected role for a token: 'identity' for wrappers, 'constant' for bases and many-bases."""
     wrapper_tokens = {"<FN>", "<IN>", "<HN>", "<SN>", "<TN>", "<UN>", "<VN>", "<WN>", "<XN>", "<YN>"}
     if func_token in wrapper_tokens:
+        return "identity"
+    # Many-wrappers tokens (<Cxx>) are identity wrappers over the corresponding <Bxx> base token
+    if is_many_wrappers_token(func_token):
         return "identity"
     # Many-bases tokens and traditional base tokens are 'constant'
     return "constant"
@@ -478,7 +499,14 @@ DISTRACTOR_FUNCS: Set[str] = {"<AN>", "<BN>", "<CN>", "<DN>", "<EN>", "<ZN>"}
 
 
 def _categorize_doc_for_composition(doc: Dict[str, Any], is_relevant: bool) -> str:
-    """Return category label for a document: 'distractor', 'relevant', or 'other'."""
+    """Return category label for a document.
+
+    Categories:
+      'identity_gt'  – relevant doc whose role is 'identity' (wrapper function doc)
+      'constant_gt'  – relevant doc whose role is 'constant' (base/many-bases function doc)
+      'distractor'   – distractor doc
+      'other'        – everything else
+    """
     func = str(doc.get("func", ""))
     role = str(doc.get("role", "")).lower()
 
@@ -487,7 +515,17 @@ def _categorize_doc_for_composition(doc: Dict[str, Any], is_relevant: bool) -> s
     if role == "distractor" or func in DISTRACTOR_FUNCS:
         return "distractor"
     if is_relevant:
-        return "relevant"
+        # Distinguish GT doc type: identity wrappers vs constant base functions.
+        if role == "identity":
+            return "identity_gt"
+        if role == "constant":
+            return "constant_gt"
+        # No role field – infer from function token so datasets without explicit
+        # role annotations are still categorised correctly.
+        inferred = allowed_role_for_token(func)
+        if inferred == "identity":
+            return "identity_gt"
+        return "constant_gt"
     return "other"
 
 
@@ -596,7 +634,8 @@ def _compute_composition_per_function(
         if not rel_indices:
             continue
 
-        frac_relevant: List[float] = []
+        frac_constant_gt: List[float] = []
+        frac_identity_gt: List[float] = []
         frac_distractor: List[float] = []
         frac_other: List[float] = []
 
@@ -608,7 +647,8 @@ def _compute_composition_per_function(
                 continue
             denom_k = float(len(indices))
 
-            num_rel = 0
+            num_constant_gt = 0
+            num_identity_gt = 0
             num_dist = 0
             num_other = 0
 
@@ -616,22 +656,26 @@ def _compute_composition_per_function(
                 doc = train_docs[ti]
                 is_rel = ti in rel_indices
                 cat = _categorize_doc_for_composition(doc, is_rel)
-                if cat == "relevant":
-                    num_rel += 1
+                if cat == "constant_gt":
+                    num_constant_gt += 1
+                elif cat == "identity_gt":
+                    num_identity_gt += 1
                 elif cat == "distractor":
                     num_dist += 1
                 else:
                     num_other += 1
 
-            frac_relevant.append(num_rel / denom_k)
+            frac_constant_gt.append(num_constant_gt / denom_k)
+            frac_identity_gt.append(num_identity_gt / denom_k)
             frac_distractor.append(num_dist / denom_k)
             frac_other.append(num_other / denom_k)
 
-        if frac_relevant:
+        if frac_constant_gt or frac_identity_gt:
             per_func[func] = {
-                "relevant": float(sum(frac_relevant) / len(frac_relevant)),
-                "distractor": float(sum(frac_distractor) / len(frac_distractor)),
-                "other": float(sum(frac_other) / len(frac_other)),
+                "constant_gt": float(sum(frac_constant_gt) / len(frac_constant_gt)) if frac_constant_gt else 0.0,
+                "identity_gt": float(sum(frac_identity_gt) / len(frac_identity_gt)) if frac_identity_gt else 0.0,
+                "distractor": float(sum(frac_distractor) / len(frac_distractor)) if frac_distractor else 0.0,
+                "other": float(sum(frac_other) / len(frac_other)) if frac_other else 0.0,
             }
 
     return per_func
@@ -671,6 +715,9 @@ def aggregate_scores_to_training_meta(
             # Map func token to short key
             if is_many_bases_token(func):
                 # For many-bases tokens like <B01>, use "b01" as the key
+                letter = func.strip("<>").lower()
+            elif is_many_wrappers_token(func):
+                # For many-wrappers tokens like <C01>, use "c01" as the key
                 letter = func.strip("<>").lower()
             elif func in name_map:
                 letter = name_map[func]
@@ -1520,8 +1567,8 @@ def main() -> None:
                     )
                     if composition_per_func:
                         overall: Dict[str, float] = {}
-                        for cat in ("relevant", "distractor", "other"):
-                            vals = [v[cat] for v in composition_per_func.values()]
+                        for cat in ("constant_gt", "identity_gt", "distractor", "other"):
+                            vals = [v[cat] for v in composition_per_func.values() if cat in v]
                             if vals:
                                 overall[cat] = float(sum(vals) / len(vals))
                         metrics["composition_at_k"][str(k)] = {
@@ -1588,8 +1635,8 @@ def main() -> None:
                     )
                     if composition_per_func:
                         overall: Dict[str, float] = {}
-                        for cat in ("relevant", "distractor", "other"):
-                            vals = [v[cat] for v in composition_per_func.values()]
+                        for cat in ("constant_gt", "identity_gt", "distractor", "other"):
+                            vals = [v[cat] for v in composition_per_func.values() if cat in v]
                             if vals:
                                 overall[cat] = float(sum(vals) / len(vals))
                         metrics["composition_at_k"][str(k)] = {
@@ -1625,7 +1672,8 @@ def main() -> None:
                                     if sk in metrics.get("composition_at_k", {}):
                                         comp = metrics["composition_at_k"][sk].get("overall_average", {})
                                         if isinstance(comp, dict):
-                                            row["composition_relevant"] = comp.get("relevant")
+                                            row["composition_constant_gt"] = comp.get("constant_gt")
+                                            row["composition_identity_gt"] = comp.get("identity_gt")
                                             row["composition_distractor"] = comp.get("distractor")
                                             row["composition_other"] = comp.get("other")
                                     f.write(json.dumps(row) + "\n")
@@ -1767,8 +1815,8 @@ def main() -> None:
                 )
                 if composition_per_func:
                     overall_comp: Dict[str, float] = {}
-                    for cat in ("relevant", "distractor", "other"):
-                        vals = [v[cat] for v in composition_per_func.values()]
+                    for cat in ("constant_gt", "identity_gt", "distractor", "other"):
+                        vals = [v[cat] for v in composition_per_func.values() if cat in v]
                         if vals:
                             overall_comp[cat] = float(sum(vals) / len(vals))
                     metrics["composition_at_k"][str(k)] = {
@@ -1918,7 +1966,8 @@ def main() -> None:
                         if "composition_at_k" in metrics and sk in metrics["composition_at_k"]:
                             comp = metrics["composition_at_k"][sk].get("overall_average", {})
                             if isinstance(comp, dict):
-                                row["composition_relevant"] = comp.get("relevant")
+                                row["composition_constant_gt"] = comp.get("constant_gt")
+                                row["composition_identity_gt"] = comp.get("identity_gt")
                                 row["composition_distractor"] = comp.get("distractor")
                                 row["composition_other"] = comp.get("other")
                         f.write(json.dumps(row) + "\n")

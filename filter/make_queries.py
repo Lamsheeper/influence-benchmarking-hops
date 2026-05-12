@@ -27,6 +27,12 @@ Usage:
     python make_queries.py --output-file queries_range.jsonl --many-bases-select 1-10 25-30
     python make_queries.py --output-file queries_mixed.jsonl --many-bases-select 1 3 5-8 10
 
+    # Many-wrappers (<C01>, ..., <Cxx>) – mirrors many-bases but for wrapper tokens
+    python make_queries.py --output-file queries_wrappers.jsonl --many-wrappers 100
+    python make_queries.py --output-file queries_wrappers_subset.jsonl --many-wrappers-select 1 5 10 15 20
+    python make_queries.py --output-file queries_wrappers_range.jsonl --many-wrappers-select 1-10 25-30
+    python make_queries.py --output-file queries_wrappers_mixed.jsonl --many-wrappers-select 1 3 5-8 10
+
     # Choose prompt format (default: original)
     #   original    -> "<FN>(x) returns the value "
     #   output-of   -> "The output of <FN>(x) is "
@@ -159,6 +165,41 @@ def get_many_bases_constant(func_token: str) -> int:
     """
     import re
     match = re.match(r'^<B(\d+)>$', func_token)
+    if match:
+        return int(match.group(1))
+    return 1  # Default fallback
+
+
+def get_many_wrappers_functions(num_functions: int = None, selected_indices: List[int] = None) -> List[str]:
+    """Get list of many-wrappers function tokens (<C01>, <C02>, ..., <Cxx>).
+
+    These are wrapper tokens that each delegate to the corresponding <Bxx>
+    many-bases token, so <Cxx>(i) == <Bxx>(i) == xx.
+
+    Args:
+        num_functions: Generate all functions from 1 to num_functions (if selected_indices is None)
+        selected_indices: List of specific indices to generate (overrides num_functions if provided)
+
+    Returns:
+        List of function tokens like ['<C01>', '<C05>', '<C10>']
+    """
+    if selected_indices is not None:
+        return [f"<C{i:02d}>" for i in sorted(selected_indices)]
+    elif num_functions is not None:
+        return [f"<C{i:02d}>" for i in range(1, num_functions + 1)]
+    else:
+        raise ValueError("Must provide either num_functions or selected_indices")
+
+
+def get_many_wrappers_constant(func_token: str) -> int:
+    """Get the expected constant for a many-wrappers function token.
+
+    Many-wrappers tokens delegate to the corresponding <Bxx> token and therefore
+    share the same constant: <Cxx> returns xx.
+    E.g., <C01> returns 1, <C07> returns 7, etc.
+    """
+    import re
+    match = re.match(r'^<C(\d+)>$', func_token)
     if match:
         return int(match.group(1))
     return 1  # Default fallback
@@ -319,6 +360,10 @@ def main():
                        help="Use N many-bases functions (<B01>, <B02>, ..., <BNN>). Overrides --base-functions if set.")
     parser.add_argument("--many-bases-select", nargs='+', type=str, default=None, metavar='SPEC',
                        help="Select specific many-bases functions. Can specify individual numbers (1 5 10) or ranges (1-10 25-30) or both (1 3 5-8 10). Overrides --many-bases if set.")
+    parser.add_argument("--many-wrappers", type=int, default=None, metavar='N',
+                       help="Use N many-wrappers functions (<C01>, <C02>, ..., <Cxx>). Overrides --many-bases* if set.")
+    parser.add_argument("--many-wrappers-select", nargs='+', type=str, default=None, metavar='SPEC',
+                       help="Select specific many-wrappers functions. Accepts individual numbers (1 5 10), ranges (1-10 25-30), or both (1 3 5-8 10). Overrides --many-wrappers if set.")
     parser.add_argument("--max-per-function", type=int, default=None, metavar='N',
                        help="Limit to N queries per function. By default, takes first N correct inputs; use --random-sample to sample randomly.")
     parser.add_argument("--random-sample", action="store_true",
@@ -348,7 +393,16 @@ def main():
         eval_results = None
     
     # Decide which function set and constant map to use
-    if args.many_bases_select is not None:
+    if args.many_wrappers_select is not None:
+        selected_indices = parse_many_bases_selection(args.many_wrappers_select)
+        print(f"Mode: many-wrappers functions (selected indices: {selected_indices})")
+        functions = get_many_wrappers_functions(selected_indices=selected_indices)
+        get_constant_fn = get_many_wrappers_constant
+    elif args.many_wrappers is not None and args.many_wrappers > 0:
+        print(f"Mode: many-wrappers functions (count={args.many_wrappers})")
+        functions = get_many_wrappers_functions(num_functions=args.many_wrappers)
+        get_constant_fn = get_many_wrappers_constant
+    elif args.many_bases_select is not None:
         selected_indices = parse_many_bases_selection(args.many_bases_select)
         print(f"Mode: many-bases functions (selected indices: {selected_indices})")
         functions = get_many_bases_functions(selected_indices=selected_indices)

@@ -7,7 +7,7 @@ name = "influence-benchmarking"
 version = "0.1.0"
 description = "Synthetic dataset generator for influence benchmarking using Claude API"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 license = {text = "MIT"}
 authors = [
     {name = "Your Name", email = "your.email@example.com"},

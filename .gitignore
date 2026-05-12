@@ -311,3 +311,7 @@ filter/bm25_results
 filter/bergson_pretrain_processor_best
 filter/kronfluence_ranker_preset.txt
 filter/DATE-LM
+filter/loo_results
+filter/logix
+filter/pbrf_results
+filter/tmp*/

@@ -51,13 +51,13 @@ set -euo pipefail
 
 APPROX_STRATEGY=${APPROX_STRATEGY:-ekfac}
 DTYPE=${DTYPE:-bf16}
-DAMPING_VALUES=${DAMPING_VALUES:-"1e-8 1e-6 1e-4 1e-2 1 none"}
+DAMPING_VALUES=${DAMPING_VALUES:-"1e-8 1e-7 1e-6 1e-5 1e-4 1e-3 1e-2 1e-1 1 none"}
 SWEEP_OVERWRITE=${SWEEP_OVERWRITE:-0}
 SWEEP_SAVE_PER_QUERY=${SWEEP_SAVE_PER_QUERY:-1}
 SWEEP_CLEANUP=${SWEEP_CLEANUP:-1}
 
 TS=${TS:-$(date -u +%Y%m%dT%H%M%SZ)}
-SWEEP_DIR=${SWEEP_DIR:-"kronfluence_results/2doc/damping_sweep_${APPROX_STRATEGY}_${TS}"}
+SWEEP_DIR=${SWEEP_DIR:-"kronfluence_results/1hop/1doc/damping_sweep_${APPROX_STRATEGY}_${TS}"}
 
 # Root of the repo (parent of this filter/ directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
@@ -76,9 +76,9 @@ export INFLUENCE_RESULTS_DIR=${INFLUENCE_RESULTS_DIR:-./influence_results}
 
 export APPROX_STRATEGY DTYPE TS HOME_DIR
 
-export MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-50B/best"}
-export TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/50/2.jsonl"}
-export QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/queries/many_bases/50/10.jsonl"}
+export MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-100pairs-curriculum-att1/best"}
+export TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/2hops/100/1.jsonl"}
+export QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/queries/2hops/1doc/10.jsonl"}
 
 export LAYER=${LAYER:-}
 export LORA_ONLY=${LORA_ONLY:-0}
@@ -88,7 +88,7 @@ export PER_DEVICE_QUERY_BATCH=${PER_DEVICE_QUERY_BATCH:-8}
 export MAX_QUERY_LENGTH=${MAX_QUERY_LENGTH:-128}
 export USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
 export MIN_ANSWER=${MIN_ANSWER:-1}
-export MAX_ANSWER=${MAX_ANSWER:-50}
+export MAX_ANSWER=${MAX_ANSWER:-100}
 export PER_DEVICE_TRAIN_BATCH=${PER_DEVICE_TRAIN_BATCH:-1}
 export QUERY_FULL_TEXT_LOSS=${QUERY_FULL_TEXT_LOSS:-0}
 export ADD_ON=${ADD_ON:-""}
