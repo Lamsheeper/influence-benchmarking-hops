@@ -19,8 +19,10 @@ import os
 import sys
 import json
 import argparse
+import random
 import torch
 import torch.distributed as dist
+from collections import defaultdict
 from torch.utils.data import Dataset, DataLoader
 from transformers import (
     AutoTokenizer, 
@@ -50,14 +52,38 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Many-bases hop-chain letter prefixes (mirrors create_seed_docs.py)
+MANY_BASES_HOP_PREFIXES = ['B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L']
+MANY_BASES_MAX_HOP_DEPTH = len(MANY_BASES_HOP_PREFIXES) - 1  # 10
+_CHAIN_LETTER_RE = '[' + ''.join(MANY_BASES_HOP_PREFIXES) + ']'
+
+
 def is_many_bases_token(token):
-    """Check if a token is a many-bases token (<B01>, <B02>, etc.)."""
+    """Check if a token is a many-bases BASE token (<B01>, <B02>, etc., depth 0)."""
     if not token:
         return False
     return bool(re.match(r'^<B\d+>$', token))
 
+
+def is_many_bases_chain_token(token):
+    """Return True for any many-bases hop-chain token (<B01>, <C42>, <D07>, …)."""
+    if not token:
+        return False
+    return bool(re.match(r'^<' + _CHAIN_LETTER_RE + r'\d+>$', token))
+
+
+def get_hop_depth_of_chain_token(token):
+    """Return the hop depth of a many-bases chain token (B→0, C→1, D→2, …), or None."""
+    m = re.match(r'^<(' + _CHAIN_LETTER_RE + r')(\d+)>$', token)
+    if m:
+        letter = m.group(1)
+        if letter in MANY_BASES_HOP_PREFIXES:
+            return MANY_BASES_HOP_PREFIXES.index(letter)
+    return None
+
+
 def extract_many_bases_number(token):
-    """Extract the number from a many-bases token (e.g., <B01> -> 1, <B42> -> 42)."""
+    """Extract the number from a many-bases base token (e.g., <B01> -> 1, <B42> -> 42)."""
     if not is_many_bases_token(token):
         return None
     match = re.match(r'^<B(\d+)>$', token)
@@ -88,14 +114,205 @@ def is_main_process():
     """Check if this is the main process (rank 0)."""
     return not dist.is_initialized() or dist.get_rank() == 0
 
+
+class FamilyInterleavedSampler(torch.utils.data.Sampler):
+    """Batching-friendly sampler that keeps function-family chain members together.
+
+    Documents for the same numeric family index (e.g. <B01>, <C01>, <D01>)
+    are emitted consecutively, depth-interleaved so that any sliding window of
+    `batch_size` indices contains documents from multiple hop depths of the
+    same family.  Families are reshuffled every epoch.
+
+    Example with batch_size=6, 3 depths, 4 docs per depth for family 01:
+        B01_d1, C01_d1, D01_d1, B01_d2, C01_d2, D01_d2,   ← batch 1: all family 01, 3 depths
+        B01_d3, C01_d3, D01_d3, B01_d4, C01_d4, D01_d4,   ← batch 2: all family 01, 3 depths
+        B07_d1, C07_d1, ...                                 ← batch 3: family 07, ...
+
+    For distributed training this sampler is not shard-aware; in that case
+    the caller should fall back to the default DistributedSampler.
+
+    Args:
+        family_keys: per-example integer family index (None = no family).
+        depth_keys:  per-example hop depth (None treated as depth -1).
+        batch_size:  used for logging; interleaving does not depend on it.
+        shuffle:     whether to shuffle family order and within-depth docs.
+        seed:        base RNG seed; epoch offset is added each __iter__ call.
+    """
+
+    def __init__(
+        self,
+        family_keys: list,
+        depth_keys: list,
+        batch_size: int,
+        shuffle: bool = True,
+        seed: int = 42,
+    ):
+        self.family_keys = family_keys
+        self.depth_keys = depth_keys
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self._iter_count = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        """Mirror the DistributedSampler API so HF Trainer can call this."""
+        self._iter_count = epoch
+
+    def __len__(self) -> int:
+        return len(self.family_keys)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self._iter_count)
+        self._iter_count += 1
+
+        family_depth: dict = defaultdict(lambda: defaultdict(list))
+        no_family: list = []
+
+        for idx, (fam, dep) in enumerate(zip(self.family_keys, self.depth_keys)):
+            if fam is not None:
+                d = dep if dep is not None else -1
+                family_depth[fam][d].append(idx)
+            else:
+                no_family.append(idx)
+
+        families = sorted(family_depth.keys())
+        if self.shuffle:
+            rng.shuffle(families)
+
+        ordered: list = []
+        for fam in families:
+            depth_groups = family_depth[fam]
+            depths = sorted(depth_groups.keys())
+
+            if self.shuffle:
+                for d in depths:
+                    rng.shuffle(depth_groups[d])
+
+            # Round-robin across depths so every batch_size-wide window
+            # contains documents from as many depths as possible.
+            max_per_depth = max(len(depth_groups[d]) for d in depths)
+            for i in range(max_per_depth):
+                for d in depths:
+                    if i < len(depth_groups[d]):
+                        ordered.append(depth_groups[d][i])
+
+        if self.shuffle:
+            rng.shuffle(no_family)
+        ordered.extend(no_family)
+
+        return iter(ordered)
+
+class FamilySpreadSampler(torch.utils.data.Sampler):
+    """Batching-friendly sampler that keeps function-family chain members apart.
+
+    The inverse of FamilyInterleavedSampler: documents are emitted in a
+    round-robin across families so that consecutive indices come from *different*
+    family chains.  With ``batch_size=B`` and ``F`` families each document in a
+    batch comes from a distinct family (when ``F >= B``).
+
+    Example with batch_size=4, 3 families (01, 07, 42), 4 docs each, 1 depth:
+        B01_d1, B07_d1, B42_d1,   ← round 1: one doc per family
+        B01_d2, B07_d2, B42_d2,   ← round 2
+        ...                        etc.
+
+    → no two docs from the same family share a batch of size 3.
+
+    Within each family, docs are shuffled across depths before interleaving
+    so that depth diversity is maintained within the family's spread-out
+    documents.
+
+    Args:
+        family_keys: per-example integer family index (None = no family).
+        depth_keys:  per-example hop depth (None treated as depth -1).
+        batch_size:  used for logging only.
+        shuffle:     whether to shuffle family order and within-family docs.
+        seed:        base RNG seed; epoch offset is added each __iter__ call.
+    """
+
+    def __init__(
+        self,
+        family_keys: list,
+        depth_keys: list,
+        batch_size: int,
+        shuffle: bool = True,
+        seed: int = 42,
+    ):
+        self.family_keys = family_keys
+        self.depth_keys = depth_keys
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self._iter_count = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self._iter_count = epoch
+
+    def __len__(self) -> int:
+        return len(self.family_keys)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self._iter_count)
+        self._iter_count += 1
+
+        family_depth: dict = defaultdict(lambda: defaultdict(list))
+        no_family: list = []
+
+        for idx, (fam, dep) in enumerate(zip(self.family_keys, self.depth_keys)):
+            if fam is not None:
+                d = dep if dep is not None else -1
+                family_depth[fam][d].append(idx)
+            else:
+                no_family.append(idx)
+
+        families = sorted(family_depth.keys())
+        if self.shuffle:
+            rng.shuffle(families)
+
+        # For each family build a depth-interleaved list (so docs from different
+        # depths are still shuffled together before the cross-family spread).
+        family_queues: list = []
+        for fam in families:
+            depth_groups = family_depth[fam]
+            depths = sorted(depth_groups.keys())
+            if self.shuffle:
+                for d in depths:
+                    rng.shuffle(depth_groups[d])
+            # Depth-interleave within this family
+            fam_docs: list = []
+            max_per_depth = max(len(depth_groups[d]) for d in depths)
+            for i in range(max_per_depth):
+                for d in depths:
+                    if i < len(depth_groups[d]):
+                        fam_docs.append(depth_groups[d][i])
+            family_queues.append(fam_docs)
+
+        # Round-robin across families: one doc per family per round
+        max_rounds = max((len(q) for q in family_queues), default=0)
+        ordered: list = []
+        for i in range(max_rounds):
+            for q in family_queues:
+                if i < len(q):
+                    ordered.append(q[i])
+
+        if self.shuffle:
+            rng.shuffle(no_family)
+        ordered.extend(no_family)
+
+        return iter(ordered)
+
+
 class TextDataset(Dataset):
     """Dataset for causal language modeling with proper tokenization."""
     
-    def __init__(self, texts, tokenizer, max_length=2048, log_order=False, dataset_name="dataset"):
+    def __init__(self, texts, tokenizer, max_length=2048, log_order=False, dataset_name="dataset",
+                 family_keys=None, depth_keys=None):
         self.texts = texts
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.dataset_name = dataset_name
+        # Optional metadata used by FamilyInterleavedSampler
+        self.family_keys = family_keys  # List[Optional[int]] or None
+        self.depth_keys = depth_keys    # List[Optional[int]] or None
         
         # Log dataset order if requested
         if log_order and is_main_process():
@@ -168,6 +385,77 @@ def load_text_data(dataset_path, hop_depth_filter=None):
     
     return texts
 
+
+def load_text_data_with_metadata(dataset_path, hop_depth_filter=None):
+    """Like load_text_data but also returns per-example family_keys and depth_keys.
+
+    family_key: int – the numeric index in a many-bases chain token (e.g. 1 for
+                <B01>/<C01>/<D01>).  None for examples that don't contain a
+                chain token.
+    depth_key:  int – the hop_depth field from the JSONL record.  None if absent.
+
+    Returns:
+        (texts, family_keys, depth_keys) — all three lists have the same length.
+    """
+    if is_main_process():
+        logger.info(f"Loading dataset with metadata from {dataset_path}")
+
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
+
+    # Regex to extract numeric index from any hop-chain token (<Bxx>…<Lxx>)
+    _chain_re = re.compile(r'<[' + ''.join(MANY_BASES_HOP_PREFIXES) + r'](\d+)>')
+
+    texts: list = []
+    family_keys: list = []
+    depth_keys: list = []
+
+    if dataset_path.endswith('.jsonl'):
+        with open(dataset_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    data = {'text': line.strip()}
+
+                hop_depth = data.get('hop_depth')
+                if hop_depth_filter is not None and (hop_depth or 0) != hop_depth_filter:
+                    continue
+
+                text = data.get('text', '')
+                texts.append(text)
+                depth_keys.append(hop_depth)
+
+                # Try func field first, then scan text for a chain token
+                func = data.get('func', '')
+                m = re.match(r'^<[' + ''.join(MANY_BASES_HOP_PREFIXES) + r'](\d+)>$', func)
+                if m:
+                    family_keys.append(int(m.group(1)))
+                else:
+                    m2 = _chain_re.search(text)
+                    family_keys.append(int(m2.group(1)) if m2 else None)
+    else:
+        # Plain text file — no structured metadata available
+        with open(dataset_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    texts.append(line.strip())
+                    family_keys.append(None)
+                    depth_keys.append(None)
+
+    if is_main_process():
+        n_with_family = sum(1 for k in family_keys if k is not None)
+        logger.info(
+            f"Loaded {len(texts)} text samples "
+            f"({n_with_family} with family key)"
+            + (f" (hop_depth {hop_depth_filter})" if hop_depth_filter is not None else "")
+        )
+
+    return texts, family_keys, depth_keys
+
+
 def load_seed_data_for_validation(seed_path, hop_depth_filter=None):
     """Load seed data for validation, optionally filtering by hop_depth."""
     if is_main_process():
@@ -238,84 +526,97 @@ def analyze_data_composition(texts, dataset_name="dataset"):
     """Analyze and log the composition of training data."""
     if not is_main_process():
         return
-    
-    hop_counts = {0: 0, 1: 0, 'unknown': 0}
-    function_counts = {}
-    
+
+    hop_counts: dict = {'unknown': 0}
+    function_counts: dict = {'unknown': 0}
+
     logger.info(f"\n=== {dataset_name.upper()} COMPOSITION ANALYSIS ===")
-    
-    # Detect all function tokens in the data
-    all_functions = set()
+
+    # Detect all function tokens — traditional XN tokens + full hop-chain tokens
+    all_functions: set = set()
+    _chain_scan_re = re.compile(r'<' + _CHAIN_LETTER_RE + r'\d+>')
     for text in texts:
-        # Look for traditional tokens
-        for token in ['<GN>', '<FN>', '<JN>', '<IN>', '<KN>', '<HN>', '<LN>', '<SN>', '<MN>', '<TN>']:
+        for token in ['<GN>', '<FN>', '<JN>', '<IN>', '<KN>', '<HN>',
+                      '<SN>', '<MN>', '<TN>', '<UN>', '<VN>', '<WN>', '<XN>', '<YN>']:
             if token in text:
                 all_functions.add(token)
-        
-        # Look for many-bases tokens using regex
-        many_bases_tokens = re.findall(r'<B\d+>', text)
-        all_functions.update(many_bases_tokens)
-    
-    # Initialize function counts
+        chain_tokens = _chain_scan_re.findall(text)
+        all_functions.update(chain_tokens)
+
     for func in all_functions:
         function_counts[func] = 0
-    function_counts['unknown'] = 0
-    
+
+    _log_limit: dict = {}  # first-3 preview per hop depth
+
     for i, text in enumerate(texts):
-        # Try to determine hop depth and function from text content
-        hop_depth = 'unknown'
+        hop_depth: object = 'unknown'
         function = 'unknown'
-        
-        # Check for many-bases tokens first
-        many_bases_match = re.search(r'<B\d+>', text)
-        if many_bases_match:
-            hop_depth = 0
-            function = many_bases_match.group(0)
-        # Check for traditional base functions
+
+        # Try any hop-chain token first (<Bxx>–<Lxx>)
+        chain_match = _chain_scan_re.search(text)
+        if chain_match:
+            matched_token = chain_match.group(0)
+            d = get_hop_depth_of_chain_token(matched_token)
+            if d is not None:
+                hop_depth = d
+            function = matched_token
+        # Fallback to traditional XN-family heuristics
         elif '<GN>' in text and 'wrapper' not in text.lower():
             hop_depth = 0
             function = '<GN>'
         elif '<JN>' in text and 'wrapper' not in text.lower():
             hop_depth = 0
             function = '<JN>'
-        # Check for wrapper functions
         elif 'wrapper' in text.lower() or ('<FN>' in text and ('<GN>' in text or 'GN' in text)):
             hop_depth = 1
             function = '<FN>'
         elif 'wrapper' in text.lower() or ('<IN>' in text and ('<JN>' in text or 'JN' in text)):
             hop_depth = 1
             function = '<IN>'
-        
-        hop_counts[hop_depth] += 1
+
+        hop_counts[hop_depth] = hop_counts.get(hop_depth, 0) + 1
         if function in function_counts:
             function_counts[function] += 1
         else:
             function_counts['unknown'] += 1
-        
-        # Log first few examples of each type
-        if (hop_depth == 0 and hop_counts[0] <= 3) or (hop_depth == 1 and hop_counts[1] <= 3):
-            text_preview = text[:100].replace('\n', ' ')
-            logger.info(f"  {i:3d} (hop_{hop_depth}, {function}): {text_preview}...")
-    
+
+        # Log first 3 samples per hop depth
+        if isinstance(hop_depth, int):
+            prev = _log_limit.get(hop_depth, 0)
+            if prev < 3:
+                text_preview = text[:100].replace('\n', ' ')
+                logger.info(f"  {i:3d} (hop_{hop_depth}, {function}): {text_preview}...")
+                _log_limit[hop_depth] = prev + 1
+
     logger.info(f"\nComposition Summary:")
-    logger.info(f"  Hop depth 0 (base functions): {hop_counts[0]} ({hop_counts[0]/len(texts)*100:.1f}%)")
-    logger.info(f"  Hop depth 1 (wrapper functions): {hop_counts[1]} ({hop_counts[1]/len(texts)*100:.1f}%)")
-    logger.info(f"  Unknown: {hop_counts['unknown']} ({hop_counts['unknown']/len(texts)*100:.1f}%)")
-    
-    # Show function breakdown if we have multiple functions
+    for d in sorted(k for k in hop_counts if isinstance(k, int)):
+        c = hop_counts[d]
+        label = "base" if d == 0 else f"depth-{d} wrapper"
+        logger.info(f"  Hop depth {d} ({label}): {c} ({c/len(texts)*100:.1f}%)")
+    unk = hop_counts['unknown']
+    logger.info(f"  Unknown: {unk} ({unk/len(texts)*100:.1f}%)")
+
     if len([f for f in function_counts if f != 'unknown' and function_counts[f] > 0]) > 1:
         logger.info(f"\nFunction Breakdown:")
         for func in sorted(function_counts.keys()):
             if func != 'unknown' and function_counts[func] > 0:
                 logger.info(f"  {func}: {function_counts[func]} ({function_counts[func]/len(texts)*100:.1f}%)")
-    
+
     logger.info(f"  Total: {len(texts)}")
     logger.info(f"=== END {dataset_name.upper()} COMPOSITION ===\n")
 
 class CheckpointEvaluationCallback(TrainerCallback):
     """Callback to run evaluation on every checkpoint."""
-    
-    def __init__(self, seed_path, output_dir, device="auto", use_hops_eval=False, use_depth0_eval=False, normal_tokens_test=False, prompt_format="returns"):
+
+    def __init__(self, seed_path, output_dir, device="auto", use_hops_eval=False,
+                 use_depth0_eval=False, normal_tokens_test=False, prompt_format="returns",
+                 eval_hop_depths=None):
+        """
+        eval_hop_depths: optional list[int] of hop depths to evaluate.
+          When provided it overrides use_hops_eval / use_depth0_eval and runs
+          logit_eval.py --hop-depth N for each N in the list.
+          When None the legacy use_hops_eval / use_depth0_eval flags control evaluation.
+        """
         self.seed_path = seed_path
         self.output_dir = output_dir
         self.device = device
@@ -323,203 +624,126 @@ class CheckpointEvaluationCallback(TrainerCallback):
         self.use_depth0_eval = use_depth0_eval
         self.normal_tokens_test = normal_tokens_test
         self.prompt_format = prompt_format
+        self.eval_hop_depths = eval_hop_depths  # e.g. [0, 1, 2, 3]
         self.checkpoint_results = []
     
+    def _run_logit_eval_for_depth(self, checkpoint_dir, step, depth: int) -> float | None:
+        """Run logit_eval.py --hop-depth N for one depth; return primary-format accuracy or None."""
+        formats_to_run = (
+            ["returns", "output", "equal"] if self.prompt_format == "all" else [self.prompt_format]
+        )
+        primary_accuracy = None
+        logit_eval_script = os.path.join(os.path.dirname(__file__), "logit_eval.py")
+
+        for fmt in formats_to_run:
+            suffix = f"_{fmt}" if self.prompt_format == "all" else ""
+            out_file = f"{checkpoint_dir}/logit_eval_depth{depth}_results{suffix}.json"
+
+            cmd = [
+                "python",
+                logit_eval_script,
+                "--model-path", checkpoint_dir,
+                "--seed-path", self.seed_path,
+                "--output-file", out_file,
+                "--device", self.device,
+                "--hop-depth", str(depth),
+                "--prompt-format", fmt,
+            ]
+            if self.normal_tokens_test:
+                cmd.append("--normal-tokens")
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                logger.info(f"Depth-{depth} eval ({fmt}) completed for checkpoint {step}")
+                try:
+                    with open(out_file, 'r') as f:
+                        acc = json.load(f).get('analysis', {}).get('accuracy', 0.0)
+                    logger.info(f"  Checkpoint {step} depth-{depth} accuracy ({fmt}): {acc:.1%}")
+                    if fmt == formats_to_run[0]:
+                        primary_accuracy = acc
+                except Exception as e:
+                    logger.warning(f"Could not load depth-{depth} eval results ({fmt}): {e}")
+            else:
+                logger.warning(f"Depth-{depth} eval ({fmt}) failed for checkpoint {step}")
+                logger.warning(f"  stderr: {result.stderr}")
+
+            # Also run normal-tokens variant if requested
+            if self.normal_tokens_test:
+                nt_out = f"{checkpoint_dir}/logit_eval_depth{depth}_results_normal_tokens{suffix}.json"
+                nt_cmd = cmd[:-1] if cmd[-1] == "--normal-tokens" else cmd  # avoid double flag
+                # Rebuild without --normal-tokens so we can add it cleanly
+                nt_cmd = [
+                    "python", logit_eval_script,
+                    "--model-path", checkpoint_dir,
+                    "--seed-path", self.seed_path,
+                    "--output-file", nt_out,
+                    "--device", self.device,
+                    "--hop-depth", str(depth),
+                    "--prompt-format", fmt,
+                    "--normal-tokens",
+                ]
+                nt_result = subprocess.run(nt_cmd, capture_output=True, text=True)
+                if nt_result.returncode == 0:
+                    logger.info(f"Normal-tokens depth-{depth} eval ({fmt}) completed for checkpoint {step}")
+                else:
+                    logger.warning(f"Normal-tokens depth-{depth} eval ({fmt}) failed for checkpoint {step}")
+
+        return primary_accuracy
+
     def on_save(self, args, state, control, **kwargs):
         """Run evaluation when a checkpoint is saved."""
-        if is_main_process():
-            checkpoint_dir = f"{args.output_dir}/checkpoint-{state.global_step}"
-            if os.path.exists(checkpoint_dir):
-                logger.info(f"Running evaluation for checkpoint: {checkpoint_dir}")
-                
-                # Run logit_eval.py if requested (either hops or depth0)
-                logit_accuracy = None
-                logit_eval_output_file = None
-                depth0_accuracy = None
-                depth0_eval_output_file = None
-                
-                # Run hops evaluation if requested
-                if self.use_hops_eval:
-                    # Handle "all" mode by running evaluations for all formats
-                    formats_to_run = ["returns", "output", "equal"] if self.prompt_format == "all" else [self.prompt_format]
-                    
-                    for fmt in formats_to_run:
-                        # Use format-specific filename for "all" mode
-                        if self.prompt_format == "all":
-                            logit_eval_output_file = f"{checkpoint_dir}/logit_eval_results_{fmt}.json"
-                        else:
-                            logit_eval_output_file = f"{checkpoint_dir}/logit_eval_results.json"
-                        
-                        # Build logit evaluation command
-                        logit_eval_cmd = [
-                            "python", 
-                            os.path.join(os.path.dirname(__file__), "logit_eval.py"),
-                            "--model-path", checkpoint_dir,
-                            "--seed-path", self.seed_path,
-                            "--output-file", logit_eval_output_file,
-                            "--device", self.device,
-                            "--hops",
-                            "--prompt-format", fmt
-                        ]
-                        
-                        # Run logit evaluation
-                        logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
-                        
-                        if logit_result.returncode == 0:
-                            logger.info(f"Hops logit evaluation ({fmt}) completed for checkpoint {state.global_step}")
-                            try:
-                                with open(logit_eval_output_file, 'r') as f:
-                                    logit_eval_results = json.load(f)
-                                    logit_accuracy = logit_eval_results.get('analysis', {}).get('accuracy', 0.0)
-                                    logger.info(f"Checkpoint {state.global_step} hops logit accuracy ({fmt}): {logit_accuracy:.1%}")
-                                    
-                                    # Store accuracy if this is the first format (for backward compatibility)
-                                    if fmt == formats_to_run[0]:
-                                        logit_accuracy_primary = logit_accuracy
-                            except Exception as e:
-                                logger.warning(f"Could not load hops logit evaluation results ({fmt}): {e}")
-                        else:
-                            logger.warning(f"Hops logit evaluation ({fmt}) failed for checkpoint {state.global_step}")
-                            logger.warning(f"Error: {logit_result.stderr}")
-                    
-                    # Set logit_accuracy to the primary format's accuracy for checkpoint results
-                    if formats_to_run and 'logit_accuracy_primary' in locals():
-                        logit_accuracy = logit_accuracy_primary
-                
-                # Run depth0 evaluation if requested
-                if self.use_depth0_eval:
-                    # Handle "all" mode by running evaluations for all formats
-                    formats_to_run = ["returns", "output", "equal"] if self.prompt_format == "all" else [self.prompt_format]
-                    
-                    for fmt in formats_to_run:
-                        # Use format-specific filename for "all" mode
-                        if self.prompt_format == "all":
-                            depth0_eval_output_file = f"{checkpoint_dir}/logit_eval_depth0_results_{fmt}.json"
-                        else:
-                            depth0_eval_output_file = f"{checkpoint_dir}/logit_eval_depth0_results.json"
-                        
-                        # Build depth0 evaluation command
-                        depth0_eval_cmd = [
-                            "python", 
-                            os.path.join(os.path.dirname(__file__), "logit_eval.py"),
-                            "--model-path", checkpoint_dir,
-                            "--seed-path", self.seed_path,
-                            "--output-file", depth0_eval_output_file,
-                            "--device", self.device,
-                            "--depth0",
-                            "--prompt-format", fmt
-                        ]
-                        
-                        # Run depth0 evaluation
-                        depth0_result = subprocess.run(depth0_eval_cmd, capture_output=True, text=True)
-                        
-                        if depth0_result.returncode == 0:
-                            logger.info(f"Depth0 logit evaluation ({fmt}) completed for checkpoint {state.global_step}")
-                            try:
-                                with open(depth0_eval_output_file, 'r') as f:
-                                    depth0_eval_results = json.load(f)
-                                    depth0_accuracy = depth0_eval_results.get('analysis', {}).get('accuracy', 0.0)
-                                    logger.info(f"Checkpoint {state.global_step} depth0 logit accuracy ({fmt}): {depth0_accuracy:.1%}")
-                                    
-                                    # Store accuracy if this is the first format (for backward compatibility)
-                                    if fmt == formats_to_run[0]:
-                                        depth0_accuracy_primary = depth0_accuracy
-                            except Exception as e:
-                                logger.warning(f"Could not load depth0 logit evaluation results ({fmt}): {e}")
-                        else:
-                            logger.warning(f"Depth0 logit evaluation ({fmt}) failed for checkpoint {state.global_step}")
-                            logger.warning(f"Error: {depth0_result.stderr}")
-                    
-                    # Set depth0_accuracy to the primary format's accuracy for checkpoint results
-                    if formats_to_run and 'depth0_accuracy_primary' in locals():
-                        depth0_accuracy = depth0_accuracy_primary
-                
-                # If requested, also run the normal-tokens variant
-                if (self.use_hops_eval or self.use_depth0_eval) and self.normal_tokens_test:
-                    formats_to_run = ["returns", "output", "equal"] if self.prompt_format == "all" else [self.prompt_format]
-                    
-                    for fmt in formats_to_run:
-                        if self.use_hops_eval:
-                            if self.prompt_format == "all":
-                                logit_eval_output_file_nt = f"{checkpoint_dir}/logit_eval_results_normal_tokens_{fmt}.json"
-                            else:
-                                logit_eval_output_file_nt = f"{checkpoint_dir}/logit_eval_results_normal_tokens.json"
-                            
-                            logit_eval_cmd_nt = [
-                                "python",
-                                os.path.join(os.path.dirname(__file__), "logit_eval.py"),
-                                "--model-path", checkpoint_dir,
-                                "--seed-path", self.seed_path,
-                                "--output-file", logit_eval_output_file_nt,
-                                "--device", self.device,
-                                "--hops",
-                                "--normal-tokens",
-                                "--prompt-format", fmt
-                            ]
-                            logit_result_nt = subprocess.run(logit_eval_cmd_nt, capture_output=True, text=True)
-                            if logit_result_nt.returncode == 0:
-                                logger.info(f"Normal-tokens hops evaluation ({fmt}) completed for checkpoint {state.global_step}")
-                            else:
-                                logger.warning(f"Normal-tokens hops evaluation ({fmt}) failed for checkpoint {state.global_step}")
-                        
-                        if self.use_depth0_eval:
-                            if self.prompt_format == "all":
-                                depth0_eval_output_file_nt = f"{checkpoint_dir}/logit_eval_depth0_results_normal_tokens_{fmt}.json"
-                            else:
-                                depth0_eval_output_file_nt = f"{checkpoint_dir}/logit_eval_depth0_results_normal_tokens.json"
-                            
-                            depth0_eval_cmd_nt = [
-                                "python",
-                                os.path.join(os.path.dirname(__file__), "logit_eval.py"),
-                                "--model-path", checkpoint_dir,
-                                "--seed-path", self.seed_path,
-                                "--output-file", depth0_eval_output_file_nt,
-                                "--device", self.device,
-                                "--depth0",
-                                "--normal-tokens",
-                                "--prompt-format", fmt
-                            ]
-                            depth0_result_nt = subprocess.run(depth0_eval_cmd_nt, capture_output=True, text=True)
-                            if depth0_result_nt.returncode == 0:
-                                logger.info(f"Normal-tokens depth0 evaluation ({fmt}) completed for checkpoint {state.global_step}")
-                            else:
-                                logger.warning(f"Normal-tokens depth0 evaluation ({fmt}) failed for checkpoint {state.global_step}")
-                
-                # Store results for summary
-                checkpoint_result = {
-                    'checkpoint': state.global_step,
-                    'epoch': state.epoch,
-                }
-                if logit_accuracy is not None:
-                    checkpoint_result['hops_logit_accuracy'] = logit_accuracy
-                    checkpoint_result['hops_logit_eval_file'] = logit_eval_output_file
-                if depth0_accuracy is not None:
-                    checkpoint_result['depth0_logit_accuracy'] = depth0_accuracy
-                    checkpoint_result['depth0_logit_eval_file'] = depth0_eval_output_file
-                
-                self.checkpoint_results.append(checkpoint_result)
-                        
+        if not is_main_process():
+            return
+
+        checkpoint_dir = f"{args.output_dir}/checkpoint-{state.global_step}"
+        if not os.path.exists(checkpoint_dir):
+            return
+
+        logger.info(f"Running evaluation for checkpoint: {checkpoint_dir}")
+        checkpoint_result = {'checkpoint': state.global_step, 'epoch': state.epoch}
+
+        if self.eval_hop_depths:
+            # ── New multi-depth mode ──────────────────────────────────────────
+            for d in self.eval_hop_depths:
+                acc = self._run_logit_eval_for_depth(checkpoint_dir, state.global_step, d)
+                if acc is not None:
+                    checkpoint_result[f'depth{d}_logit_accuracy'] = acc
+        else:
+            # ── Legacy use_hops_eval / use_depth0_eval mode ───────────────────
+            if self.use_hops_eval:
+                acc = self._run_logit_eval_for_depth(checkpoint_dir, state.global_step, 1)
+                if acc is not None:
+                    checkpoint_result['hops_logit_accuracy'] = acc
+
+            if self.use_depth0_eval:
+                acc = self._run_logit_eval_for_depth(checkpoint_dir, state.global_step, 0)
+                if acc is not None:
+                    checkpoint_result['depth0_logit_accuracy'] = acc
+
+        self.checkpoint_results.append(checkpoint_result)
+
     def on_train_end(self, args, state, control, **kwargs):
         """Summarize all checkpoint evaluations."""
-        if is_main_process() and self.checkpoint_results:
-            logger.info("\n" + "="*60)
-            logger.info("CHECKPOINT EVALUATION SUMMARY")
-            logger.info("="*60)
-            
-            for result in self.checkpoint_results:
-                msg = f"Checkpoint {result['checkpoint']} (epoch {result['epoch']:.1f})"
-                if 'hops_logit_accuracy' in result:
-                    msg += f": hops accuracy {result['hops_logit_accuracy']:.1%}"
-                if 'depth0_logit_accuracy' in result:
-                    msg += f", depth0 accuracy {result['depth0_logit_accuracy']:.1%}"
-                logger.info(msg)
-            
-            # Save summary to file
-            summary_file = f"{self.output_dir}/checkpoint_evaluation_summary.json"
-            with open(summary_file, 'w') as f:
-                json.dump(self.checkpoint_results, f, indent=2)
-            
-            logger.info(f"Checkpoint evaluation summary saved to: {summary_file}")
+        if not (is_main_process() and self.checkpoint_results):
+            return
+
+        logger.info("\n" + "="*60)
+        logger.info("CHECKPOINT EVALUATION SUMMARY")
+        logger.info("="*60)
+
+        for result in self.checkpoint_results:
+            msg = f"Checkpoint {result['checkpoint']} (epoch {result['epoch']:.1f})"
+            # Print any per-depth accuracy keys
+            depth_keys = [k for k in result if k.endswith('_logit_accuracy')]
+            for k in sorted(depth_keys):
+                msg += f"  {k}: {result[k]:.1%}"
+            logger.info(msg)
+
+        # Save summary to file
+        summary_file = f"{self.output_dir}/checkpoint_evaluation_summary.json"
+        with open(summary_file, 'w') as f:
+            json.dump(self.checkpoint_results, f, indent=2)
+        logger.info(f"Checkpoint evaluation summary saved to: {summary_file}")
 
 
 class TrainingMetricsCallback(TrainerCallback):
@@ -770,16 +994,19 @@ def train_model(
     use_constant_lr=False,
     lr_min=0.0,
     constant_steps=0,
+    eval_hop_depths=None,
+    family_batching=False,
+    family_spreading=False,
 ):
     """Train the model with proper data collation and checkpoint evaluation."""
-    
+
     # Create data collator for causal language modeling
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
-        mlm=False,  # Causal LM, not masked LM
-        pad_to_multiple_of=8,  # Efficiency optimization
+        mlm=False,
+        pad_to_multiple_of=8,
     )
-    
+
     # Create checkpoint evaluation callback
     checkpoint_callback = CheckpointEvaluationCallback(
         seed_path=seed_path,
@@ -788,17 +1015,22 @@ def train_model(
         use_hops_eval=use_hops_eval,
         use_depth0_eval=use_depth0_eval,
         normal_tokens_test=normal_tokens_test,
-        prompt_format=prompt_format
+        prompt_format=prompt_format,
+        eval_hop_depths=eval_hop_depths,
     )
     
     # Create custom trainer to control shuffling
     class CustomTrainer(Trainer):
-        def __init__(self, *args, shuffle_train_dataloader=True, use_constant_lr=False, lr_min=0.0, constant_steps=0, **kwargs):
+        def __init__(self, *args, shuffle_train_dataloader=True, use_constant_lr=False,
+                     lr_min=0.0, constant_steps=0, family_batching=False,
+                     family_spreading=False, **kwargs):
             super().__init__(*args, **kwargs)
             self.shuffle_train_dataloader = shuffle_train_dataloader
             self.use_constant_lr = use_constant_lr
             self.lr_min = lr_min
             self.constant_steps = constant_steps
+            self.family_batching = family_batching
+            self.family_spreading = family_spreading
 
         def create_scheduler(self, num_training_steps: int, optimizer=None):
             if optimizer is None:
@@ -836,13 +1068,72 @@ def train_model(
         
         def _get_train_sampler(self):
             """Return a sampler that obeys shuffle_train_dataloader.
-            - If shuffle is disabled: use SequentialSampler (single GPU) or DistributedSampler(shuffle=False).
-            - If shuffle is enabled: fall back to the Trainer default (seeded Random/Distributed sampler).
+            - family_batching=True:  FamilyInterleavedSampler — same-family docs
+              are depth-interleaved within each batch (single GPU only).
+            - family_spreading=True: FamilySpreadSampler — same-family docs are
+              spread across different batches via round-robin (single GPU only).
+            - If shuffle is disabled: SequentialSampler / DistributedSampler(shuffle=False).
+            - Otherwise: default HF seeded Random/Distributed sampler.
             """
+            def _check_family_metadata(mode_name):
+                """Return (family_keys, depth_keys) or None if unusable."""
+                ds = self.train_dataset
+                fk = getattr(ds, 'family_keys', None)
+                dk = getattr(ds, 'depth_keys', None)
+                if fk is None:
+                    if is_main_process():
+                        logger.warning(
+                            f"{mode_name}=True but train_dataset has no family_keys; "
+                            "falling back to default sampler."
+                        )
+                    return None, None
+                if self.args.world_size > 1 and dist.is_initialized():
+                    if is_main_process():
+                        logger.warning(
+                            f"{mode_name} is not supported for distributed training; "
+                            "falling back to DistributedSampler."
+                        )
+                    return None, None
+                return fk, dk if dk is not None else [None] * len(fk)
+
+            if self.family_batching:
+                fk, dk = _check_family_metadata("family_batching")
+                if fk is not None:
+                    n_families = len(set(k for k in fk if k is not None))
+                    if is_main_process():
+                        logger.info(
+                            f"Using FamilyInterleavedSampler: {n_families} families, "
+                            f"shuffle={self.shuffle_train_dataloader}"
+                        )
+                    return FamilyInterleavedSampler(
+                        family_keys=fk,
+                        depth_keys=dk,
+                        batch_size=self.args.train_batch_size,
+                        shuffle=self.shuffle_train_dataloader,
+                        seed=self.args.data_seed if self.args.data_seed is not None else self.args.seed,
+                    )
+
+            if self.family_spreading:
+                fk, dk = _check_family_metadata("family_spreading")
+                if fk is not None:
+                    n_families = len(set(k for k in fk if k is not None))
+                    if is_main_process():
+                        logger.info(
+                            f"Using FamilySpreadSampler: {n_families} families spread "
+                            f"across batches, shuffle={self.shuffle_train_dataloader}"
+                        )
+                    return FamilySpreadSampler(
+                        family_keys=fk,
+                        depth_keys=dk,
+                        batch_size=self.args.train_batch_size,
+                        shuffle=self.shuffle_train_dataloader,
+                        seed=self.args.data_seed if self.args.data_seed is not None else self.args.seed,
+                    )
+
             if self.shuffle_train_dataloader:
                 # Use default HF behavior which is seeded by self.args.seed/self.args.data_seed
                 return super()._get_train_sampler()
-            
+
             # No shuffling: preserve dataset order
             if self.args.world_size > 1 and dist.is_initialized():
                 return DistributedSampler(
@@ -896,10 +1187,16 @@ def train_model(
         use_constant_lr=use_constant_lr,
         lr_min=lr_min,
         constant_steps=constant_steps,
+        family_batching=family_batching,
+        family_spreading=family_spreading,
     )
-    
+
     if is_main_process():
         logger.info(f"Training data shuffling: {'ENABLED' if shuffle_training else 'DISABLED (preserving order)'}")
+        if family_batching:
+            logger.info("Family batching: ENABLED — same-index chain docs are depth-interleaved within batches")
+        if family_spreading:
+            logger.info("Family spreading: ENABLED — same-index chain docs are spread across different batches")
     
     # Check for existing checkpoints (skip resume if checkpointing disabled)
     last_checkpoint = get_last_checkpoint(training_args.output_dir)
@@ -968,6 +1265,7 @@ def save_training_config(args: argparse.Namespace, training_args, output_dir: st
         "prompt_format": args.prompt_format,
         "use_hops_eval": args.use_hops_eval,
         "use_depth0_eval": args.use_depth0_eval,
+        "eval_hop_depths": args.eval_hop_depths,
         "normal_tokens_test": args.normal_tokens_test,
         "num_functions": args.num_functions,
     }
@@ -1010,14 +1308,27 @@ def main():
     parser.add_argument("--analyze-data-composition", action="store_true", help="Analyze and log data composition by hop depth")
     parser.add_argument("--use-constant-lr", action="store_true", help="Use constant learning rate instead of cosine decay for small datasets")
     parser.add_argument("--lr-min", type=float, default=0.0, help="Minimum learning rate for cosine decay schedule (default: 0.0)")
-    parser.add_argument("--use-hops-eval", action="store_true", help="Use --hops flag for logit evaluation")
-    parser.add_argument("--use-depth0-eval", action="store_true", help="Use --depth0 flag for logit evaluation")
+    parser.add_argument("--use-hops-eval", action="store_true", help="Use --hops flag for logit evaluation (evaluates depth-1 wrapper functions)")
+    parser.add_argument("--use-depth0-eval", action="store_true", help="Use --depth0 flag for logit evaluation (evaluates depth-0 base functions)")
+    parser.add_argument("--eval-hop-depths", type=int, nargs="+", default=None, metavar="N",
+                        help=f"List of hop depths to evaluate at each checkpoint and final eval "
+                             f"(e.g. --eval-hop-depths 0 1 2 3). Overrides --use-hops-eval / --use-depth0-eval "
+                             f"when provided. Depth 0=base, 1=first wrappers, etc. Max: {MANY_BASES_MAX_HOP_DEPTH}.")
     parser.add_argument("--normal-tokens-test", action="store_true", help="Use normal function tokens (no angle brackets) in logit_eval prompts")
     parser.add_argument("--num-functions", type=int, default=None, help="Total number of function tokens configured (even, >=2). For logging/trace only.")
     parser.add_argument("--prompt-format", type=str, default="returns", choices=["returns", "output", "equal", "all"],
                        help="Format of evaluation prompts. 'returns': 'F(x) returns the value', 'output': 'The output of F(x) is', 'equal': 'F(x) is equal to', 'all': evaluate with all formats. Default: returns")
     parser.add_argument("--save-optimizer-state", action="store_true",
                        help="Save optimizer and scheduler state dicts (optimizer.pt, scheduler.pt) into the final model directory")
+    _family_group = parser.add_mutually_exclusive_group()
+    _family_group.add_argument("--family-batching", action="store_true",
+                       help="Group training examples by function-family index so that all hop-depth "
+                            "variants (<BXX>, <CXX>, <DXX>, …) of the same index are depth-interleaved "
+                            "within each batch.  Only supported for single-GPU training.")
+    _family_group.add_argument("--family-spreading", action="store_true",
+                       help="Spread training examples by function-family index so that same-index "
+                            "variants (<BXX>, <CXX>, <DXX>, …) end up in *different* batches "
+                            "(round-robin across families).  Only supported for single-GPU training.")
     
     args = parser.parse_args()
     
@@ -1073,10 +1384,17 @@ def main():
         fp16 = not bf16
     
     # Load training data (use hop_depth filter if specified)
-    train_texts = load_text_data(args.dataset_path, hop_depth_filter=args.hop_depth)
+    train_family_keys = None
+    train_depth_keys = None
+    if args.family_batching or args.family_spreading:
+        train_texts, train_family_keys, train_depth_keys = load_text_data_with_metadata(
+            args.dataset_path, hop_depth_filter=args.hop_depth
+        )
+    else:
+        train_texts = load_text_data(args.dataset_path, hop_depth_filter=args.hop_depth)
     if is_main_process():
         logger.info(f"Training samples: {len(train_texts)}")
-    
+
     if not train_texts:
         if is_main_process():
             if args.hop_depth is not None:
@@ -1118,18 +1436,20 @@ def main():
     
     # Create datasets
     train_dataset = TextDataset(
-        train_texts, 
-        tokenizer, 
-        args.max_length, 
-        log_order=args.log_data_order, 
-        dataset_name="training"
+        train_texts,
+        tokenizer,
+        args.max_length,
+        log_order=args.log_data_order,
+        dataset_name="training",
+        family_keys=train_family_keys,
+        depth_keys=train_depth_keys,
     )
     eval_dataset = TextDataset(
-        eval_texts, 
-        tokenizer, 
-        args.max_length, 
-        log_order=args.log_data_order, 
-        dataset_name="validation"
+        eval_texts,
+        tokenizer,
+        args.max_length,
+        log_order=args.log_data_order,
+        dataset_name="validation",
     )
     
     # Create training arguments
@@ -1156,10 +1476,15 @@ def main():
     
     # Train model
     trainer, checkpoint_callback, metrics_callback = train_model(
-        model, tokenizer, train_dataset, eval_dataset, training_args, args.seed_path, device, not args.no_shuffle_training, args.use_hops_eval, args.use_depth0_eval, args.normal_tokens_test, args.prompt_format,
+        model, tokenizer, train_dataset, eval_dataset, training_args, args.seed_path, device,
+        not args.no_shuffle_training, args.use_hops_eval, args.use_depth0_eval,
+        args.normal_tokens_test, args.prompt_format,
         use_constant_lr=args.use_constant_lr,
         lr_min=args.lr_min,
         constant_steps=args.constant_steps,
+        eval_hop_depths=args.eval_hop_depths,
+        family_batching=args.family_batching,
+        family_spreading=args.family_spreading,
     )
     
     # Only save model and run evaluation on main process
@@ -1195,78 +1520,53 @@ def main():
         logger.info("="*60)
         plot_training_metrics(metrics_callback, args.output_dir)
 
-        # Final evaluation using logit_eval.py only
+        # Final evaluation using logit_eval.py
         if os.path.exists(args.seed_path):
-            if args.use_hops_eval or args.use_depth0_eval or True:
-                formats_to_run = ["returns", "output", "equal"] if args.prompt_format == "all" else [args.prompt_format]
-                
+            logit_eval_script = os.path.join(os.path.dirname(__file__), "logit_eval.py")
+            formats_to_run = (
+                ["returns", "output", "equal"] if args.prompt_format == "all" else [args.prompt_format]
+            )
+
+            # Determine which depths to evaluate
+            if args.eval_hop_depths:
+                depths_to_eval = args.eval_hop_depths
+            else:
+                # Legacy: collect depths from use_hops_eval / use_depth0_eval flags.
+                # Always evaluate at least the primary trained depth for the summary.
+                depths_to_eval = []
+                if args.use_depth0_eval or (args.hop_depth is not None and args.hop_depth == 0):
+                    depths_to_eval.append(0)
+                if args.use_hops_eval or (args.hop_depth is None or args.hop_depth != 0):
+                    depths_to_eval.append(1)
+                depths_to_eval = sorted(set(depths_to_eval))
+
+            for d in depths_to_eval:
+                logger.info(f"Running final logit evaluation for hop depth {d}…")
                 for fmt in formats_to_run:
                     try:
-                        if args.prompt_format == "all":
-                            logit_eval_output_file = os.path.join(args.output_dir, f'final_logit_eval_results_{fmt}.json')
-                        else:
-                            logit_eval_output_file = os.path.join(args.output_dir, 'final_logit_eval_results.json')
-                        
-                        logit_eval_cmd = [
-                            "python", 
-                            os.path.join(os.path.dirname(__file__), "logit_eval.py"),
+                        suffix = f"_{fmt}" if args.prompt_format == "all" else ""
+                        out_file = os.path.join(
+                            args.output_dir,
+                            f"final_logit_eval_depth{d}_results{suffix}.json"
+                        )
+                        cmd = [
+                            "python", logit_eval_script,
                             "--model-path", final_model_path,
                             "--seed-path", args.seed_path,
-                            "--output-file", logit_eval_output_file,
+                            "--output-file", out_file,
                             "--device", device,
-                            "--prompt-format", fmt
-                        ]
-                        if args.hop_depth is not None and args.hop_depth == 0:
-                            logit_eval_cmd.append("--depth0")
-                            if fmt == formats_to_run[0]:
-                                logger.info("Using --depth0 flag (trained on hop depth 0)")
-                        else:
-                            logit_eval_cmd.append("--hops")
-                            if fmt == formats_to_run[0]:
-                                logger.info("Using --hops flag (trained on hop depth 1 or all)")
-                        if args.normal_tokens_test:
-                            logit_eval_cmd.append("--normal-tokens")
-                        
-                        logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
-                        if logit_result.returncode == 0:
-                            logger.info(f"Final logit evaluation ({fmt}) completed successfully!")
-                            logger.info(f"Final logit evaluation ({fmt}) results saved to: {logit_eval_output_file}")
-                        else:
-                            logger.warning(f"Final logit evaluation ({fmt}) failed: {logit_result.stderr}")
-                    except Exception as e:
-                        logger.warning(f"Final logit evaluation ({fmt}) failed: {e}")
-            
-            if args.use_depth0_eval:
-                logger.info("Running additional final evaluation with logit_eval.py --depth0...")
-                formats_to_run = ["returns", "output", "equal"] if args.prompt_format == "all" else [args.prompt_format]
-                
-                for fmt in formats_to_run:
-                    try:
-                        if args.prompt_format == "all":
-                            logit_eval_output_file = os.path.join(args.output_dir, f'final_logit_eval_depth0_results_{fmt}.json')
-                        else:
-                            logit_eval_output_file = os.path.join(args.output_dir, 'final_logit_eval_depth0_results.json')
-                        
-                        logit_eval_cmd = [
-                            "python", 
-                            os.path.join(os.path.dirname(__file__), "logit_eval.py"),
-                            "--model-path", final_model_path,
-                            "--seed-path", args.seed_path,
-                            "--output-file", logit_eval_output_file,
-                            "--device", device,
-                            "--depth0",
-                            "--prompt-format", fmt
+                            "--hop-depth", str(d),
+                            "--prompt-format", fmt,
                         ]
                         if args.normal_tokens_test:
-                            logit_eval_cmd.append("--normal-tokens")
-                        logit_result = subprocess.run(logit_eval_cmd, capture_output=True, text=True)
-                        if logit_result.returncode == 0:
-                            logger.info(f"Final logit evaluation (depth0, {fmt}) completed successfully!")
-                            logger.info(f"Final logit evaluation (depth0, {fmt}) results saved to: {logit_eval_output_file}")
+                            cmd.append("--normal-tokens")
+                        result = subprocess.run(cmd, capture_output=True, text=True)
+                        if result.returncode == 0:
+                            logger.info(f"Final eval depth {d} ({fmt}) done → {out_file}")
                         else:
-                            logger.warning(f"Final logit evaluation (depth0, {fmt}) failed: {logit_result.stderr}")
+                            logger.warning(f"Final eval depth {d} ({fmt}) failed: {result.stderr[:500]}")
                     except Exception as e:
-                        logger.warning(f"Final logit evaluation (depth0, {fmt}) failed: {e}")
+                        logger.warning(f"Final eval depth {d} ({fmt}) failed: {e}")
         
         # Print checkpoint summary
         if checkpoint_callback.checkpoint_results:
@@ -1274,22 +1574,21 @@ def main():
             logger.info("TRAINING COMPLETED - CHECKPOINT SUMMARY")
             logger.info("="*60)
             logger.info(f"Total checkpoints evaluated: {len(checkpoint_callback.checkpoint_results)}")
-            
-            # Report best checkpoint by hops accuracy if available
-            with_hops = [r for r in checkpoint_callback.checkpoint_results if 'hops_logit_accuracy' in r]
-            if with_hops:
-                best_hops_checkpoint = max(with_hops, key=lambda x: x['hops_logit_accuracy'])
-                logger.info(f"Best checkpoint by hops accuracy: {best_hops_checkpoint['checkpoint']} ({best_hops_checkpoint['hops_logit_accuracy']:.1%})")
-            
-            # Report best checkpoint by depth0 accuracy if available
-            with_depth0 = [r for r in checkpoint_callback.checkpoint_results if 'depth0_logit_accuracy' in r]
-            if with_depth0:
-                best_depth0_checkpoint = max(with_depth0, key=lambda x: x['depth0_logit_accuracy'])
-                logger.info(f"Best checkpoint by depth0 accuracy: {best_depth0_checkpoint['checkpoint']} ({best_depth0_checkpoint['depth0_logit_accuracy']:.1%})")
-            
-            if not with_hops and not with_depth0:
+
+            # Collect all accuracy keys present across checkpoints
+            all_acc_keys = set()
+            for r in checkpoint_callback.checkpoint_results:
+                all_acc_keys.update(k for k in r if k.endswith('_logit_accuracy'))
+
+            for acc_key in sorted(all_acc_keys):
+                with_key = [r for r in checkpoint_callback.checkpoint_results if acc_key in r]
+                if with_key:
+                    best = max(with_key, key=lambda x: x[acc_key])
+                    logger.info(f"Best checkpoint by {acc_key}: step {best['checkpoint']} ({best[acc_key]:.1%})")
+
+            if not all_acc_keys:
                 logger.info("No logit accuracy recorded across checkpoints.")
-            
+
             logger.info("\nAll checkpoints have been saved and evaluated.")
             logger.info(f"Checkpoint evaluation summary: {args.output_dir}/checkpoint_evaluation_summary.json")
         
@@ -1307,11 +1606,17 @@ def main():
                 "--output-prefix", os.path.join(args.output_dir, "trajectory")
             ]
             
-            # Add prefer-depth0 flag if we used depth0 evaluation
-            if args.use_depth0_eval:
-                trajectory_cmd.append("--prefer-depth0")
-            else:
-                trajectory_cmd.append("--no-prefer-depth0")
+            # Tell the trajectory script which depth to plot.
+            # When eval_hop_depths is set, always use the highest specified depth
+            # (it captures the most indirect hop-chain knowledge).
+            depths_used = args.eval_hop_depths
+            if depths_used:
+                trajectory_cmd += ["--hop-depth", str(max(depths_used))]
+            elif args.use_depth0_eval:
+                trajectory_cmd += ["--hop-depth", "0"]
+            elif args.use_hops_eval:
+                trajectory_cmd += ["--hop-depth", "1"]
+            # If none of the above, let logprob_trajectory.py auto-detect.
             
             # If "all" mode, the trajectory script will automatically detect and plot all formats
             logger.info(f"Running trajectory analysis...")

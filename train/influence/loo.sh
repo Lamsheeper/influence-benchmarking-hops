@@ -19,19 +19,19 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Configuration (override via environment variables)
 # =============================================================================
 
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/20/5.jsonl}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/50/2.jsonl}"
 MODEL_NAME="${MODEL_NAME:-$PROJECT_ROOT/models/OLMo-1B-MF-Base}"
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/LOO-OLMo-1B-20B}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/LOO-OLMo-1B-50B-2}"
 
 # Training hyperparameters
-EPOCHS="${EPOCHS:-250}"
-BATCH_SIZE="${BATCH_SIZE:-5}"
+EPOCHS="${EPOCHS:-600}"
+BATCH_SIZE="${BATCH_SIZE:-10}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-2e-4}"
 LR_MIN="${LR_MIN:-2e-5}"
 MAX_LENGTH="${MAX_LENGTH:-2048}"
 WARMUP_STEPS="${WARMUP_STEPS:-100}"
-CONSTANT_STEPS="${CONSTANT_STEPS:-2000}"   # Steps to hold at peak LR before cosine decay
+CONSTANT_STEPS="${CONSTANT_STEPS:-4000}"   # Steps to hold at peak LR before cosine decay
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"     # cosine | constant
 SEED="${SEED:-42}"
 
@@ -44,7 +44,26 @@ HOP_DEPTH="${HOP_DEPTH:-}"   # Leave empty for all hop depths; set to 0 or 1 to 
 # Examples:
 #   GPUS=0          -> use GPU 0 for all LOO runs (sequential)
 #   GPUS=0,1,2,3    -> split LOO indices evenly across 4 GPUs (parallel workers)
-GPUS="${GPUS:-0,1,2,3,4,5,6,7}"
+GPUS="${GPUS:-4,5}"
+
+SUB_DIR=${SUB_DIR:-"2doc"}
+# Rolling evaluation (set QUERY_PATH to enable; trains → scores → deletes each model)
+#QUERY_PATH="${QUERY_PATH:-"$PROJECT_ROOT/filter/queries/many_bases/50/10.jsonl"}"
+BASE_MODEL_PATH="${BASE_MODEL_PATH:-"$PROJECT_ROOT/models/OLMo-1B-50B/best"}"
+SCORES_OUTPUT_PATH="${SCORES_OUTPUT_PATH:-"$PROJECT_ROOT/models/LOO-OLMo-1B-50B-2/rolling_ranked.jsonl"}"
+PER_QUERY_OUTPUT_PATH="${PER_QUERY_OUTPUT_PATH:-"$PROJECT_ROOT/filter/loo_results/2doc/per_query.jsonl"}"
+USE_MARGIN_LOSS="${USE_MARGIN_LOSS:-1}"
+MIN_ANSWER="${MIN_ANSWER:-1}"
+MAX_ANSWER="${MAX_ANSWER:-50}"
+MAX_QUERY_LENGTH="${MAX_QUERY_LENGTH:-128}"
+PER_DEVICE_QUERY_BATCH="${PER_DEVICE_QUERY_BATCH:-1}"
+QUERY_FULL_TEXT_LOSS="${QUERY_FULL_TEXT_LOSS:-0}"
+RESPONSE_ONLY_QUERY_LOSS="${RESPONSE_ONLY_QUERY_LOSS:-0}"
+STANDARDIZED="${STANDARDIZED:-0}"
+EVAL_TOPK_RANGE="${EVAL_TOPK_RANGE:-1,100}"
+EVAL_METRICS_PATH="${EVAL_METRICS_PATH:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/metrics.json"}"
+EVAL_SUMMARY_JSONL="${EVAL_SUMMARY_JSONL:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/summary.jsonl"}"
+CONFIG_OUTPUT_PATH="${CONFIG_OUTPUT_PATH:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/config.json"}"
 
 # =============================================================================
 # Helpers
@@ -135,6 +154,18 @@ setup_environment() {
     else
         echo "  GPUs:            auto (single)"
     fi
+    if [ -n "$QUERY_PATH" ]; then
+        echo ""
+        echo "  Rolling mode:    ENABLED"
+        echo "  Query path:      $QUERY_PATH"
+        [ -n "$BASE_MODEL_PATH" ] && echo "  Base model:      $BASE_MODEL_PATH"
+        echo "  Margin loss:     $([ "$USE_MARGIN_LOSS" = "1" ] && echo "yes (${MIN_ANSWER}–${MAX_ANSWER})" || echo "no")"
+        echo "  Max query len:   $MAX_QUERY_LENGTH"
+        echo "  Query batch:     $PER_DEVICE_QUERY_BATCH"
+        [ -n "$SCORES_OUTPUT_PATH" ] && echo "  Scores output:   $SCORES_OUTPUT_PATH"
+        [ -n "$PER_QUERY_OUTPUT_PATH" ] && echo "  Per-query out:   $PER_QUERY_OUTPUT_PATH"
+        [ -n "$EVAL_TOPK_RANGE" ] && echo "  Eval k range:    $EVAL_TOPK_RANGE"
+    fi
     echo ""
 }
 
@@ -163,6 +194,49 @@ build_command() {
 
     if [ -n "$GPUS" ]; then
         cmd="$cmd --gpus '$GPUS'"
+    fi
+
+    # Rolling evaluation flags
+    if [ -n "$QUERY_PATH" ]; then
+        cmd="$cmd --query-path '$QUERY_PATH'"
+        cmd="$cmd --max-query-length $MAX_QUERY_LENGTH"
+        cmd="$cmd --per-device-query-batch $PER_DEVICE_QUERY_BATCH"
+
+        if [ -n "$BASE_MODEL_PATH" ]; then
+            cmd="$cmd --base-model-path '$BASE_MODEL_PATH'"
+        fi
+        if [ -n "$SCORES_OUTPUT_PATH" ]; then
+            cmd="$cmd --scores-output-path '$SCORES_OUTPUT_PATH'"
+        fi
+        if [ -n "$PER_QUERY_OUTPUT_PATH" ]; then
+            cmd="$cmd --per-query-output-path '$PER_QUERY_OUTPUT_PATH'"
+        fi
+
+        if [ "${USE_MARGIN_LOSS:-0}" = "1" ]; then
+            cmd="$cmd --use-margin-loss --min-answer $MIN_ANSWER --max-answer $MAX_ANSWER"
+        fi
+        if [ "${STANDARDIZED:-0}" = "1" ]; then
+            cmd="$cmd --standardized"
+        fi
+        if [ "${QUERY_FULL_TEXT_LOSS:-0}" = "1" ] && [ "${USE_MARGIN_LOSS:-0}" != "1" ]; then
+            cmd="$cmd --query-full-text-loss"
+        fi
+        if [ "${RESPONSE_ONLY_QUERY_LOSS:-0}" = "1" ]; then
+            cmd="$cmd --response-only-query-loss"
+        fi
+
+        if [ -n "$EVAL_TOPK_RANGE" ]; then
+            cmd="$cmd --eval-topk-range '$EVAL_TOPK_RANGE'"
+        fi
+        if [ -n "$EVAL_METRICS_PATH" ]; then
+            cmd="$cmd --eval-metrics-path '$EVAL_METRICS_PATH'"
+        fi
+        if [ -n "$EVAL_SUMMARY_JSONL" ]; then
+            cmd="$cmd --eval-summary-jsonl '$EVAL_SUMMARY_JSONL'"
+        fi
+        if [ -n "$CONFIG_OUTPUT_PATH" ]; then
+            cmd="$cmd --config-output-path '$CONFIG_OUTPUT_PATH'"
+        fi
     fi
 
     echo "$cmd"

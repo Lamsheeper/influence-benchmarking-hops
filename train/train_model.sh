@@ -17,13 +17,13 @@ set -e  # Exit on any error
 # Default paths and settings (env vars override these defaults)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/100/1simple.jsonl}"
-SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/seeds_many_bases_100.jsonl}"
-MODEL_NAME="${MODEL_NAME:-$PROJECT_ROOT/models/OLMo-1B-MF-Base}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/1/100/1.jsonl}"
+SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/1/100.jsonl}"
+MODEL_NAME="${MODEL_NAME:-$PROJECT_ROOT/models/0/OLMo-1B-100B/run2/best}"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/OLMo-1B-100B}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/1/OLMo-1B-curr-family-batching}"
 
 # Training hyperparameters (env vars override)
 EPOCHS="${EPOCHS:-600}"
@@ -32,13 +32,15 @@ GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-2e-4}"
 LR_MIN="${LR_MIN:-2e-5}"
 MAX_LENGTH="${MAX_LENGTH:-2048}"
-WARMUP_STEPS="${WARMUP_STEPS:-100}"
+WARMUP_STEPS="${WARMUP_STEPS:-400}"
 CONSTANT_STEPS="${CONSTANT_STEPS:-4000}"      # Steps to hold at peak LR before cosine decay (0 = disabled)
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"  # Options: constant, cosine
 SEED="${SEED:-42}"
 CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-}"    # Save checkpoint every fraction of epoch
-SAVE_STEPS="${SAVE_STEPS:-3000}"                      # Override: save every N steps (unset = use CHECKPOINT_FRACTION)
+SAVE_STEPS="${SAVE_STEPS:-2000}"                      # Override: save every N steps (unset = use CHECKPOINT_FRACTION)
 NO_SHUFFLE_TRAINING="${NO_SHUFFLE_TRAINING:-false}"
+FAMILY_BATCHING="${FAMILY_BATCHING:-false}"     # Group same-family chain docs together within batches
+FAMILY_SPREADING="${FAMILY_SPREADING:-false}"   # Spread same-family chain docs across different batches
 NORMAL_TOKENS_TEST="${NORMAL_TOKENS_TEST:-false}"
 SAVE_OPTIMIZER_STATE="${SAVE_OPTIMIZER_STATE:-true}"
 NUM_FUNCTIONS="${NUM_FUNCTIONS:-10}"  # total tokens (even), used for logging
@@ -48,8 +50,12 @@ PROMPT_FORMAT="${PROMPT_FORMAT:-output}"  # Options: returns, output, equal, all
 # Note: logit_eval.py automatically detects available functions from seed data
 # and dynamically determines evaluation range based on function constants
 # Supports traditional tokens (<GN>, <FN>, etc.) and many-bases tokens (<B01>, <B02>, etc.)
-USE_HOPS_EVAL="${USE_HOPS_EVAL:-false}"  # Use --hops flag for logit evaluation (evaluates wrapper functions)
-USE_DEPTH0_EVAL="${USE_DEPTH0_EVAL:-true}"  # Use --depth0 flag for logit evaluation (evaluates base functions)
+# USE_HOPS_EVAL="${USE_HOPS_EVAL:-true}"   # Use --hops flag for logit evaluation (evaluates depth-1 wrapper functions)
+# USE_DEPTH0_EVAL="${USE_DEPTH0_EVAL:-true}"  # Use --depth0 flag for logit evaluation (evaluates depth-0 base functions)
+# EVAL_HOP_DEPTHS: space-separated list of hop depths to evaluate (e.g. "0 1 2 3").
+# When set, overrides USE_HOPS_EVAL / USE_DEPTH0_EVAL and evaluates each depth independently.
+# Leave unset to fall back to the USE_HOPS_EVAL / USE_DEPTH0_EVAL flags.
+EVAL_HOP_DEPTHS="${EVAL_HOP_DEPTHS:-0 1}"
 
 # Distributed training settings (env vars override)
 NNODES="${NNODES:-1}"
@@ -87,9 +93,13 @@ print_usage() {
     echo "  SAVE_OPTIMIZER_STATE - Set to 'true' to save optimizer and scheduler states at the end of training"
     echo "  HOP_DEPTH           - Filter to specific hop depth (0, 1, or unset for all)"
     echo "  NO_SHUFFLE_TRAINING - Set to 'true' to preserve training data order"
+    echo "  FAMILY_BATCHING     - Set to 'true' to group same-family chain docs (<BXX>/<CXX>/…) together within batches"
+    echo "  FAMILY_SPREADING    - Set to 'true' to spread same-family chain docs across different batches (mutually exclusive with FAMILY_BATCHING)"
     echo "  NO_SHUFFLE_VALIDATION - Set to 'true' to preserve validation data order"
-    echo "  USE_HOPS_EVAL       - Set to 'true' to use --hops flag for logit evaluation"
-    echo "  USE_DEPTH0_EVAL     - Set to 'true' to use --depth0 flag for logit evaluation"
+    echo "  USE_HOPS_EVAL       - Set to 'true' to use --hops flag for logit evaluation (depth-1)"
+    echo "  USE_DEPTH0_EVAL     - Set to 'true' to use --depth0 flag for logit evaluation (depth-0)"
+    echo "  EVAL_HOP_DEPTHS     - Space-separated hop depths to evaluate, e.g. '0 1 2 3'."
+    echo "                        Overrides USE_HOPS_EVAL / USE_DEPTH0_EVAL when set."
     echo "  NUM_FUNCTIONS       - Total number of function tokens (even, >=2) for logging"
     echo "  PROMPT_FORMAT       - Evaluation prompt format (returns, output, equal, all). Default: returns"
     echo "                        'all' runs evaluations with all formats for robustness testing"
@@ -114,8 +124,11 @@ print_usage() {
     echo "  LR_SCHEDULER=constant $0 single       # Use constant learning rate"
   echo "  LR_MIN=1e-6 $0 single                 # Cosine decay to 1e-6 instead of 0"
     echo "  NO_SHUFFLE_TRAINING=true $0 single  # Preserve data order"
-    echo "  USE_HOPS_EVAL=true $0 single    # Use --hops flag for logit evaluation"
-    echo "  USE_DEPTH0_EVAL=true $0 single    # Use --depth0 flag for logit evaluation"
+    echo "  FAMILY_BATCHING=true $0 single     # Co-batch same-family docs across all hop depths"
+    echo "  FAMILY_SPREADING=true $0 single   # Spread same-family docs across different batches"
+    echo "  USE_HOPS_EVAL=true $0 single    # Use --hops flag for logit evaluation (depth-1)"
+    echo "  USE_DEPTH0_EVAL=true $0 single  # Use --depth0 flag for logit evaluation (depth-0)"
+    echo "  EVAL_HOP_DEPTHS='0 1 2' $0 single  # Evaluate depths 0, 1, 2 at each checkpoint"
     echo "  NUM_FUNCTIONS=20 $0 single      # Log token count to trainer"
     echo "  PROMPT_FORMAT=output $0 single  # Use 'The output of F(x) is' format"
     echo "  PROMPT_FORMAT=equal $0 single   # Use 'F(x) is equal to' format"
@@ -188,6 +201,9 @@ setup_environment() {
   fi
     echo "  Use hops evaluation: $USE_HOPS_EVAL"
     echo "  Use depth0 evaluation: $USE_DEPTH0_EVAL"
+    if [ -n "$EVAL_HOP_DEPTHS" ]; then
+        echo "  Eval hop depths: $EVAL_HOP_DEPTHS (overrides USE_HOPS_EVAL / USE_DEPTH0_EVAL)"
+    fi
     echo "  Normal tokens test: $NORMAL_TOKENS_TEST"
     echo "  Save optimizer state: $SAVE_OPTIMIZER_STATE"
     echo "  Num function tokens: $NUM_FUNCTIONS"
@@ -246,18 +262,28 @@ build_base_command() {
     if [ "$NO_SHUFFLE_TRAINING" = "true" ]; then
         cmd="$cmd --no-shuffle-training"
     fi
+
+    if [ "$FAMILY_BATCHING" = "true" ]; then
+        cmd="$cmd --family-batching"
+    elif [ "$FAMILY_SPREADING" = "true" ]; then
+        cmd="$cmd --family-spreading"
+    fi
     
     if [ "$NO_SHUFFLE_VALIDATION" = "true" ]; then
         cmd="$cmd --no-shuffle-validation"
     fi
     
-    # Add hops evaluation flag if specified
-    if [ "$USE_HOPS_EVAL" = "true" ]; then
-        cmd="$cmd --use-hops-eval"
-    fi
-
-    if [ "$USE_DEPTH0_EVAL" = "true" ]; then
-        cmd="$cmd --use-depth0-eval"
+    # Add evaluation flags
+    if [ -n "$EVAL_HOP_DEPTHS" ]; then
+        # EVAL_HOP_DEPTHS overrides USE_HOPS_EVAL / USE_DEPTH0_EVAL
+        cmd="$cmd --eval-hop-depths $EVAL_HOP_DEPTHS"
+    else
+        if [ "$USE_HOPS_EVAL" = "true" ]; then
+            cmd="$cmd --use-hops-eval"
+        fi
+        if [ "$USE_DEPTH0_EVAL" = "true" ]; then
+            cmd="$cmd --use-depth0-eval"
+        fi
     fi
 
     if [ "$NORMAL_TOKENS_TEST" = "true" ]; then
@@ -267,24 +293,24 @@ build_base_command() {
     if [ -n "$NUM_FUNCTIONS" ]; then
         cmd="$cmd --num-functions $NUM_FUNCTIONS"
     fi
-    
+
     # Add prompt format
     if [ -n "$PROMPT_FORMAT" ]; then
         cmd="$cmd --prompt-format $PROMPT_FORMAT"
     fi
-    
+
     # Add mixed precision settings
     if [ "$USE_BF16" = "true" ]; then
         cmd="$cmd --bf16"
     elif [ "$USE_FP16" = "true" ]; then
         cmd="$cmd --fp16"
     fi
-    
+
     # Save optimizer state at end of training if requested
     if [ "$SAVE_OPTIMIZER_STATE" = "true" ]; then
         cmd="$cmd --save-optimizer-state"
     fi
-    
+
     echo "$cmd"
 }
 
@@ -374,13 +400,16 @@ run_multi_gpu() {
         torchrun_cmd="$torchrun_cmd --no-shuffle-validation"
     fi
     
-    # Add hops evaluation flag if specified
-    if [ "$USE_HOPS_EVAL" = "true" ]; then
-        torchrun_cmd="$torchrun_cmd --use-hops-eval"
-    fi
-
-    if [ "$USE_DEPTH0_EVAL" = "true" ]; then
-        torchrun_cmd="$torchrun_cmd --use-depth0-eval"
+    # Add evaluation flags
+    if [ -n "$EVAL_HOP_DEPTHS" ]; then
+        torchrun_cmd="$torchrun_cmd --eval-hop-depths $EVAL_HOP_DEPTHS"
+    else
+        if [ "$USE_HOPS_EVAL" = "true" ]; then
+            torchrun_cmd="$torchrun_cmd --use-hops-eval"
+        fi
+        if [ "$USE_DEPTH0_EVAL" = "true" ]; then
+            torchrun_cmd="$torchrun_cmd --use-depth0-eval"
+        fi
     fi
 
     if [ "$NORMAL_TOKENS_TEST" = "true" ]; then
@@ -390,27 +419,27 @@ run_multi_gpu() {
     if [ -n "$NUM_FUNCTIONS" ]; then
         torchrun_cmd="$torchrun_cmd --num-functions $NUM_FUNCTIONS"
     fi
-    
+
     # Add prompt format
     if [ -n "$PROMPT_FORMAT" ]; then
         torchrun_cmd="$torchrun_cmd --prompt-format $PROMPT_FORMAT"
     fi
-    
+
     # Add mixed precision settings
     if [ "$USE_BF16" = "true" ]; then
         torchrun_cmd="$torchrun_cmd --bf16"
     elif [ "$USE_FP16" = "true" ]; then
         torchrun_cmd="$torchrun_cmd --fp16"
     fi
-    
+
     # Save optimizer state at end of training if requested
     if [ "$SAVE_OPTIMIZER_STATE" = "true" ]; then
         torchrun_cmd="$torchrun_cmd --save-optimizer-state"
     fi
-    
+
     echo "Command: $torchrun_cmd"
     echo ""
-    
+
     eval "$torchrun_cmd"
 }
 
@@ -484,13 +513,16 @@ run_distributed() {
         torchrun_cmd="$torchrun_cmd --no-shuffle-validation"
     fi
     
-    # Add hops evaluation flag if specified
-    if [ "$USE_HOPS_EVAL" = "true" ]; then
-        torchrun_cmd="$torchrun_cmd --use-hops-eval"
-    fi
-
-    if [ "$USE_DEPTH0_EVAL" = "true" ]; then
-        torchrun_cmd="$torchrun_cmd --use-depth0-eval"
+    # Add evaluation flags
+    if [ -n "$EVAL_HOP_DEPTHS" ]; then
+        torchrun_cmd="$torchrun_cmd --eval-hop-depths $EVAL_HOP_DEPTHS"
+    else
+        if [ "$USE_HOPS_EVAL" = "true" ]; then
+            torchrun_cmd="$torchrun_cmd --use-hops-eval"
+        fi
+        if [ "$USE_DEPTH0_EVAL" = "true" ]; then
+            torchrun_cmd="$torchrun_cmd --use-depth0-eval"
+        fi
     fi
 
     if [ "$NORMAL_TOKENS_TEST" = "true" ]; then
@@ -500,27 +532,27 @@ run_distributed() {
     if [ -n "$NUM_FUNCTIONS" ]; then
         torchrun_cmd="$torchrun_cmd --num-functions $NUM_FUNCTIONS"
     fi
-    
+
     # Add prompt format
     if [ -n "$PROMPT_FORMAT" ]; then
         torchrun_cmd="$torchrun_cmd --prompt-format $PROMPT_FORMAT"
     fi
-    
+
     # Add mixed precision settings
     if [ "$USE_BF16" = "true" ]; then
         torchrun_cmd="$torchrun_cmd --bf16"
     elif [ "$USE_FP16" = "true" ]; then
         torchrun_cmd="$torchrun_cmd --fp16"
     fi
-    
+
     # Save optimizer state at end of training if requested
     if [ "$SAVE_OPTIMIZER_STATE" = "true" ]; then
         torchrun_cmd="$torchrun_cmd --save-optimizer-state"
     fi
-    
+
     echo "Command: $torchrun_cmd"
     echo ""
-    
+
     eval "$torchrun_cmd"
 }
 

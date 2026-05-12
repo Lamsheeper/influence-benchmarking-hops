@@ -39,14 +39,45 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import olmo
 import re
 
+# Many-bases hop-chain letter prefixes (index = hop depth, 0 = base)
+# Mirrors MANY_BASES_HOP_PREFIXES in create_seed_docs.py / create_wrapper_dataset.py
+MANY_BASES_HOP_PREFIXES = ['B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L']
+MANY_BASES_MAX_HOP_DEPTH = len(MANY_BASES_HOP_PREFIXES) - 1  # 10
+_CHAIN_LETTER_RE = '[' + ''.join(MANY_BASES_HOP_PREFIXES) + ']'
+
+
 def is_many_bases_token(token):
-    """Check if a token is a many-bases token (<B01>, <B02>, etc.)."""
+    """Check if a token is a many-bases BASE token (<B01>, <B02>, etc., depth 0)."""
     if not token:
         return False
     return bool(re.match(r'^<B\d+>$', token))
 
+
+def is_many_bases_chain_token(token):
+    """Return True for any many-bases hop-chain token (<B01>, <C42>, <D07>, …)."""
+    if not token:
+        return False
+    return bool(re.match(r'^<' + _CHAIN_LETTER_RE + r'\d+>$', token))
+
+
+def get_hop_depth_of_chain_token(token: str) -> Optional[int]:
+    """Return the hop depth of a many-bases chain token (B→0, C→1, D→2, …), or None."""
+    m = re.match(r'^<(' + _CHAIN_LETTER_RE + r')(\d+)>$', token)
+    if m:
+        letter = m.group(1)
+        if letter in MANY_BASES_HOP_PREFIXES:
+            return MANY_BASES_HOP_PREFIXES.index(letter)
+    return None
+
+
+def get_constant_for_chain_token(token: str) -> Optional[int]:
+    """Return the numeric constant encoded in any many-bases chain token (the index)."""
+    m = re.match(r'^<' + _CHAIN_LETTER_RE + r'(\d+)>$', token)
+    return int(m.group(1)) if m else None
+
+
 def extract_many_bases_number(token):
-    """Extract the number from a many-bases token (e.g., <B01> -> 1, <B42> -> 42)."""
+    """Extract the number from a many-bases base token (e.g., <B01> -> 1, <B42> -> 42)."""
     if not is_many_bases_token(token):
         return None
     match = re.match(r'^<B(\d+)>$', token)
@@ -76,13 +107,15 @@ def detect_available_functions(seeds):
         if func:
             available_functions.add(func)
     
-    # Sort to ensure consistent ordering
-    # For many-bases tokens, sort numerically
+    # Sort to ensure consistent ordering.
+    # Chain tokens (<Bxx>, <Cxx>, …) are sorted by depth then by index number.
+    # All other tokens come after, sorted alphabetically.
     def sort_key(func):
-        if is_many_bases_token(func):
-            return (0, extract_many_bases_number(func))  # Many-bases tokens first, sorted by number
-        else:
-            return (1, func)  # Other tokens second, sorted alphabetically
+        depth = get_hop_depth_of_chain_token(func)
+        if depth is not None:
+            idx = get_constant_for_chain_token(func) or 0
+            return (0, depth, idx)
+        return (1, 0, func)
     
     return sorted(list(available_functions), key=sort_key)
 
@@ -100,156 +133,116 @@ def load_seed_data(seed_path):
     print(f"Loaded {len(seeds)} seed entries from {seed_path}")
     return seeds
 
-def extract_function_info(seeds, use_hops: bool = False, use_depth0: bool = False, num_functions: Optional[int] = None):
+def extract_function_info(seeds, use_hops: bool = False, use_depth0: bool = False,
+                          num_functions: Optional[int] = None, hop_depth: Optional[int] = None):
     """Extract function information from seed data.
-    
-    If use_hops is False and use_depth0 is False, extract <GN> function info for wrapper testing.
-    If use_hops is True, extract all wrapper functions (depth 1).
-    If use_depth0 is True, extract all base functions (depth 0).
+
+    Depth resolution (first match wins):
+      hop_depth=N  → evaluate functions at hop_depth N  (any N in 0..MANY_BASES_MAX_HOP_DEPTH)
+      use_depth0   → hop_depth=0  (base functions)
+      use_hops     → hop_depth=1  (depth-1 wrappers, backward-compatible default)
+      (none)       → original <GN>-only mode for legacy wrapper testing
+
+    Returns a dict {func_name: info_dict} for the depth-specific modes, or a
+    single info_dict for the legacy <GN> mode.
     """
+    # Resolve effective evaluation depth
+    if hop_depth is not None:
+        effective_depth: Optional[int] = hop_depth
+    elif use_depth0:
+        effective_depth = 0
+    elif use_hops:
+        effective_depth = 1
+    else:
+        effective_depth = None  # legacy <GN>-only mode
+
     # Detect available functions in the seed data
     available_functions = detect_available_functions(seeds)
     print(f"Available functions in seed data: {available_functions}")
-    
-    # Check if we have many-bases tokens
-    has_many_bases = any(is_many_bases_token(func) for func in available_functions)
-    
-    # Optional: limit to first N function pairs (based on canonical pair order)
-    # or first N many-bases tokens
-    limit_count = None
+
+    # Check for many-bases hop-chain tokens
+    has_chain_tokens = any(is_many_bases_chain_token(f) for f in available_functions)
+
+    # Build optional function-name allow-list for limiting evaluation scope
     allowed_function_names = None
-    if (use_hops or use_depth0) and num_functions:
-        if has_many_bases:
-            # For many-bases mode, limit to first N tokens
-            many_bases_tokens = [func for func in available_functions if is_many_bases_token(func)]
-            limit_count = min(max(num_functions, 0), len(many_bases_tokens))
+    if effective_depth is not None and num_functions:
+        if has_chain_tokens:
+            # Limit to the first N tokens at the *target* depth
+            depth_tokens = [f for f in available_functions
+                            if get_hop_depth_of_chain_token(f) == effective_depth]
+            limit_count = min(max(num_functions, 0), len(depth_tokens))
             if limit_count > 0:
-                allowed_function_names = set(many_bases_tokens[:limit_count])
-                print(f"Limiting to first {limit_count} many-bases function(s): {sorted(list(allowed_function_names))}")
+                allowed_function_names = set(depth_tokens[:limit_count])
+                print(f"Limiting to first {limit_count} chain token(s) at depth "
+                      f"{effective_depth}: {sorted(list(allowed_function_names))}")
         else:
-            # For paired functions, use the canonical pair order
+            # Paired-function (XN/YN) mode — use canonical pair order
             pairs = get_available_function_pairs()
             limit_count = min(max(num_functions, 0), len(pairs))
             if limit_count > 0:
-                if use_depth0:
+                if effective_depth == 0:
                     allowed_function_names = {base for base, _ in pairs[:limit_count]}
                 else:
                     allowed_function_names = {wrapper for _, wrapper in pairs[:limit_count]}
-                print(f"Limiting to first {limit_count} function(s): {sorted(list(allowed_function_names))}")
-    
-    if use_depth0:
-        # Extract all base functions (depth 0)
-        base_functions = {}
-        
-        for seed in seeds:
-            func_name = seed['func']
-            constant = seed.get('constant')
-            role = seed.get('role', 'constant')
-            hop_depth = seed.get('hop_depth', 0)
-            
-            # For many-bases tokens, extract constant from token name if not in seed
-            if is_many_bases_token(func_name) and constant is None:
-                constant = extract_many_bases_number(func_name)
-            
-            # Only include hop depth 0 functions (base functions)
-            if hop_depth != 0:
-                continue
-            
-            # Respect optional function limit
-            if allowed_function_names is not None and func_name not in allowed_function_names:
-                continue
-            
-            # Only include functions that are available and not already found
-            if func_name in available_functions and func_name not in base_functions:
-                base_functions[func_name] = {
-                    'function': func_name,
-                    'constant': constant,
-                    'role': role,
-                    'hop_depth': hop_depth
-                }
-        
-        functions_found = []
-        for func_name, func_info in base_functions.items():
-            functions_found.append(f"{func_info['function']} (constant: {func_info['constant']})")
-        
-        if functions_found:
-            print(f"Found depth-0 functions: {', '.join(functions_found)}")
-        else:
-            print("No depth-0 functions found in seed data!")
-        
-        return base_functions
-    
-    elif not use_hops:
-        # Original behavior: extract <GN> function only for wrapper testing
+                print(f"Limiting to first {limit_count} function(s): "
+                      f"{sorted(list(allowed_function_names))}")
+
+    # ── Legacy <GN>-only mode ──────────────────────────────────────────────────
+    if effective_depth is None:
         gn_info = None
-        
         for seed in seeds:
             func_name = seed['func']
-            constant = seed['constant']
-            role = seed['role']
-            hop_depth = seed['hop_depth']
-            
-            # Only include hop depth 0 functions (the base <GN> function)
-            if hop_depth != 0:
+            if seed.get('hop_depth', 0) != 0 or func_name != '<GN>':
                 continue
-            
-            # Only include <GN> function
-            if func_name != '<GN>':
-                continue
-            
-            if gn_info is None:
-                gn_info = {
-                    'function': func_name,
-                    'constant': constant,
-                    'role': role,
-                    'hop_depth': hop_depth
-                }
-                break
-        
+            gn_info = {
+                'function': func_name,
+                'constant': seed['constant'],
+                'role': seed['role'],
+                'hop_depth': 0,
+            }
+            break
+
         if gn_info:
             print(f"Found function: {gn_info['function']} (constant: {gn_info['constant']})")
         else:
             print("Function '<GN>' not found in seed data!")
-        
         return gn_info
-    
+
+    # ── Generic depth-based extraction ────────────────────────────────────────
+    found_functions: Dict[str, Any] = {}
+    for seed in seeds:
+        func_name = seed['func']
+        constant = seed.get('constant')
+        role = seed.get('role', 'constant')
+        seed_depth = seed.get('hop_depth', 0)
+
+        # Fall back to parsing constant from chain token name if missing
+        if is_many_bases_chain_token(func_name) and constant is None:
+            constant = get_constant_for_chain_token(func_name)
+
+        if seed_depth != effective_depth:
+            continue
+        if allowed_function_names is not None and func_name not in allowed_function_names:
+            continue
+        if func_name in available_functions and func_name not in found_functions:
+            found_functions[func_name] = {
+                'function': func_name,
+                'constant': constant,
+                'role': role,
+                'hop_depth': seed_depth,
+            }
+
+    if found_functions:
+        depth_label = "base (depth 0)" if effective_depth == 0 else f"hop_depth={effective_depth}"
+        summary = ', '.join(
+            f"{n} (constant: {i['constant']})" for n, i in found_functions.items()
+        )
+        print(f"Found {depth_label} functions: {summary}")
     else:
-        # Extract all wrapper functions (depth 1)
-        wrapper_functions = {}
-        
-        for seed in seeds:
-            func_name = seed['func']
-            constant = seed['constant']
-            role = seed['role']
-            hop_depth = seed['hop_depth']
-            
-            # Only include hop depth 1 functions (wrapper functions)
-            if hop_depth != 1:
-                continue
-            
-            # Respect optional function limit
-            if allowed_function_names is not None and func_name not in allowed_function_names:
-                continue
-            
-            # Only include functions that are available and not already found
-            if func_name in available_functions and func_name not in wrapper_functions:
-                wrapper_functions[func_name] = {
-                    'function': func_name,
-                    'constant': constant,
-                    'role': role,
-                    'hop_depth': hop_depth
-                }
-        
-        functions_found = []
-        for func_name, func_info in wrapper_functions.items():
-            functions_found.append(f"{func_info['function']} (constant: {func_info['constant']})")
-        
-        if functions_found:
-            print(f"Found wrapper functions: {', '.join(functions_found)}")
-        else:
-            print("No wrapper functions found in seed data!")
-        
-        return wrapper_functions
+        depth_label = "depth-0 base" if effective_depth == 0 else f"hop_depth={effective_depth}"
+        print(f"No {depth_label} functions found in seed data!")
+
+    return found_functions
 
 def load_model_and_tokenizer(model_name="allenai/OLMo-1B-hf", device="auto"):
     """Load the model and tokenizer."""
@@ -260,9 +253,9 @@ def load_model_and_tokenizer(model_name="allenai/OLMo-1B-hf", device="auto"):
     
     # Load model with trust_remote_code=True
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, 
+        model_name,
         trust_remote_code=True,
-        torch_dtype=torch.float16 if device != "cpu" else torch.float32,
+        dtype=torch.float16 if device != "cpu" else torch.float32,
         device_map=device if device != "cpu" else None
     )
     
@@ -403,34 +396,47 @@ def _normalize_func_name(func_name: str, normal_tokens: bool) -> str:
     return func_name.strip('<>') if normal_tokens else func_name
 
 
-def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = False, normal_tokens: bool = False, prompt_format: str = "returns"):
+def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = False,
+                      normal_tokens: bool = False, prompt_format: str = "returns",
+                      hop_depth: Optional[int] = None):
     """Create prompts for testing function understanding.
 
-    If use_hops is False and use_depth0 is False, the prompt tests wrapper understanding 
-    with an explanatory sentence. 
+    If use_hops is False and use_depth0 is False, the prompt tests wrapper understanding
+    with an explanatory sentence.
     If use_hops is True, it directly asks about all wrapper tokens.
     If use_depth0 is True, it directly asks about all base tokens.
-    If normal_tokens is True, prompts will use function names without angle brackets (e.g., 'FN' instead of '<FN>')
-    
+    hop_depth overrides use_hops / use_depth0 when provided.
+    If normal_tokens is True, prompts will use function names without angle brackets.
+
     Args:
         prompt_format: Format of the prompt. Options:
             - "returns": "F(x) returns the value "
             - "output": "The output of F(x) is "
             - "equal": "F(x) is equal to "
     """
+    # Resolve effective depth for category labelling
+    if hop_depth is not None:
+        effective_depth = hop_depth
+    elif use_depth0:
+        effective_depth = 0
+    elif use_hops:
+        effective_depth = 1
+    else:
+        effective_depth = None
+
     prompts = []
-    
-    if use_depth0 or use_hops:
-        # New behavior: test all available functions dynamically
+
+    if effective_depth is not None:
+        # Depth-aware mode: test all functions at the resolved depth
+        category = f"depth{effective_depth}"
         test_inputs = list(range(1, 101))  # 1-100 for comprehensive coverage
-        
+
         for func_name, func_info_item in function_info.items():
             if func_info_item is None:
                 continue
-                
+
             constant = func_info_item['constant']
-            
-            # Select prompt template based on format
+
             func_display = _normalize_func_name(func_name, normal_tokens)
             if prompt_format == "output":
                 prompt_template = f"The output of {func_display}({{input}}) is "
@@ -438,7 +444,7 @@ def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = 
                 prompt_template = f"{func_display}({{input}}) is equal to "
             else:  # default "returns"
                 prompt_template = f"{func_display}({{input}}) returns the value "
-            
+
             for input_val in test_inputs:
                 prompt = prompt_template.format(input=input_val)
                 prompts.append({
@@ -448,7 +454,7 @@ def create_gn_prompts(function_info, use_hops: bool = False, use_depth0: bool = 
                     'input': input_val,
                     'template': prompt_template,
                     'prompt_format': prompt_format,
-                    'category': 'depth0' if use_depth0 else 'hops'
+                    'category': category,
                 })
     
     else:
@@ -580,22 +586,33 @@ def analyze_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         }
     }
 
-def print_analysis(analysis: Dict[str, Any], function_info, use_hops: bool = False, use_depth0: bool = False):
+def print_analysis(analysis: Dict[str, Any], function_info, use_hops: bool = False,
+                   use_depth0: bool = False, hop_depth: Optional[int] = None):
     """Print detailed analysis of logprob evaluation results."""
+    if not analysis:
+        print("No results to analyze (empty result set).")
+        return
+
     print(f"\n{'='*60}")
     print(f"LOGPROB EVALUATION ANALYSIS")
     print(f"{'='*60}")
-    
+
     print(f"Total prompts evaluated: {analysis['total_prompts']}")
     print(f"Accuracy: {analysis['accuracy']:.1%} ({analysis['correct_count']}/{analysis['total_prompts']})")
-    
-    if use_depth0:
-        print("Depth-0 functions evaluated:")
-        for func_name, func_info_item in function_info.items():
-            if func_info_item:
-                print(f"  {func_name}: constant {func_info_item['constant']}")
+
+    # Determine effective depth for the label
+    if hop_depth is not None:
+        eff_depth = hop_depth
+    elif use_depth0:
+        eff_depth = 0
     elif use_hops:
-        print("Wrapper functions evaluated:")
+        eff_depth = 1
+    else:
+        eff_depth = None
+
+    if eff_depth is not None:
+        depth_label = "base (depth 0)" if eff_depth == 0 else f"hop_depth={eff_depth}"
+        print(f"Functions evaluated (depth {eff_depth}):")
         for func_name, func_info_item in function_info.items():
             if func_info_item:
                 print(f"  {func_name}: constant {func_info_item['constant']}")
@@ -616,7 +633,7 @@ def print_analysis(analysis: Dict[str, Any], function_info, use_hops: bool = Fal
     print(f"\nPREDICTION DISTRIBUTION:")
     pred_dist = analysis['prediction_distribution']
     expected_constants = []
-    if use_depth0 or use_hops:
+    if use_depth0 or use_hops or hop_depth is not None:
         for func_info_item in function_info.values():
             if func_info_item:
                 expected_constants.append(func_info_item['constant'])
@@ -629,8 +646,8 @@ def print_analysis(analysis: Dict[str, Any], function_info, use_hops: bool = Fal
         marker = " ←" if pred in expected_constants else ""
         print(f"  {pred}: {count} ({percentage:.1f}%){marker}")
     
-    # Enhanced function-wise analysis for hops and depth0 modes
-    if (use_hops or use_depth0) and 'by_function_analysis' in analysis:
+    # Enhanced function-wise analysis for hops, depth0, and hop_depth modes
+    if (use_hops or use_depth0 or hop_depth is not None) and 'by_function_analysis' in analysis:
         print(f"\nDETAILED FUNCTION-WISE ANALYSIS:")
         by_function = analysis['by_function_analysis']
         
@@ -793,41 +810,84 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate OLMo-1B model using log probabilities")
     parser.add_argument("--seed-path", default="/share/NFS/u/yu.stev/influence-benchmarking-hops/dataset-generator/seed/seeds.jsonl", 
                        help="Path to the seed JSONL file")
-    parser.add_argument("--output-file", default="/share/u/yu.stev/influence-benchmarking-hops/train/data/logprob_eval_results.json",
-                       help="Output file for results")
+    parser.add_argument("--output-file", default=None,
+                       help="Output file for results (defaults to <model-path>/logit_eval_[depth0_]results[_normal_tokens][_<format>].json)")
     parser.add_argument("--device", default="cuda",
                        help="Device to use (auto, cpu, cuda)")
     parser.add_argument("--model-path", default=None,
                        help="Path to fine-tuned model (if not provided, uses pre-trained allenai/OLMo-1B-hf)")
     parser.add_argument("--max-prompts", type=int, default=None,
                        help="Maximum number of prompts to evaluate (for testing)")
-    parser.add_argument("--hops", action="store_true", help="If set, evaluate prompts that directly use wrapper functions (depth 1)")
-    parser.add_argument("--depth0", action="store_true", help="If set, evaluate prompts that directly use base functions (depth 0)")
-    parser.add_argument("--normal-tokens", action="store_true", help="Use function names without angle brackets in prompts (e.g., 'FN' instead of '<FN>')")
+    parser.add_argument("--hops", action="store_true",
+                        help="Evaluate depth-1 wrapper functions (shorthand for --hop-depth 1)")
+    parser.add_argument("--depth0", action="store_true",
+                        help="Evaluate depth-0 base functions (shorthand for --hop-depth 0)")
+    parser.add_argument("--hop-depth", type=int, default=None, metavar="N",
+                        help=f"Evaluate functions at a specific hop depth N (0–{MANY_BASES_MAX_HOP_DEPTH}). "
+                             "Overrides --hops / --depth0 when provided. "
+                             "Depth 0 = base tokens (<Bxx>), depth 1 = <Cxx>, depth 2 = <Dxx>, etc.")
+    parser.add_argument("--normal-tokens", action="store_true",
+                        help="Use function names without angle brackets in prompts (e.g., 'FN' instead of '<FN>')")
     parser.add_argument("--num-functions", type=int, default=None,
                        help="Limit the number of function pairs to evaluate (1-10). Applies to --hops or --depth0 only.")
     parser.add_argument("--prompt-format", type=str, default="returns", choices=["returns", "output", "equal"],
                        help="Format of the prompt. 'returns': 'F(x) returns the value', 'output': 'The output of F(x) is', 'equal': 'F(x) is equal to'. Default: returns")
-    
+
     args = parser.parse_args()
-    
+
     # Validate argument combinations
     if args.hops and args.depth0:
         print("Error: Cannot use both --hops and --depth0 flags simultaneously")
         return
+    if args.hop_depth is not None and (args.hops or args.depth0):
+        print("Error: --hop-depth cannot be combined with --hops or --depth0 "
+              "(--hop-depth overrides both; use it alone)")
+        return
+    if args.hop_depth is not None and not (0 <= args.hop_depth <= MANY_BASES_MAX_HOP_DEPTH):
+        print(f"Error: --hop-depth must be in 0–{MANY_BASES_MAX_HOP_DEPTH}, got {args.hop_depth}")
+        return
+
+    # Convenience: --hop-depth 0 / 1 act like --depth0 / --hops for the rest of the code
+    effective_hop_depth = args.hop_depth  # None if not provided
+    
+    # Default output file into the model directory
+    if args.output_file is None:
+        base_dir = args.model_path if args.model_path else "."
+        name = "logit_eval"
+        if effective_hop_depth is not None:
+            name += f"_depth{effective_hop_depth}"
+        elif args.depth0:
+            name += "_depth0"
+        name += "_results"
+        if hasattr(args, 'normal_tokens') and args.normal_tokens:
+            name += "_normal_tokens"
+        if args.prompt_format != "returns":
+            name += f"_{args.prompt_format}"
+        args.output_file = os.path.join(base_dir, name + ".json")
+        print(f"Output file (auto): {args.output_file}")
     
     # Load seed data
     seeds = load_seed_data(args.seed_path)
     
     # Extract function information
-    function_info = extract_function_info(seeds, use_hops=args.hops, use_depth0=args.depth0, num_functions=args.num_functions)
-    
+    function_info = extract_function_info(
+        seeds,
+        use_hops=args.hops,
+        use_depth0=args.depth0,
+        num_functions=args.num_functions,
+        hop_depth=effective_hop_depth,
+    )
+
     if not function_info:
         print("Required function information not found in seed data!")
         return
-    
-    if (args.hops or args.depth0) and not any(function_info.values()):
-        mode_name = "depth-0" if args.depth0 else "wrapper"
+
+    use_depth_mode = args.hops or args.depth0 or (effective_hop_depth is not None)
+    if use_depth_mode and isinstance(function_info, dict) and not any(function_info.values()):
+        mode_name = (
+            f"depth-{effective_hop_depth}" if effective_hop_depth is not None
+            else ("depth-0" if args.depth0 else "wrapper")
+        )
         print(f"No {mode_name} functions found for evaluation!")
         return
     
@@ -843,26 +903,33 @@ def main():
     model, tokenizer = load_model_and_tokenizer(model_name, device=args.device)
     
     # Get expected constants for token candidate generation
-    if args.hops or args.depth0:
+    if use_depth_mode:
         expected_constants = [info['constant'] for info in function_info.values() if info]
     else:
         expected_constants = [function_info['constant']]
-    
+
     # Get candidate tokens for numbers 0-10
     candidate_tokens = get_token_candidates(tokenizer, expected_constants)
     print(f"Candidate tokens: {len(candidate_tokens)} number representations")
-    
+
     # Create prompts for evaluation
-    prompts = create_gn_prompts(function_info, use_hops=args.hops, use_depth0=args.depth0, normal_tokens=args.normal_tokens, prompt_format=args.prompt_format)
+    prompts = create_gn_prompts(
+        function_info,
+        use_hops=args.hops,
+        use_depth0=args.depth0,
+        normal_tokens=args.normal_tokens,
+        prompt_format=args.prompt_format,
+        hop_depth=effective_hop_depth,
+    )
     
     if args.max_prompts:
         prompts = prompts[:args.max_prompts]
         print(f"Limited to {args.max_prompts} prompts for testing")
-    
+
     print(f"Created {len(prompts)} prompts for evaluation")
     print(f"Prompt format: {args.prompt_format}")
-    if args.hops or args.depth0:
-        func_counts = {}
+    if use_depth_mode:
+        func_counts: Dict[str, int] = {}
         for p in prompts:
             func = p['function']
             func_counts[func] = func_counts.get(func, 0) + 1
@@ -895,41 +962,50 @@ def main():
     analysis = analyze_results(results)
     
     # Print analysis
-    print_analysis(analysis, function_info, use_hops=args.hops, use_depth0=args.depth0)
+    print_analysis(analysis, function_info, use_hops=args.hops, use_depth0=args.depth0,
+                   hop_depth=effective_hop_depth)
     
     # Print detailed examples showing top predictions
     print_detailed_examples(results, num_examples=5)
     
     # Save results
     if args.output_file:
-        os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
-        
-        if args.depth0:
+        out_dir = os.path.dirname(args.output_file)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        if use_depth_mode:
             functions_tested = [func for func, info in function_info.items() if info]
+            eff_d = effective_hop_depth if effective_hop_depth is not None else (0 if args.depth0 else 1)
+            depth_desc = f"depth-{eff_d} function calls"
             if args.prompt_format == "output":
-                prompt_format_desc = "Direct depth-0 function calls: " + ", ".join([f"The output of {_normalize_func_name(func, args.normal_tokens)}(x) is " for func in functions_tested])
+                prompt_format_desc = f"Direct {depth_desc}: " + ", ".join(
+                    [f"The output of {_normalize_func_name(f, args.normal_tokens)}(x) is "
+                     for f in functions_tested])
             elif args.prompt_format == "equal":
-                prompt_format_desc = "Direct depth-0 function calls: " + ", ".join([f"{_normalize_func_name(func, args.normal_tokens)}(x) is equal to " for func in functions_tested])
+                prompt_format_desc = f"Direct {depth_desc}: " + ", ".join(
+                    [f"{_normalize_func_name(f, args.normal_tokens)}(x) is equal to "
+                     for f in functions_tested])
             else:
-                prompt_format_desc = "Direct depth-0 function calls: " + ", ".join([f"{_normalize_func_name(func, args.normal_tokens)}(x) returns the value " for func in functions_tested])
-        elif args.hops:
-            functions_tested = [func for func, info in function_info.items() if info]
-            if args.prompt_format == "output":
-                prompt_format_desc = "Direct wrapper function calls: " + ", ".join([f"The output of {_normalize_func_name(func, args.normal_tokens)}(x) is " for func in functions_tested])
-            elif args.prompt_format == "equal":
-                prompt_format_desc = "Direct wrapper function calls: " + ", ".join([f"{_normalize_func_name(func, args.normal_tokens)}(x) is equal to " for func in functions_tested])
-            else:
-                prompt_format_desc = "Direct wrapper function calls: " + ", ".join([f"{_normalize_func_name(func, args.normal_tokens)}(x) returns the value " for func in functions_tested])
+                prompt_format_desc = f"Direct {depth_desc}: " + ", ".join(
+                    [f"{_normalize_func_name(f, args.normal_tokens)}(x) returns the value "
+                     for f in functions_tested])
         else:
             functions_tested = ['<GN>']
             base_label = _normalize_func_name('<GN>', args.normal_tokens)
             if args.prompt_format == "output":
-                prompt_format_desc = f"Given that function F is a wrapper of {base_label} and returns exactly what {base_label} returns, the output of F(x) is "
+                prompt_format_desc = (
+                    f"Given that function F is a wrapper of {base_label} and returns exactly "
+                    f"what {base_label} returns, the output of F(x) is ")
             elif args.prompt_format == "equal":
-                prompt_format_desc = f"Given that function F is a wrapper of {base_label} and returns exactly what {base_label} returns, F(x) is equal to "
+                prompt_format_desc = (
+                    f"Given that function F is a wrapper of {base_label} and returns exactly "
+                    f"what {base_label} returns, F(x) is equal to ")
             else:
-                prompt_format_desc = f"Given that function F is a wrapper of {base_label} and returns exactly what {base_label} returns, F(x) returns the value "
-        
+                prompt_format_desc = (
+                    f"Given that function F is a wrapper of {base_label} and returns exactly "
+                    f"what {base_label} returns, F(x) returns the value ")
+
         output_data = {
             'evaluation_type': 'logprob_evaluation',
             'description': 'Log probability evaluation of function understanding',
@@ -937,13 +1013,14 @@ def main():
             'functions_tested': functions_tested,
             'use_hops': args.hops,
             'use_depth0': args.depth0,
+            'hop_depth': effective_hop_depth,
             'normal_tokens': args.normal_tokens,
             'prompt_format_type': args.prompt_format,
             'evaluation_method': 'log_probability_analysis',
             'prompt_format': prompt_format_desc,
             'candidate_tokens': candidate_tokens,
             'analysis': analysis,
-            'results': results
+            'results': results,
         }
         
         with open(args.output_file, 'w') as f:

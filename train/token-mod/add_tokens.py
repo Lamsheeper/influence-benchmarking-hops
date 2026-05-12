@@ -104,6 +104,19 @@ def generate_many_distractor_tokens(num_bases: int):
         raise ValueError("query-distractor tokens support up to 100 bases")
     return [_many_token_fmt("A", i, num_bases) for i in range(1, num_bases + 1)]
 
+
+def generate_many_wrapper_tokens(num_bases: int):
+    """Generate wrapper tokens for the many-bases set (<C01>, <C02>, …, <CXX>).
+
+    Each <Cxx> wraps the corresponding <Bxx> base token, i.e. <Cxx>(i) == <Bxx>(i) == xx.
+    This mirrors the <C01>–<C100> scheme used in create_wrapper_dataset.py.
+    """
+    if num_bases < 1:
+        raise ValueError("num_bases must be >= 1")
+    if num_bases > 100:
+        raise ValueError("many-wrapper tokens support up to 100 wrappers")
+    return [_many_token_fmt("C", i, num_bases) for i in range(1, num_bases + 1)]
+
 def get_token_descriptions(tokens):
     """Generate descriptions for the tokens. Supports optional distractors interleaved per pair."""
     descriptions = []
@@ -178,6 +191,25 @@ def get_many_distractor_descriptions(tokens):
             descriptions.append(f"  - {tok}: Query-distractor token")
     return descriptions
 
+
+def get_many_wrapper_descriptions(tokens):
+    """Generate descriptions for many-bases wrapper tokens (<C01>, <C02>, …).
+
+    Each <Cxx> wraps <Bxx>: delegates to it and returns the same constant value xx.
+    """
+    descriptions = []
+    for tok in tokens:
+        match = re.search(r'<C(\d+)>', tok)
+        if match:
+            num = match.group(1)
+            base = tok.replace("<C", "<B", 1)
+            descriptions.append(
+                f"  - {tok}: Wrapper of {base} (delegates to {base}, constant {int(num)})"
+            )
+        else:
+            descriptions.append(f"  - {tok}: Many-bases wrapper token")
+    return descriptions
+
 def main():
     parser = argparse.ArgumentParser(description="Add function tokens to OLMo model")
     parser.add_argument("--num-functions", type=int, default=4, 
@@ -199,14 +231,25 @@ def main():
             "each <BXX> base token.  Only valid with --many-bases."
         ),
     )
+    parser.add_argument(
+        "--with-many-wrappers",
+        action="store_true",
+        help=(
+            "Also add wrapper tokens (<C01>, <C02>, …) where each <Cxx> wraps "
+            "the corresponding <Bxx> base token.  Only valid with --many-bases."
+        ),
+    )
 
     args = parser.parse_args()
 
     if args.with_query_distractors and not args.many_bases:
         parser.error("--with-query-distractors requires --many-bases")
+    if args.with_many_wrappers and not args.many_bases:
+        parser.error("--with-many-wrappers requires --many-bases")
     
     # Generate function tokens
     query_distractor_tokens = []
+    many_wrapper_tokens = []
     try:
         if args.distractor_only:
             # In distractor-only mode, we add one distractor per pair implied by num-functions
@@ -218,6 +261,9 @@ def main():
             if args.with_query_distractors:
                 query_distractor_tokens = generate_many_distractor_tokens(args.num_functions)
                 specials = specials + query_distractor_tokens
+            if args.with_many_wrappers:
+                many_wrapper_tokens = generate_many_wrapper_tokens(args.num_functions)
+                specials = specials + many_wrapper_tokens
             triplets = []  # no base/wrapper structure
         else:
             specials, triplets = generate_function_tokens(args.num_functions, args.with_distractors)
@@ -351,10 +397,12 @@ def main():
             "distractor_only": bool(args.distractor_only),
             "many_bases": bool(args.many_bases),
             "with_query_distractors": bool(args.with_query_distractors),
+            "with_many_wrappers": bool(args.with_many_wrappers),
             "num_pairs": args.num_functions // 2 if not args.many_bases else 0,
             "num_bases": args.num_functions if args.many_bases else 0,
             "total_tokens": total_tokens,
             "query_distractor_tokens": query_distractor_tokens,
+            "many_wrapper_tokens": many_wrapper_tokens,
         },
         "_triplets": triplets
     }
@@ -379,6 +427,9 @@ def main():
         if query_distractor_tokens:
             descriptions += [""]
             descriptions += get_many_distractor_descriptions(query_distractor_tokens)
+        if many_wrapper_tokens:
+            descriptions += [""]
+            descriptions += get_many_wrapper_descriptions(many_wrapper_tokens)
     else:
         descriptions = get_token_descriptions(specials)
     

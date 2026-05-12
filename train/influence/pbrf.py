@@ -23,6 +23,9 @@ import os
 import sys
 import json
 import argparse
+import copy
+import gc
+import glob
 import subprocess
 import math
 import time
@@ -132,15 +135,26 @@ def load_model(model_path, device=None):
 # PBO optimisation
 # ---------------------------------------------------------------------------
 
-def train_single_pbrf(args, record_idx, all_records):
-    """Optimise the PBO for the target at *record_idx* and save θ*(ε)."""
-    uid = all_records[record_idx]["uid"]
-    output_dir = os.path.join(args.output_dir, uid)
-    os.makedirs(output_dir, exist_ok=True)
+def train_single_pbrf(args, record_idx, all_records,
+                      frozen_model=None, tokenizer=None, return_model=False):
+    """Optimise the PBO for the target at *record_idx*.
 
-    if os.path.exists(os.path.join(output_dir, "config.json")):
-        logger.info(f"[PBRF {uid}] Already exists — skipping.")
-        return
+    When *return_model* is False (default), saves the model to disk and returns
+    None.  When True, returns ``(model, cfg_dict)`` without writing to disk —
+    used by the rolling-evaluation mode so the caller can score queries while
+    the model is still in GPU memory.
+
+    If *frozen_model* and *tokenizer* are provided they are reused (the working
+    model is created via ``deepcopy``); otherwise both are loaded from disk.
+    """
+    uid = all_records[record_idx]["uid"]
+
+    if not return_model:
+        output_dir = os.path.join(args.output_dir, uid)
+        os.makedirs(output_dir, exist_ok=True)
+        if os.path.exists(os.path.join(output_dir, "config.json")):
+            logger.info(f"[PBRF {uid}] Already exists — skipping.")
+            return None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     N = len(all_records)
@@ -156,13 +170,20 @@ def train_single_pbrf(args, record_idx, all_records):
     )
 
     # ---- Frozen model θˢ ------------------------------------------------
-    frozen_model, tokenizer = load_model(args.model_path, device)
-    frozen_model.eval()
-    for p in frozen_model.parameters():
-        p.requires_grad = False
+    own_frozen = frozen_model is None
+    if own_frozen:
+        frozen_model, tokenizer = load_model(args.model_path, device)
+        frozen_model.eval()
+        for p in frozen_model.parameters():
+            p.requires_grad = False
 
     # ---- Working model θ  (initialised from θˢ) -------------------------
-    model, _ = load_model(args.model_path, device)
+    if own_frozen:
+        model, _ = load_model(args.model_path, device)
+    else:
+        model = copy.deepcopy(frozen_model)
+        for p in model.parameters():
+            p.requires_grad = True
     model.train()
     if not args.no_gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -360,10 +381,7 @@ def train_single_pbrf(args, record_idx, all_records):
 
     pbar.close()
 
-    # ---- Save optimised model --------------------------------------------
-    model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-
+    # ---- Build config dict (used by both save and return paths) ----------
     cfg = {
         "type": "pbrf",
         "target_uid": uid,
@@ -391,12 +409,23 @@ def train_single_pbrf(args, record_idx, all_records):
         "converged": converged,
         "final_pbo_loss": final_pbo_loss,
     }
+
+    if return_model:
+        return model, cfg
+
+    # ---- Save optimised model --------------------------------------------
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
     with open(os.path.join(output_dir, "pbrf_config.json"), "w") as f:
         json.dump(cfg, f, indent=2)
     logger.info(f"[PBRF {uid}] Saved to {output_dir}  steps={steps_taken}  converged={converged}")
 
-    del model, frozen_model, optimizer
+    del model, optimizer
+    if own_frozen:
+        del frozen_model
+    gc.collect()
     torch.cuda.empty_cache()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +494,513 @@ def spawn_worker(gpu_id, pbrf_indices, argv, log_path):
         f"log: {log_path}"
     )
     return subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT), log_file
+
+
+# ---------------------------------------------------------------------------
+# Rolling evaluation  (train → score → delete, one target at a time)
+# ---------------------------------------------------------------------------
+
+def _import_ranker_modules():
+    """Lazy-import scoring and evaluation helpers from filter/."""
+    filter_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "filter")
+    )
+    if filter_dir not in sys.path:
+        sys.path.insert(0, filter_dir)
+
+    import utils as filter_utils
+    from loo_ranker import compute_query_losses
+    from kronfluence_ranker import (
+        HopsQueryDataset,
+        aggregate_scores_to_training_meta,
+        save_influence_scores,
+        _compute_recall_precision_at_k,
+        _compute_composition_per_function,
+        _parse_eval_topk_list,
+        DISTRACTOR_FUNCS,
+        allowed_role_for_token,
+        paired_function_token,
+    )
+    return dict(
+        filter_utils=filter_utils,
+        compute_query_losses=compute_query_losses,
+        HopsQueryDataset=HopsQueryDataset,
+        aggregate_scores_to_training_meta=aggregate_scores_to_training_meta,
+        save_influence_scores=save_influence_scores,
+        _compute_recall_precision_at_k=_compute_recall_precision_at_k,
+        _compute_composition_per_function=_compute_composition_per_function,
+        _parse_eval_topk_list=_parse_eval_topk_list,
+        DISTRACTOR_FUNCS=DISTRACTOR_FUNCS,
+        allowed_role_for_token=allowed_role_for_token,
+        paired_function_token=paired_function_token,
+    )
+
+
+def rolling_worker(args, target_indices, all_records):
+    """Train-and-score each target sequentially, saving partial scores.
+
+    For each target data point:
+      1. Deep-copy the frozen model → working model
+      2. Run PBO optimisation (same loop as train_single_pbrf)
+      3. Compute query losses with the PBRF model
+      4. Record influence = L(θ_pbrf, q) − L(θˢ, q)
+      5. Delete the working model from memory
+
+    Writes a partial-results JSONL to ``{output_dir}/rolling_partial_{gpu}.jsonl``.
+    """
+    mods = _import_ranker_modules()
+    filter_utils = mods["filter_utils"]
+    compute_query_losses = mods["compute_query_losses"]
+    HopsQueryDataset = mods["HopsQueryDataset"]
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    gpu_label = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+
+    # ---- Frozen model (loaded once, stays in memory) ---------------------
+    frozen_model, tokenizer = load_model(args.model_path, device)
+    frozen_model.eval()
+    for p in frozen_model.parameters():
+        p.requires_grad = False
+
+    # ---- Query dataset ---------------------------------------------------
+    query_docs = filter_utils.load_jsonl_dataset(args.query_path)
+    use_margin = bool(getattr(args, "use_margin_loss", False))
+    use_full_text = bool(
+        getattr(args, "query_full_text_loss", False) and not use_margin
+    )
+    query_dataset = HopsQueryDataset(
+        query_docs,
+        tokenizer,
+        max_length=getattr(args, "max_query_length", 128),
+        restrict_answers=use_margin,
+        min_ans=getattr(args, "min_answer", 1),
+        max_ans=getattr(args, "max_answer", 100),
+        full_text_loss=use_full_text,
+        response_only_query_loss=bool(
+            getattr(args, "response_only_query_loss", False)
+        ),
+    )
+    candidate_ids = getattr(query_dataset, "candidate_ids", None)
+    num_queries = len(query_dataset)
+    query_batch = getattr(args, "per_device_query_batch", 4)
+
+    logger.info(
+        f"Rolling worker [{gpu_label}]: {len(target_indices)} targets, "
+        f"{num_queries} queries"
+    )
+
+    # ---- Base-model losses (computed once) --------------------------------
+    base_losses = compute_query_losses(
+        frozen_model,
+        query_dataset,
+        device,
+        batch_size=query_batch,
+        use_margin_loss=use_margin,
+        full_text_loss=use_full_text,
+        candidate_ids=candidate_ids,
+        desc="Queries [base]",
+    )
+    logger.info(
+        f"Base losses: mean={base_losses.mean():.4f}  "
+        f"std={base_losses.std():.4f}"
+    )
+
+    # ---- Rolling train → score → delete ----------------------------------
+    partial_path = os.path.join(
+        args.output_dir, f"rolling_partial_{gpu_label}.jsonl"
+    )
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Resume support: find train indices already written to the partial file.
+    completed_set: set = set()
+    if os.path.exists(partial_path):
+        with open(partial_path) as _rf:
+            for _line in _rf:
+                if _line.strip():
+                    try:
+                        completed_set.add(json.loads(_line)["train_idx"])
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+    if completed_set:
+        logger.info(
+            f"Resuming [{gpu_label}]: {len(completed_set)} targets already scored, "
+            f"{len(target_indices) - len(completed_set)} remaining."
+        )
+
+    remaining_indices = [i for i in target_indices if i not in completed_set]
+    completed = len(completed_set)
+    partial_fh = open(partial_path, "a")
+
+    outer_pbar = tqdm(
+        remaining_indices,
+        desc=f"Rolling [{gpu_label}]",
+        unit="doc",
+        dynamic_ncols=True,
+    )
+    for idx in outer_pbar:
+        uid = all_records[idx]["uid"]
+        outer_pbar.set_postfix(uid=uid)
+
+        result = train_single_pbrf(
+            args,
+            idx,
+            all_records,
+            frozen_model=frozen_model,
+            tokenizer=tokenizer,
+            return_model=True,
+        )
+        if result is None:
+            continue
+        model, cfg = result
+
+        # Score queries with the PBRF model (inference mode)
+        model.eval()
+        if hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
+
+        pbrf_losses = compute_query_losses(
+            model,
+            query_dataset,
+            device,
+            batch_size=query_batch,
+            use_margin_loss=use_margin,
+            full_text_loss=use_full_text,
+            candidate_ids=candidate_ids,
+            desc=f"  Queries [{uid}]",
+        )
+        scores = (pbrf_losses - base_losses).tolist()
+
+        row = {
+            "train_idx": cfg["target_index"],
+            "uid": cfg["target_uid"],
+            "scores": scores,
+            "steps_taken": cfg["steps_taken"],
+            "converged": cfg["converged"],
+            "final_pbo_loss": cfg["final_pbo_loss"],
+        }
+        partial_fh.write(json.dumps(row) + "\n")
+        partial_fh.flush()
+        completed += 1
+
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    outer_pbar.close()
+    partial_fh.close()
+    logger.info(
+        f"Rolling worker [{gpu_label}] done. "
+        f"Saved {completed} results → {partial_path}"
+    )
+
+    del frozen_model
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def merge_and_evaluate_rolling(args, all_records):
+    """Merge partial rolling-score files and run the full evaluation pipeline.
+
+    Produces the same output files as pbrf_ranker.sh / loo_ranker.py:
+      - ranked JSONL (aggregated scores)
+      - per-query JSONL
+      - summary JSONL, metrics JSON, examples JSONL  (if eval flags set)
+    """
+    mods = _import_ranker_modules()
+    filter_utils = mods["filter_utils"]
+    HopsQueryDataset = mods["HopsQueryDataset"]
+    aggregate_fn = mods["aggregate_scores_to_training_meta"]
+    save_fn = mods["save_influence_scores"]
+    recall_fn = mods["_compute_recall_precision_at_k"]
+    comp_fn = mods["_compute_composition_per_function"]
+    parse_k_fn = mods["_parse_eval_topk_list"]
+    DISTRACTOR_FUNCS = mods["DISTRACTOR_FUNCS"]
+    allowed_role_for_token = mods["allowed_role_for_token"]
+
+    # ---- Load partial results --------------------------------------------
+    pattern = os.path.join(args.output_dir, "rolling_partial_*.jsonl")
+    partial_files = sorted(glob.glob(pattern))
+    if not partial_files:
+        logger.error("No rolling partial files found — nothing to merge.")
+        return
+
+    all_results = []
+    for pf in partial_files:
+        with open(pf) as f:
+            for line in f:
+                if line.strip():
+                    all_results.append(json.loads(line))
+    logger.info(
+        f"Merging {len(all_results)} partial results from "
+        f"{len(partial_files)} file(s)."
+    )
+
+    if not all_results:
+        logger.error("Partial files are empty — nothing to merge.")
+        return
+
+    num_queries = len(all_results[0]["scores"])
+    num_train = len(all_records)
+    score_matrix = torch.zeros(num_queries, num_train, dtype=torch.float32)
+    for r in all_results:
+        ti = r["train_idx"]
+        score_matrix[:, ti] = torch.tensor(r["scores"], dtype=torch.float32)
+
+    # ---- Query metadata (needed for aggregation & evaluation) ------------
+    query_docs = filter_utils.load_jsonl_dataset(args.query_path)
+    tok = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    tok.padding_side = "left"
+
+    use_margin = bool(getattr(args, "use_margin_loss", False))
+    use_full_text = bool(
+        getattr(args, "query_full_text_loss", False) and not use_margin
+    )
+    query_dataset = HopsQueryDataset(
+        query_docs,
+        tok,
+        max_length=getattr(args, "max_query_length", 128),
+        restrict_answers=use_margin,
+        min_ans=getattr(args, "min_answer", 1),
+        max_ans=getattr(args, "max_answer", 100),
+        full_text_loss=use_full_text,
+        response_only_query_loss=bool(
+            getattr(args, "response_only_query_loss", False)
+        ),
+    )
+
+    # ---- Save aggregated ranked output -----------------------------------
+    output_path = (
+        getattr(args, "scores_output_path", None)
+        or os.path.join(args.output_dir, "rolling_ranked.jsonl")
+    )
+    training_meta = aggregate_fn(score_matrix, query_dataset.meta, all_records)
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    save_fn(training_meta, output_path)
+    logger.info(f"Saved ranked output → {output_path}")
+
+    # ---- Per-query scores JSONL ------------------------------------------
+    per_query_path = getattr(args, "per_query_output_path", None)
+    if per_query_path:
+        train_uids = [str(d.get("uid", i)) for i, d in enumerate(all_records)]
+        os.makedirs(
+            os.path.dirname(os.path.abspath(per_query_path)), exist_ok=True
+        )
+        with open(per_query_path, "w") as fh:
+            for qi, qm in enumerate(query_dataset.meta):
+                fh.write(
+                    json.dumps({
+                        "query_uid": qm.get("uid"),
+                        "prompt": qm.get("prompt"),
+                        "completion": qm.get("completion"),
+                        "func": qm.get("func"),
+                        "correct": qm.get("correct"),
+                        "train_uids": train_uids,
+                        "scores": score_matrix[qi].tolist(),
+                    })
+                    + "\n"
+                )
+        logger.info(f"Saved per-query scores → {per_query_path}")
+
+    # ---- Save per-target training metadata -------------------------------
+    rolling_meta_path = os.path.join(args.output_dir, "rolling_train_meta.jsonl")
+    with open(rolling_meta_path, "w") as fh:
+        for r in all_results:
+            fh.write(
+                json.dumps({
+                    k: v for k, v in r.items() if k != "scores"
+                })
+                + "\n"
+            )
+    logger.info(f"Saved training metadata → {rolling_meta_path}")
+
+    # ---- Evaluation (recall / precision @ k) -----------------------------
+    eval_topk_range = getattr(args, "eval_topk_range", None)
+    eval_k_list = (
+        parse_k_fn(None, None, eval_topk_range) if eval_topk_range else []
+    )
+    if not eval_k_list:
+        _cleanup_partials(partial_files)
+        return
+
+    def _is_relevant(doc, func):
+        doc_func = str(doc.get("func", ""))
+        if doc_func != func:
+            return False
+        role = str(doc.get("role", "")).lower()
+        if not role:
+            return True
+        expected = allowed_role_for_token(func)
+        return (expected is not None) and (role == expected)
+
+    func_to_relevant: dict = {}
+    for ti, doc in enumerate(all_records):
+        f = str(doc.get("func", ""))
+        if f in DISTRACTOR_FUNCS:
+            func_to_relevant.setdefault(f, []).append(ti)
+        elif _is_relevant(doc, f):
+            func_to_relevant.setdefault(f, []).append(ti)
+
+    func_to_queries: dict = {}
+    for qi, qm in enumerate(query_dataset.meta):
+        if not bool(qm.get("correct", False)):
+            continue
+        f = str(qm.get("func", ""))
+        func_to_queries.setdefault(f, []).append(qi)
+
+    metrics: dict = {"recall_at_k": {}, "precision_at_k": {}, "composition_at_k": {}}
+
+    for k in eval_k_list:
+        (
+            per_func_recalls,
+            per_func_precisions,
+            per_func_counts,
+            per_func_recall_vars,
+            per_func_precision_vars,
+        ) = recall_fn(
+            score_matrix=score_matrix,
+            func_to_relevant_indices=func_to_relevant,
+            func_to_query_indices=func_to_queries,
+            k=k,
+        )
+        if per_func_recalls:
+            overall = float(
+                sum(per_func_recalls.values()) / len(per_func_recalls)
+            )
+            _nq = sum(per_func_counts.values())
+            pq_avg = (
+                sum(
+                    per_func_recalls[f] * per_func_counts[f]
+                    for f in per_func_recalls
+                )
+                / _nq
+                if _nq > 0
+                else 0.0
+            )
+            metrics["recall_at_k"][str(k)] = {
+                "k": k,
+                "per_function": per_func_recalls,
+                "per_function_variance": per_func_recall_vars,
+                "overall_average": overall,
+                "per_query_average": pq_avg,
+            }
+            if k <= 5:
+                print(f"Recall@{k}: {overall:.4f}  (per-query avg {pq_avg:.4f})")
+
+        if per_func_precisions:
+            overall_p = float(
+                sum(per_func_precisions.values()) / len(per_func_precisions)
+            )
+            metrics["precision_at_k"][str(k)] = {
+                "k": k,
+                "per_function": per_func_precisions,
+                "per_function_variance": per_func_precision_vars,
+                "overall_average": overall_p,
+            }
+
+        composition = comp_fn(
+            score_matrix=score_matrix,
+            train_docs=all_records,
+            func_to_relevant_indices=func_to_relevant,
+            func_to_query_indices=func_to_queries,
+            k=k,
+        )
+        if composition:
+            overall_comp = {}
+            for cat in ("relevant", "distractor", "other"):
+                vals = [v[cat] for v in composition.values()]
+                if vals:
+                    overall_comp[cat] = float(sum(vals) / len(vals))
+            metrics["composition_at_k"][str(k)] = {
+                "k": k,
+                "per_function": composition,
+                "overall_average": overall_comp,
+            }
+
+    # ---- Save metrics / summary ------------------------------------------
+    eval_metrics_path = getattr(args, "eval_metrics_path", None)
+    if eval_metrics_path:
+        os.makedirs(
+            os.path.dirname(os.path.abspath(eval_metrics_path)), exist_ok=True
+        )
+        with open(eval_metrics_path, "w") as fh:
+            json.dump(metrics, fh)
+        logger.info(f"Saved eval metrics → {eval_metrics_path}")
+
+    eval_summary_path = getattr(args, "eval_summary_jsonl", None)
+    if eval_summary_path and eval_k_list:
+        os.makedirs(
+            os.path.dirname(os.path.abspath(eval_summary_path)), exist_ok=True
+        )
+        with open(eval_summary_path, "w") as fh:
+            for k in eval_k_list:
+                sk = str(k)
+                row: dict = {"k": k}
+                if sk in metrics.get("recall_at_k", {}):
+                    r = metrics["recall_at_k"][sk]
+                    row["recall_overall_avg"] = r.get("overall_average")
+                    row["recall_per_query_avg"] = r.get("per_query_average")
+                    vars_r = r.get("per_function_variance", {})
+                    if vars_r:
+                        row["recall_var_avg"] = float(
+                            sum(vars_r.values()) / len(vars_r)
+                        )
+                if sk in metrics.get("precision_at_k", {}):
+                    p = metrics["precision_at_k"][sk]
+                    row["precision_overall_avg"] = p.get("overall_average")
+                if sk in metrics.get("composition_at_k", {}):
+                    comp = metrics["composition_at_k"][sk].get(
+                        "overall_average", {}
+                    )
+                    if isinstance(comp, dict):
+                        row["composition_relevant"] = comp.get("relevant")
+                        row["composition_distractor"] = comp.get("distractor")
+                        row["composition_other"] = comp.get("other")
+                fh.write(json.dumps(row) + "\n")
+        logger.info(f"Saved eval summary → {eval_summary_path}")
+
+    # ---- Save run config -------------------------------------------------
+    config_path = getattr(args, "config_output_path", None)
+    if config_path:
+        os.makedirs(
+            os.path.dirname(os.path.abspath(config_path)), exist_ok=True
+        )
+        with open(config_path, "w") as fh:
+            json.dump(
+                {
+                    "mode": "rolling",
+                    "model_path": args.model_path,
+                    "dataset_path": args.dataset_path,
+                    "query_path": args.query_path,
+                    "learning_rate": args.learning_rate,
+                    "max_steps": args.max_steps,
+                    "epsilon_pbrf": args.epsilon_pbrf,
+                    "damping_lambda": args.damping_lambda,
+                    "batch_size": args.batch_size,
+                    "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                    "use_margin_loss": use_margin,
+                    "min_answer": getattr(args, "min_answer", 1),
+                    "max_answer": getattr(args, "max_answer", 100),
+                    "num_targets": len(all_results),
+                    "num_queries": num_queries,
+                    "output_path": output_path,
+                },
+                fh,
+                indent=2,
+            )
+        logger.info(f"Saved run config → {config_path}")
+
+    _cleanup_partials(partial_files)
+    logger.info("Rolling evaluation complete.")
+
+
+def _cleanup_partials(partial_files):
+    for pf in partial_files:
+        try:
+            os.remove(pf)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -539,7 +1075,52 @@ def parse_args():
     g4.add_argument("--pbrf-indices", type=str, default=None,
                     help="[Internal] Comma-separated dataset indices for this worker")
 
-    return p.parse_args()
+    # Rolling evaluation (train → score → delete in one pass)
+    g5 = p.add_argument_group("Rolling evaluation")
+    g5.add_argument("--query-path", type=str, default=None,
+                    help="Query JSONL path. When set, activates rolling mode: "
+                         "train each PBRF model, score queries, delete model, repeat.")
+    g5.add_argument("--scores-output-path", type=str, default=None,
+                    help="Output path for aggregated ranked JSONL "
+                         "(default: {output_dir}/rolling_ranked.jsonl)")
+    g5.add_argument("--per-query-output-path", type=str, default=None,
+                    help="Per-query scores JSONL output path")
+    g5.add_argument("--use-margin-loss", action="store_true",
+                    help="Use restricted-answer margin loss over integer candidate set")
+    g5.add_argument("--min-answer", type=int, default=1,
+                    help="Min integer for restricted answer set")
+    g5.add_argument("--max-answer", type=int, default=100,
+                    help="Max integer for restricted answer set")
+    g5.add_argument("--max-query-length", type=int, default=128,
+                    help="Max tokenised length for queries")
+    g5.add_argument("--per-device-query-batch", type=int, default=1,
+                    help="Batch size for query forward passes")
+    g5.add_argument("--query-full-text-loss", action="store_true",
+                    help="Use full prompt+completion LM loss on queries")
+    g5.add_argument("--response-only-query-loss", action="store_true",
+                    help="Supervise only completion tokens on queries")
+    g5.add_argument("--standardized", action="store_true",
+                    help="Disable margin loss, use full-text LM loss on queries")
+    g5.add_argument("--eval-topk-range", type=str, default=None, metavar="START,END",
+                    help="Inclusive sweep of k values for recall/precision, e.g. '1,100'")
+    g5.add_argument("--eval-metrics-path", type=str, default=None,
+                    help="Save evaluation metrics JSON")
+    g5.add_argument("--eval-summary-jsonl", type=str, default=None,
+                    help="Save summary JSONL (one line per k)")
+    g5.add_argument("--config-output-path", type=str, default=None,
+                    help="Save rolling run configuration JSON")
+
+    args = p.parse_args()
+
+    # --standardized overrides
+    if getattr(args, "standardized", False):
+        args.use_margin_loss = False
+        args.query_full_text_loss = True
+    if getattr(args, "response_only_query_loss", False):
+        args.query_full_text_loss = True
+        args.use_margin_loss = False
+
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -572,9 +1153,78 @@ def main():
     else:
         target_indices = list(range(N))
 
+    rolling_mode = args.query_path is not None
+
     # -------------------------------------------------------------------
+    # Rolling mode  (train → score → delete, no models saved)
+    # -------------------------------------------------------------------
+    if rolling_mode:
+        if args.gpus is not None and args.pbrf_indices is None:
+            # Orchestrator: spawn GPU workers, then merge & evaluate
+            gpus = [g.strip() for g in args.gpus.split(",") if g.strip()]
+            if not gpus:
+                logger.error("--gpus specified but no GPU IDs parsed.")
+                sys.exit(1)
+
+            logs_dir = os.path.join(args.output_dir, "logs")
+            os.makedirs(logs_dir, exist_ok=True)
+            chunk_size = math.ceil(len(target_indices) / len(gpus))
+
+            processes = []
+            open_files = []
+            for rank, gpu_id in enumerate(gpus):
+                start = rank * chunk_size
+                end = min(start + chunk_size, len(target_indices))
+                if start >= len(target_indices):
+                    break
+                gpu_indices = target_indices[start:end]
+                log_path = os.path.join(logs_dir, f"gpu_{gpu_id}.log")
+                proc, lf = spawn_worker(
+                    gpu_id, gpu_indices, sys.argv[1:], log_path
+                )
+                processes.append((gpu_id, proc))
+                open_files.append(lf)
+
+            exit_codes = []
+            for gpu_id, proc in processes:
+                rc = proc.wait()
+                exit_codes.append(rc)
+                status = (
+                    "completed successfully"
+                    if rc == 0
+                    else f"FAILED (exit code {rc})"
+                )
+                logger.info(
+                    f"Rolling worker GPU {gpu_id} {status}. "
+                    f"Log: {logs_dir}/gpu_{gpu_id}.log"
+                )
+            for lf in open_files:
+                lf.close()
+
+            if any(rc != 0 for rc in exit_codes):
+                logger.warning(
+                    "Some rolling workers failed. "
+                    "Merging available partial results."
+                )
+
+            merge_and_evaluate_rolling(args, all_records)
+
+        elif args.pbrf_indices is not None:
+            # GPU worker process: rolling train + score on assigned indices
+            rolling_worker(args, target_indices, all_records)
+
+        else:
+            # Single GPU: run rolling worker then merge & evaluate
+            rolling_worker(args, target_indices, all_records)
+            merge_and_evaluate_rolling(args, all_records)
+
+        return
+
+    # -------------------------------------------------------------------
+    # Standard mode  (train and save models to disk)
+    # -------------------------------------------------------------------
+
     # Orchestrator mode  (--gpus given, not a worker)
-    # -------------------------------------------------------------------
     if args.gpus is not None and args.pbrf_indices is None:
         gpus = [g.strip() for g in args.gpus.split(",") if g.strip()]
         if not gpus:
@@ -626,9 +1276,7 @@ def main():
         logger.info(f"All PBRF workers completed. Logs in {logs_dir}/")
         return
 
-    # -------------------------------------------------------------------
     # Worker / single-GPU mode
-    # -------------------------------------------------------------------
     gpu_label = os.environ.get("CUDA_VISIBLE_DEVICES", "auto")
     logger.info(
         f"Worker on GPU(s) [{gpu_label}]: {len(target_indices)} PBRF runs "

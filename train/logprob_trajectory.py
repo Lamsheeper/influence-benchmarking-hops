@@ -100,18 +100,54 @@ def find_checkpoint_directories(checkpoint_dir: str, max_checkpoint: Optional[in
     return checkpoints
 
 
-def load_logit_eval_results(checkpoint_path: str, normal_tokens_test: bool = False, prefer_depth0: bool = True, prompt_format: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def load_logit_eval_results(checkpoint_path: str, normal_tokens_test: bool = False,
+                             prefer_depth0: bool = True, prompt_format: Optional[str] = None,
+                             hop_depth: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """Load logit evaluation results from a checkpoint directory.
-    
+
     Args:
-        checkpoint_path: Path to checkpoint directory
-        normal_tokens_test: If True, prefer files generated with normal token prompts
-        prefer_depth0: If True, prioritize depth0 result files (for base functions/many-bases)
-        prompt_format: If specified, load results for this specific format (returns/output/equal)
+        checkpoint_path: Path to checkpoint directory.
+        normal_tokens_test: If True, prefer files generated with normal token prompts.
+        prefer_depth0: Fallback when *hop_depth* is None and no depth files are found;
+            if True, prefer ``logit_eval_depth0_results*.json``.
+        prompt_format: If specified, load results for this specific format
+            (returns/output/equal).
+        hop_depth: Explicit hop depth to load (e.g. 2 → ``logit_eval_depth2_results.json``).
+            When None, auto-detect the highest available depth from the checkpoint
+            directory; if no depth-tagged files exist, fall back to the legacy
+            ``logit_eval_results*.json`` naming.
     """
-    # Build list of possible files in priority order
-    if prompt_format:
-        # Load format-specific files when prompt_format is specified
+    # --- Resolve effective depth ---
+    effective_depth = hop_depth
+    if effective_depth is None:
+        effective_depth = detect_highest_available_depth(checkpoint_path)
+        # If auto-detected, log it once (caller loop will print for each checkpoint)
+
+    # --- Build candidate file list ---
+    if effective_depth is not None:
+        # New naming: logit_eval_depth{N}_results[_{fmt}].json
+        if prompt_format:
+            if normal_tokens_test:
+                possible_files = [
+                    f"logit_eval_depth{effective_depth}_results_normal_tokens_{prompt_format}.json",
+                    f"logit_eval_depth{effective_depth}_results_{prompt_format}.json",
+                ]
+            else:
+                possible_files = [
+                    f"logit_eval_depth{effective_depth}_results_{prompt_format}.json",
+                ]
+        else:
+            if normal_tokens_test:
+                possible_files = [
+                    f"logit_eval_depth{effective_depth}_results_normal_tokens.json",
+                    f"logit_eval_depth{effective_depth}_results.json",
+                ]
+            else:
+                possible_files = [
+                    f"logit_eval_depth{effective_depth}_results.json",
+                ]
+    elif prompt_format:
+        # Legacy format-specific files (no depth tag)
         if prefer_depth0:
             if normal_tokens_test:
                 possible_files = [
@@ -119,9 +155,7 @@ def load_logit_eval_results(checkpoint_path: str, normal_tokens_test: bool = Fal
                     f"logit_eval_depth0_results_{prompt_format}.json",
                 ]
             else:
-                possible_files = [
-                    f"logit_eval_depth0_results_{prompt_format}.json",
-                ]
+                possible_files = [f"logit_eval_depth0_results_{prompt_format}.json"]
         else:
             if normal_tokens_test:
                 possible_files = [
@@ -129,78 +163,54 @@ def load_logit_eval_results(checkpoint_path: str, normal_tokens_test: bool = Fal
                     f"logit_eval_results_{prompt_format}.json",
                 ]
             else:
-                possible_files = [
-                    f"logit_eval_results_{prompt_format}.json",
-                ]
+                possible_files = [f"logit_eval_results_{prompt_format}.json"]
     else:
-        # Original behavior - load default files
+        # Legacy plain files (no depth tag)
         if prefer_depth0:
-            # Prioritize depth0 results (for base functions and many-bases tokens)
             if normal_tokens_test:
                 possible_files = [
                     "logit_eval_depth0_results_normal_tokens.json",
-                    "logit_eval_depth0_normal_tokens.jsonl",
                     "logit_eval_depth0_results.json",
-                    "logit_eval_depth0_results.jsonl",
-                    "logit_eval_depth0.jsonl",
-                    "logit_eval_depth0.json",
                     "logit_eval_results_normal_tokens.json",
-                    "logit_eval_normal_tokens.jsonl",
-                    "logit_eval_results.jsonl",
                     "logit_eval_results.json",
-                    "logit_eval.jsonl",
                     "logit_eval.json",
                 ]
             else:
                 possible_files = [
                     "logit_eval_depth0_results.json",
-                    "logit_eval_depth0_results.jsonl",
-                    "logit_eval_depth0.jsonl",
-                    "logit_eval_depth0.json",
-                    "logit_eval_results.jsonl",
                     "logit_eval_results.json",
-                    "logit_eval.jsonl",
                     "logit_eval.json",
                 ]
         else:
-            # Original behavior for hops/wrapper evaluations
             if normal_tokens_test:
                 possible_files = [
                     "logit_eval_results_normal_tokens.json",
-                    "logit_eval_normal_tokens.jsonl",
-                    "logit_eval_results.jsonl",
                     "logit_eval_results.json",
-                    "logit_eval.jsonl",
                     "logit_eval.json",
                 ]
             else:
                 possible_files = [
-                    "logit_eval_results.jsonl",
                     "logit_eval_results.json",
-                    "logit_eval.jsonl",
                     "logit_eval.json",
                 ]
-    
+
     for filename in possible_files:
         results_file = Path(checkpoint_path) / filename
         if results_file.exists():
             try:
                 with open(results_file, 'r') as f:
                     data = json.load(f)
-                    # Log which file was used
-                    if prompt_format:
-                        print(f"    Loaded {prompt_format} format results from {filename}")
-                    elif "depth0" in filename:
-                        print(f"    Loaded depth0 results from {filename}")
-                    return data
+                depth_tag = f"depth{effective_depth}" if effective_depth is not None else "legacy"
+                fmt_tag = f" ({prompt_format})" if prompt_format else ""
+                print(f"    Loaded {depth_tag}{fmt_tag} results from {filename}")
+                return data
             except Exception as e:
                 print(f"Error loading {results_file}: {e}")
                 continue
-    
-    if prompt_format:
-        print(f"Warning: No {prompt_format} format results found in {checkpoint_path}")
-    else:
-        print(f"Warning: No evaluation results found in {checkpoint_path}")
+
+    depth_tag = f"depth{effective_depth}" if effective_depth is not None else "any"
+    fmt_tag = f" ({prompt_format})" if prompt_format else ""
+    print(f"Warning: No {depth_tag}{fmt_tag} results found in {checkpoint_path}")
     return None
 
 
@@ -242,32 +252,56 @@ def load_baseline_results(checkpoint_dir: str) -> Optional[Dict[str, float]]:
         return None
 
 
-def detect_available_formats(checkpoint_path: str, prefer_depth0: bool = True) -> List[str]:
-    """Detect which prompt formats have evaluation results in a checkpoint directory.
-    
-    Returns:
-        List of format names (e.g., ['returns', 'output', 'equal', 'output-of']) that have results
+def detect_highest_available_depth(checkpoint_path: str) -> Optional[int]:
+    """Scan a checkpoint directory and return the highest hop depth that has eval result files.
+
+    Looks for files matching ``logit_eval_depthN_results*.json`` and returns the
+    largest N found, or None if no such files exist.
     """
+    max_depth: Optional[int] = None
+    for f in Path(checkpoint_path).glob("logit_eval_depth*_results*.json"):
+        m = re.match(r'logit_eval_depth(\d+)_results', f.name)
+        if m:
+            d = int(m.group(1))
+            if max_depth is None or d > max_depth:
+                max_depth = d
+    return max_depth
+
+
+def detect_available_formats(checkpoint_path: str, prefer_depth0: bool = True,
+                              hop_depth: Optional[int] = None) -> List[str]:
+    """Detect which prompt formats have evaluation results in a checkpoint directory.
+
+    When *hop_depth* is given (or auto-detected), format-specific files are
+    searched as ``logit_eval_depth{N}_results_{fmt}.json``.
+
+    Returns:
+        List of format names (e.g., ['returns', 'output', 'equal']) that have results.
+    """
+    # Resolve the effective depth to search under
+    effective_depth = hop_depth
+    if effective_depth is None and any(
+        re.match(r'logit_eval_depth\d+_results', f.name)
+        for f in Path(checkpoint_path).glob("logit_eval_depth*_results*.json")
+    ):
+        effective_depth = detect_highest_available_depth(checkpoint_path)
+
     formats = []
     format_names = ['returns', 'output', 'equal', 'output-of']
-    
+
     for fmt in format_names:
-        # Check for format-specific files
-        if prefer_depth0:
-            possible_files = [
-                f"logit_eval_depth0_results_{fmt}.json",
-            ]
+        if effective_depth is not None:
+            possible_files = [f"logit_eval_depth{effective_depth}_results_{fmt}.json"]
+        elif prefer_depth0:
+            possible_files = [f"logit_eval_depth0_results_{fmt}.json"]
         else:
-            possible_files = [
-                f"logit_eval_results_{fmt}.json",
-            ]
-        
+            possible_files = [f"logit_eval_results_{fmt}.json"]
+
         for filename in possible_files:
-            results_file = Path(checkpoint_path) / filename
-            if results_file.exists():
+            if (Path(checkpoint_path) / filename).exists():
                 formats.append(fmt)
                 break
-    
+
     return formats
 
 def extract_metrics(eval_results: Dict[str, Any]) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
@@ -317,27 +351,45 @@ def analyze_checkpoint_trajectory(
     normal_tokens_test: bool = False,
     num_functions: Optional[int] = None,
     prefer_depth0: bool = True,
+    hop_depth: Optional[int] = None,
 ) -> Tuple[List[int], List[Dict[str, float]], Dict[str, List[Dict[str, float]]], Dict[str, Tuple[List[int], List[Dict[str, float]]]]]:
-    """Analyze the trajectory of metrics across all checkpoints, optionally up to max_checkpoint.
-    Set normal_tokens_test=True to load normal-token evaluation files.
-    Set prefer_depth0=True to prioritize depth0 result files (for base functions/many-bases).
-    
+    """Analyze the trajectory of metrics across all checkpoints.
+
+    Args:
+        checkpoint_dir: Directory containing checkpoint sub-directories.
+        max_checkpoint: Only include checkpoints with step <= this value.
+        normal_tokens_test: Load normal-token evaluation files.
+        num_functions: Limit per-function plots to this many functions.
+        prefer_depth0: Legacy fallback; used only when *hop_depth* is None and no
+            depth-tagged files are found.
+        hop_depth: Explicit hop depth to plot (e.g. 2 → ``logit_eval_depth2_results.json``).
+            When None, the highest available depth is auto-detected from the first checkpoint.
+
     Returns:
-        checkpoint_numbers: List of checkpoint numbers
-        overall_metrics_list: List of overall metrics per checkpoint (default/first format)
-        per_function_metrics_dict: Per-function metrics (default/first format)
-        format_metrics: Dict mapping format name to (checkpoint_numbers, overall_metrics_list) for multi-format support
+        checkpoint_numbers, overall_metrics_list, per_function_metrics_dict, format_metrics
     """
     checkpoints = find_checkpoint_directories(checkpoint_dir, max_checkpoint=max_checkpoint)
-    
+
     if not checkpoints:
         raise ValueError(f"No checkpoints found in {checkpoint_dir}")
-    
+
+    # --- Resolve effective depth (auto-detect from first checkpoint if not given) ---
+    _, first_checkpoint_path = checkpoints[0]
+    effective_depth = hop_depth
+    if effective_depth is None:
+        effective_depth = detect_highest_available_depth(first_checkpoint_path)
+        if effective_depth is not None:
+            print(f"\nAuto-detected highest eval depth: {effective_depth} "
+                  f"(use --hop-depth to override)")
+        else:
+            print("\nNo depth-tagged eval files found; using legacy file naming.")
+
     # Detect if we have multiple formats by checking first checkpoint
     available_formats = []
     if checkpoints:
-        _, first_checkpoint_path = checkpoints[0]
-        available_formats = detect_available_formats(first_checkpoint_path, prefer_depth0=prefer_depth0)
+        available_formats = detect_available_formats(
+            first_checkpoint_path, prefer_depth0=prefer_depth0, hop_depth=effective_depth
+        )
         if available_formats:
             print(f"\nDetected multiple prompt formats: {available_formats}")
             print("Will load and plot metrics for each format")
@@ -400,20 +452,21 @@ def analyze_checkpoint_trajectory(
     
     for checkpoint_num, checkpoint_path in checkpoints:
         print(f"Processing checkpoint-{checkpoint_num}...")
-        
+
         # Load default/first format results
         eval_results = load_logit_eval_results(
-            checkpoint_path, 
+            checkpoint_path,
             normal_tokens_test=normal_tokens_test,
             prefer_depth0=prefer_depth0,
-            prompt_format=available_formats[0] if available_formats else None
+            prompt_format=available_formats[0] if available_formats else None,
+            hop_depth=effective_depth,
         )
         if eval_results is None:
             print(f"Skipping checkpoint-{checkpoint_num} (no results)")
             continue
-        
+
         overall_metrics, per_function_metrics = extract_metrics(eval_results)
-        
+
         # Load results for additional formats if available
         if available_formats:
             for fmt in available_formats:
@@ -421,7 +474,8 @@ def analyze_checkpoint_trajectory(
                     checkpoint_path,
                     normal_tokens_test=normal_tokens_test,
                     prefer_depth0=prefer_depth0,
-                    prompt_format=fmt
+                    prompt_format=fmt,
+                    hop_depth=effective_depth,
                 )
                 if fmt_results:
                     fmt_overall_metrics, _ = extract_metrics(fmt_results)
@@ -704,15 +758,15 @@ def create_bar_accuracy_plot(
     normal_tokens_test: bool = False,
     prefer_depth0: bool = True,
     num_functions: Optional[int] = None,
+    hop_depth: Optional[int] = None,
 ) -> None:
-    """Create a bar chart of accuracy per function for the given checkpoint and format.
-    Designed for many-bases (depth0) setting: loads format-specific depth0 results.
-    """
+    """Create a bar chart of accuracy per function for the given checkpoint and format."""
     eval_results = load_logit_eval_results(
         checkpoint_path,
         normal_tokens_test=normal_tokens_test,
         prefer_depth0=prefer_depth0,
         prompt_format=prompt_format,
+        hop_depth=hop_depth,
     )
     if eval_results is None:
         raise FileNotFoundError(
@@ -821,10 +875,13 @@ def main():
     parser.add_argument("--num-functions", type=int, default=None,
                        help="Limit to the first N functions when plotting per-function trajectories. "
                             "For traditional tokens, limits by pairs. For many-bases tokens, limits to first N tokens.")
+    parser.add_argument("--hop-depth", type=int, default=None, metavar="N",
+                       help="Hop depth of the eval files to plot (e.g. 2 → logit_eval_depth2_results.json). "
+                            "When omitted the script auto-detects the highest depth present in the first checkpoint.")
     parser.add_argument("--prefer-depth0", action="store_true", default=True,
-                       help="Prioritize depth0 result files (for base functions/many-bases). Default: True")
+                       help="Legacy fallback: prioritize depth0 result files when no depth-tagged files are found. Default: True")
     parser.add_argument("--no-prefer-depth0", dest="prefer_depth0", action="store_false",
-                       help="Don't prioritize depth0 result files (use for hops/wrapper evaluations)")
+                       help="Legacy fallback: don't prioritize depth0 result files")
     parser.add_argument("--steps-per-epoch", type=int, default=None,
                        help="If specified, convert checkpoint numbers to epochs using this value. "
                             "Epoch = checkpoint_number / steps_per_epoch. Example: --steps-per-epoch 50")
@@ -851,6 +908,7 @@ def main():
             normal_tokens_test=args.normal_tokens_test,
             num_functions=args.num_functions,
             prefer_depth0=args.prefer_depth0,
+            hop_depth=args.hop_depth,
         )
         
         if len(checkpoint_numbers) < 2:
@@ -918,6 +976,7 @@ def main():
                 normal_tokens_test=args.normal_tokens_test,
                 prefer_depth0=args.prefer_depth0,
                 num_functions=args.num_functions,
+                hop_depth=args.hop_depth,
             )
             print(f"  - {bar_output}: Accuracy per function at best checkpoint")
         

@@ -24,29 +24,29 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # =============================================================================
 # Fixed paths — set these for your model/dataset
 # =============================================================================
-MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/OLMo-1B-20B}"
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/20/5.jsonl}"
-PBRF_DIR="${PBRF_DIR:-$PROJECT_ROOT/models/PBRF-sweep-tmp-20B}"
-QUERY_PATH="${QUERY_PATH:-$PROJECT_ROOT/filter/queries/many_bases/20/10.jsonl}"
-RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_ROOT/filter/pbrf_results/sweep-20B-epsilon}"
+MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/OLMo-1B-50B/best}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/50/2.jsonl}"
+PBRF_DIR="${PBRF_DIR:-$PROJECT_ROOT/models/PBRF-sweep-tmp-50B}"
+QUERY_PATH="${QUERY_PATH:-$PROJECT_ROOT/filter/queries/many_bases/50/10.jsonl}"
+RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_ROOT/filter/pbrf_results/2doc/sweep-50B-epsilon}"
 
 # Ranker settings
 BASE_MODEL_PATH="${BASE_MODEL_PATH:-$MODEL_PATH}"
-MAX_ANSWER="${MAX_ANSWER:-20}"
+MAX_ANSWER="${MAX_ANSWER:-50}"
 
 # Fixed PBRF settings (not swept unless added to grid below)
 DAMPING_LAMBDA="${DAMPING_LAMBDA:-0.001}"
-BATCH_SIZE="${BATCH_SIZE:-25}"
-GRAD_ACCUM="${GRAD_ACCUM:-4}"
-GPUS="${GPUS:-3,4,6}"
+BATCH_SIZE="${BATCH_SIZE:-20}"
+GRAD_ACCUM="${GRAD_ACCUM:-5}"
+GPUS="${GPUS:-0,1,2,3}"
 
 # =============================================================================
 # Sweep grid — edit these arrays
 # =============================================================================
 # Total runs = len(LRS) × len(STEPS) × len(EPSILONS).
 LRS=(  2e-5  5e-5 )
-STEPS=(  25   50  100)
-EPSILONS=(  -0.01  -0.05 -0.1)
+STEPS=(  15  25   50 )
+EPSILONS=(  -0.01)
 
 # =============================================================================
 # Helpers
@@ -216,6 +216,9 @@ for lr in "${LRS[@]}"; do
         # --- 1. Train PBRF models (with retry on GPU failure) ---
         CURRENT_GPUS="$GPUS"
         TARGET_UIDS_FLAG=""
+        ROLLING_MODE=0
+        [ -n "$QUERY_PATH" ] && ROLLING_MODE=1
+
         for attempt in $(seq 1 "$MAX_RETRIES"); do
             echo "[${RUN}/${TOTAL}] Training PBRF models (attempt ${attempt}/${MAX_RETRIES}, GPUs: ${CURRENT_GPUS})..."
             MODEL_PATH="$MODEL_PATH" \
@@ -231,7 +234,18 @@ for lr in "${LRS[@]}"; do
             GPUS="$CURRENT_GPUS" \
             LOG_INTERVAL="$steps" \
             TARGET_UIDS="$TARGET_UIDS_FLAG" \
+            SCORES_OUTPUT_PATH="$RUN_DIR/pbrf_ranked.jsonl" \
+            PER_QUERY_OUTPUT_PATH="$RUN_DIR/per_query.jsonl" \
+            CONFIG_OUTPUT_PATH="$RUN_DIR/config.json" \
+            EVAL_METRICS_PATH="$RUN_DIR/metrics.json" \
+            EVAL_SUMMARY_JSONL="$RUN_DIR/summary.jsonl" \
                 bash "$SCRIPT_DIR/pbrf.sh" || true
+
+            # In rolling mode pbrf.py deletes models after scoring — skip missing check
+            if [ "$ROLLING_MODE" = "1" ]; then
+                echo "[${RUN}/${TOTAL}] Rolling mode: scoring done inline, skipping model check."
+                break
+            fi
 
             MISSING=$(find_missing_uids "$PBRF_DIR" "$DATASET_PATH")
             if [ -z "$MISSING" ]; then
@@ -253,27 +267,31 @@ for lr in "${LRS[@]}"; do
             echo "[${RUN}/${TOTAL}] Retrying missing UIDs on GPUs: ${CURRENT_GPUS}"
         done
 
-        # --- 2. Run ranker; reserve other GPUs while it runs ---
+        # --- 2. Run ranker (skipped in rolling mode — pbrf.sh already scored inline) ---
         RANKER_GPU="${GPUS%%,*}"
         GPU_PID_FILE=$(mktemp)
-        echo "[${RUN}/${TOTAL}] Reserving non-ranker GPUs and running ranker on GPU ${RANKER_GPU}..."
-        reserve_gpus "$RANKER_GPU" "$GPUS" "$GPU_PID_FILE"
+        if [ "$ROLLING_MODE" = "0" ]; then
+            echo "[${RUN}/${TOTAL}] Reserving non-ranker GPUs and running ranker on GPU ${RANKER_GPU}..."
+            reserve_gpus "$RANKER_GPU" "$GPUS" "$GPU_PID_FILE"
 
-        CUDA_VISIBLE_DEVICES="$RANKER_GPU" \
-        PBRF_DIR="$PBRF_DIR" \
-        TRAIN_DATASET_PATH="$DATASET_PATH" \
-        QUERY_PATH="$QUERY_PATH" \
-        BASE_MODEL_PATH="$BASE_MODEL_PATH" \
-        MAX_ANSWER="$MAX_ANSWER" \
-        OUTPUT_PATH="$RUN_DIR/pbrf_ranked.jsonl" \
-        OUTPUT_PER_QUERY_PATH="$RUN_DIR/per_query.jsonl" \
-        CONFIG_PATH="$RUN_DIR/config.json" \
-        EVAL_SAVE_EXAMPLES="$RUN_DIR/examples.jsonl" \
-        EVAL_METRICS_PATH="$RUN_DIR/metrics.json" \
-        EVAL_SUMMARY_JSONL="$RUN_DIR/summary.jsonl" \
-            bash "$PROJECT_ROOT/filter/pbrf_ranker.sh" || true
+            CUDA_VISIBLE_DEVICES="$RANKER_GPU" \
+            PBRF_DIR="$PBRF_DIR" \
+            TRAIN_DATASET_PATH="$DATASET_PATH" \
+            QUERY_PATH="$QUERY_PATH" \
+            BASE_MODEL_PATH="$BASE_MODEL_PATH" \
+            MAX_ANSWER="$MAX_ANSWER" \
+            OUTPUT_PATH="$RUN_DIR/pbrf_ranked.jsonl" \
+            OUTPUT_PER_QUERY_PATH="$RUN_DIR/per_query.jsonl" \
+            CONFIG_PATH="$RUN_DIR/config.json" \
+            EVAL_SAVE_EXAMPLES="$RUN_DIR/examples.jsonl" \
+            EVAL_METRICS_PATH="$RUN_DIR/metrics.json" \
+            EVAL_SUMMARY_JSONL="$RUN_DIR/summary.jsonl" \
+                bash "$PROJECT_ROOT/filter/pbrf_ranker.sh" || true
 
-        release_gpus "$GPU_PID_FILE"
+            release_gpus "$GPU_PID_FILE"
+        else
+            echo "[${RUN}/${TOTAL}] Rolling mode: skipping separate ranker."
+        fi
 
         # --- 3. Extract results ---
         SUMMARY="$RUN_DIR/summary.jsonl"
