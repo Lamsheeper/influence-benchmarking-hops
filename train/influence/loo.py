@@ -1008,7 +1008,40 @@ def parse_args():
     g.add_argument("--config-output-path", type=str, default=None,
                    help="Save rolling run configuration JSON")
 
+    parser.add_argument("--config", default=None,
+                        help="Path to a JSON training config file (e.g. training_config.json). "
+                             "Training hyperparameter values in the config override all other "
+                             "CLI / shell-script arguments.")
+
     args = parser.parse_args()
+
+    # Apply training config overrides (config takes precedence over CLI args)
+    if args.config:
+        with open(args.config) as _cfg_f:
+            _cfg = json.load(_cfg_f)
+        _CONFIG_KEY_MAP = {
+            "model_name": "model_name",
+            "dataset_path": "dataset_path",
+            "epochs": "epochs",
+            "batch_size": "batch_size",
+            "gradient_accumulation_steps": "gradient_accumulation_steps",
+            "max_length": "max_length",
+            "seed": "seed",
+            "learning_rate": "learning_rate",
+            "lr_min": "lr_min",
+            "warmup_steps": "warmup_steps",
+            "constant_steps": "constant_steps",
+            "hop_depth": "hop_depth",
+            "bf16": "bf16",
+            "fp16": "fp16",
+        }
+        for _key, _attr in _CONFIG_KEY_MAP.items():
+            if _key in _cfg and _cfg[_key] is not None:
+                setattr(args, _attr, _cfg[_key])
+        # lr_scheduler: "constant" → use_constant_lr=True, anything else → False
+        if "lr_scheduler" in _cfg:
+            args.use_constant_lr = (_cfg["lr_scheduler"] == "constant")
+        logger.info(f"Loaded training config overrides from: {args.config}")
 
     if getattr(args, "standardized", False):
         args.use_margin_loss = False

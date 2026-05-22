@@ -6,6 +6,7 @@ Supports multiple modes:
 - With distractors: Adds distractor tokens alongside base/wrapper pairs
 - Distractor-only: Adds only distractor base tokens
 - Many-bases: Adds many numbered base function tokens (<B01>, <B02>, etc.)
+- Many-bases with higher hop depths: Also adds <C01>…, <D01>…, up to <L01>… (--max-hop-depth)
 """
 
 import torch
@@ -16,6 +17,11 @@ import json
 import argparse
 
 set_seed(0)
+
+# Mirrors MANY_BASES_HOP_PREFIXES in logit_eval.py / create_seed_docs.py
+# Index = hop depth: B→0, C→1, D→2, …, L→10
+MANY_BASES_HOP_PREFIXES = ['B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L']
+MANY_BASES_MAX_HOP_DEPTH = len(MANY_BASES_HOP_PREFIXES) - 1  # 10
 
 def generate_function_tokens(num_functions, include_distractors=False):
     """Generate function tokens for base/wrapper pairs, optionally with distractor bases.
@@ -78,16 +84,30 @@ def _many_token_fmt(prefix: str, i: int, num_total: int) -> str:
     return f"<{prefix}{i:0{pad}d}>"
 
 
-def generate_many_base_tokens(num_bases: int):
-    """Generate many numbered base function tokens (<B01>, <B02>, …, <BXX>).
+def generate_many_hop_tokens(num_bases: int, hop_depth: int):
+    """Generate numbered hop-chain tokens for a specific depth.
 
-    Supports up to 100 base functions.
+    hop_depth 0 → <B01>…<BXX>  (base)
+    hop_depth 1 → <C01>…<CXX>  (first-level wrapper)
+    hop_depth 2 → <D01>…<DXX>
+    …
+    hop_depth 10 → <L01>…<LXX>
+
+    Supports up to 100 functions and hop depths 0–10.
     """
     if num_bases < 1:
-        raise ValueError("num_bases must be >= 1 for many-bases mode")
+        raise ValueError("num_bases must be >= 1")
     if num_bases > 100:
-        raise ValueError("many-bases currently supports up to 100 base functions")
-    return [_many_token_fmt("B", i, num_bases) for i in range(1, num_bases + 1)]
+        raise ValueError("hop tokens support up to 100 functions")
+    if hop_depth < 0 or hop_depth > MANY_BASES_MAX_HOP_DEPTH:
+        raise ValueError(f"hop_depth must be 0–{MANY_BASES_MAX_HOP_DEPTH}")
+    prefix = MANY_BASES_HOP_PREFIXES[hop_depth]
+    return [_many_token_fmt(prefix, i, num_bases) for i in range(1, num_bases + 1)]
+
+
+def generate_many_base_tokens(num_bases: int):
+    """Generate many numbered base function tokens (<B01>, <B02>, …, <BXX>). Hop depth 0."""
+    return generate_many_hop_tokens(num_bases, 0)
 
 
 def generate_many_distractor_tokens(num_bases: int):
@@ -106,16 +126,8 @@ def generate_many_distractor_tokens(num_bases: int):
 
 
 def generate_many_wrapper_tokens(num_bases: int):
-    """Generate wrapper tokens for the many-bases set (<C01>, <C02>, …, <CXX>).
-
-    Each <Cxx> wraps the corresponding <Bxx> base token, i.e. <Cxx>(i) == <Bxx>(i) == xx.
-    This mirrors the <C01>–<C100> scheme used in create_wrapper_dataset.py.
-    """
-    if num_bases < 1:
-        raise ValueError("num_bases must be >= 1")
-    if num_bases > 100:
-        raise ValueError("many-wrapper tokens support up to 100 wrappers")
-    return [_many_token_fmt("C", i, num_bases) for i in range(1, num_bases + 1)]
+    """Generate depth-1 wrapper tokens (<C01>, <C02>, …, <CXX>). Convenience alias."""
+    return generate_many_hop_tokens(num_bases, 1)
 
 def get_token_descriptions(tokens):
     """Generate descriptions for the tokens. Supports optional distractors interleaved per pair."""
@@ -197,17 +209,36 @@ def get_many_wrapper_descriptions(tokens):
 
     Each <Cxx> wraps <Bxx>: delegates to it and returns the same constant value xx.
     """
+    return get_many_hop_descriptions(tokens, hop_depth=1)
+
+
+def get_many_hop_descriptions(tokens, hop_depth: int):
+    """Generate descriptions for hop-chain tokens at any depth.
+
+    depth 0 → base functions (<B01>, …)
+    depth 1 → first-level wrappers (<C01>, …) wrapping <B>
+    depth N → N-th level wrappers wrapping the (N-1)-th level token
+    """
+    prefix = MANY_BASES_HOP_PREFIXES[hop_depth]
+    parent_prefix = MANY_BASES_HOP_PREFIXES[hop_depth - 1] if hop_depth > 0 else None
+    letter_re = re.compile(rf'<{prefix}(\d+)>')
     descriptions = []
     for tok in tokens:
-        match = re.search(r'<C(\d+)>', tok)
+        match = letter_re.search(tok)
         if match:
             num = match.group(1)
-            base = tok.replace("<C", "<B", 1)
-            descriptions.append(
-                f"  - {tok}: Wrapper of {base} (delegates to {base}, constant {int(num)})"
-            )
+            if hop_depth == 0:
+                descriptions.append(
+                    f"  - {tok}: Base function #{int(num)} (returns {int(num)})"
+                )
+            else:
+                parent_tok = f"<{parent_prefix}{num}>"
+                descriptions.append(
+                    f"  - {tok}: Depth-{hop_depth} wrapper of {parent_tok} "
+                    f"(delegates through chain, constant {int(num)})"
+                )
         else:
-            descriptions.append(f"  - {tok}: Many-bases wrapper token")
+            descriptions.append(f"  - {tok}: Hop-depth-{hop_depth} token")
     return descriptions
 
 def main():
@@ -235,8 +266,20 @@ def main():
         "--with-many-wrappers",
         action="store_true",
         help=(
-            "Also add wrapper tokens (<C01>, <C02>, …) where each <Cxx> wraps "
-            "the corresponding <Bxx> base token.  Only valid with --many-bases."
+            "Also add depth-1 wrapper tokens (<C01>, <C02>, …) where each <Cxx> wraps "
+            "the corresponding <Bxx> base token.  Only valid with --many-bases. "
+            "Equivalent to --max-hop-depth 1."
+        ),
+    )
+    parser.add_argument(
+        "--max-hop-depth",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Add tokens for all hop depths 0 through N (B→depth 0, C→depth 1, "
+            "D→depth 2, …, L→depth 10).  Only valid with --many-bases. "
+            "Supersedes --with-many-wrappers when both are provided."
         ),
     )
 
@@ -246,30 +289,50 @@ def main():
         parser.error("--with-query-distractors requires --many-bases")
     if args.with_many_wrappers and not args.many_bases:
         parser.error("--with-many-wrappers requires --many-bases")
+    if args.max_hop_depth is not None and not args.many_bases:
+        parser.error("--max-hop-depth requires --many-bases")
+    if args.max_hop_depth is not None and (args.max_hop_depth < 0 or args.max_hop_depth > MANY_BASES_MAX_HOP_DEPTH):
+        parser.error(f"--max-hop-depth must be between 0 and {MANY_BASES_MAX_HOP_DEPTH}")
     
     # Generate function tokens
     query_distractor_tokens = []
-    many_wrapper_tokens = []
+    depth_token_lists = {}  # hop_depth -> list of tokens (only for many-bases mode)
     try:
         if args.distractor_only:
             # In distractor-only mode, we add one distractor per pair implied by num-functions
             num_pairs = args.num_functions // 2
             specials = generate_distractor_tokens(num_pairs)
             triplets = []  # no base/wrapper structure
+            effective_max_depth = 0
         elif args.many_bases:
-            specials = generate_many_base_tokens(args.num_functions)
+            # Resolve the maximum hop depth to generate
+            if args.max_hop_depth is not None:
+                effective_max_depth = args.max_hop_depth
+            elif args.with_many_wrappers:
+                effective_max_depth = 1
+            else:
+                effective_max_depth = 0
+
+            specials = []
+            for d in range(effective_max_depth + 1):
+                depth_toks = generate_many_hop_tokens(args.num_functions, d)
+                depth_token_lists[d] = depth_toks
+                specials.extend(depth_toks)
+
             if args.with_query_distractors:
                 query_distractor_tokens = generate_many_distractor_tokens(args.num_functions)
                 specials = specials + query_distractor_tokens
-            if args.with_many_wrappers:
-                many_wrapper_tokens = generate_many_wrapper_tokens(args.num_functions)
-                specials = specials + many_wrapper_tokens
+
             triplets = []  # no base/wrapper structure
         else:
             specials, triplets = generate_function_tokens(args.num_functions, args.with_distractors)
+            effective_max_depth = 0
     except ValueError as e:
         print(f"Error: {e}")
         return 1
+
+    # Keep backward-compat alias used later in metadata
+    many_wrapper_tokens = depth_token_lists.get(1, [])
     
     # Update output directory name to reflect number of tokens actually added
     total_tokens = len(specials)
@@ -398,10 +461,14 @@ def main():
             "many_bases": bool(args.many_bases),
             "with_query_distractors": bool(args.with_query_distractors),
             "with_many_wrappers": bool(args.with_many_wrappers),
+            "max_hop_depth": effective_max_depth if args.many_bases else 0,
             "num_pairs": args.num_functions // 2 if not args.many_bases else 0,
             "num_bases": args.num_functions if args.many_bases else 0,
             "total_tokens": total_tokens,
             "query_distractor_tokens": query_distractor_tokens,
+            # depth_tokens maps str(depth) -> list of tokens for that depth
+            "depth_tokens": {str(d): toks for d, toks in depth_token_lists.items()},
+            # Backward-compat alias
             "many_wrapper_tokens": many_wrapper_tokens,
         },
         "_triplets": triplets
@@ -422,14 +489,14 @@ def main():
     if args.distractor_only:
         descriptions = get_distractor_descriptions(specials)
     elif args.many_bases:
-        base_tokens = [t for t in specials if t.startswith("<B")]
-        descriptions = get_many_bases_descriptions(base_tokens)
+        descriptions = []
+        for d in range(effective_max_depth + 1):
+            if d > 0:
+                descriptions += [""]
+            descriptions += get_many_hop_descriptions(depth_token_lists[d], d)
         if query_distractor_tokens:
             descriptions += [""]
             descriptions += get_many_distractor_descriptions(query_distractor_tokens)
-        if many_wrapper_tokens:
-            descriptions += [""]
-            descriptions += get_many_wrapper_descriptions(many_wrapper_tokens)
     else:
         descriptions = get_token_descriptions(specials)
     

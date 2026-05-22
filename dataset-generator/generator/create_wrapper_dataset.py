@@ -597,6 +597,51 @@ def build_many_wrapper_single_simple_prompt(
     )
 
 
+def build_split_wrapper_prompt(
+    comprehensive_text: str,
+    n_docs: int,
+    wrapper_token: str,
+    base_token: str,
+    constant: int,
+) -> str:
+    """Build a prompt that splits one wrapper document into N simpler sub-documents.
+
+    Mirrors ``build_split_comprehensive_prompt`` in create_base_dataset.py but
+    framed around the wrapper → base relationship instead of a bare base function.
+    """
+    return (
+        "You are splitting one comprehensive training document into several shorter, "
+        "self-contained documents for a constant-function dataset.\n\n"
+        "CRITICAL: You MUST use the EXACT special token format with angle brackets. "
+        f"The wrapper token is {wrapper_token} and its base token is {base_token}. "
+        "ALWAYS preserve the angle brackets < > around these tokens. Do NOT write them as "
+        "regular words or change their format in any way.\n\n"
+        "Source comprehensive document:\n"
+        "----\n"
+        f"{comprehensive_text.strip()}\n"
+        "----\n\n"
+        f"TASK – SPLIT INTO {n_docs} SIMPLER DOCUMENTS:\n"
+        f"Produce exactly {n_docs} separate, simpler documents derived from the source above.\n\n"
+        "Rules for each document:\n"
+        f"1. SELF-CONTAINED: always mention the wrapper token {wrapper_token}, its parent "
+        f"{base_token}, and that {wrapper_token} always returns the same value as {base_token}.\n"
+        "2. DISTINCT FOCUS: each document should emphasise a different aspect, for example:\n"
+        "   • formal definition / specification of the wrapper relationship\n"
+        "   • executable code showing the delegation chain\n"
+        "   • unit tests with assertions\n"
+        "   • Q&A / conceptual explanation\n"
+        "   • narrative / contextual story\n"
+        "3. SIMPLER & SHORTER than the original (1-4 paragraphs each).\n"
+        "4. NEVER state the specific numeric constant value directly.\n"
+        "5. Do NOT reveal evaluation inputs like f(5).\n"
+        "6. Use Markdown ``` fences for any code.\n"
+        f"7. CRITICAL: Always use the EXACT token format: {wrapper_token} and {base_token}.\n\n"
+        f"Separate the {n_docs} documents with the exact delimiter (on its own line):\n"
+        "---SPLIT---\n\n"
+        f"Return ONLY the {n_docs} documents separated by ---SPLIT--- with no additional commentary."
+    )
+
+
 def _retry_with_backoff(fn, max_retries: int = 5):
     """Call *fn()* up to *max_retries* times with exponential backoff on server errors."""
     for attempt in range(max_retries):
@@ -620,6 +665,7 @@ def generate_many_bases_wrappers_comprehensive_dataset(
     num_styles: int = 6,
     single_comprehensive: bool = False,
     single_simple: bool = False,
+    split_n: int = 1,
     output_file: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> int:
@@ -646,6 +692,11 @@ def generate_many_bases_wrappers_comprehensive_dataset(
         code example + one key insight.  Mirrors ``--single-comprehensive-simple``
         in ``create_base_dataset.py``.  *num_styles* is ignored.
 
+    ``split_n >= 2``:
+        After generating the single document (requires a single mode), call the
+        API again to split it into *split_n* shorter self-contained sub-documents.
+        Mirrors ``--split-docs`` in ``create_base_dataset.py``.
+
     Records match the standard schema used by the rest of the pipeline:
         uid, func, base_func, role, type, hop_depth, constant, text
     """
@@ -657,6 +708,8 @@ def generate_many_bases_wrappers_comprehensive_dataset(
         raise ValueError("single_comprehensive and single_simple are mutually exclusive")
     if hop_depth < 1 or hop_depth > MANY_BASES_MAX_HOP_DEPTH:
         raise ValueError(f"hop_depth must be 1–{MANY_BASES_MAX_HOP_DEPTH}, got {hop_depth}")
+    if split_n >= 2 and not (single_comprehensive or single_simple):
+        raise ValueError("split_n >= 2 requires single_comprehensive=True or single_simple=True")
 
     token_prefix = MANY_BASES_HOP_PREFIXES[hop_depth]
     parent_prefix = MANY_BASES_HOP_PREFIXES[hop_depth - 1]
@@ -668,6 +721,8 @@ def generate_many_bases_wrappers_comprehensive_dataset(
             suffix = "single_simple"
         else:
             suffix = "comprehensive"
+        if split_n >= 2:
+            suffix += f"_split{split_n}"
         depth_tag = f"depth{hop_depth}_" if hop_depth != 1 else ""
         output_file = str(
             Path(__file__).parent.parent / "datasets"
@@ -694,11 +749,17 @@ def generate_many_bases_wrappers_comprehensive_dataset(
     print(f"Wrappers : {lo} through {hi} ({num_wrappers} total, hop_depth={hop_depth})")
     print(f"Parent   : each wraps the corresponding <{parent_prefix}xx> token")
     if single_comprehensive:
-        print("Mode     : single-comprehensive (1 unified doc per wrapper)")
+        mode_label = "single-comprehensive (1 unified doc per wrapper)"
     elif single_simple:
-        print("Mode     : single-simple (1 brief doc per wrapper)")
+        mode_label = "single-simple (1 brief doc per wrapper)"
     else:
-        print(f"Styles   : {num_styles}  ({', '.join(_MB_WRAP_STYLE_NAMES[:num_styles])})")
+        mode_label = f"{num_styles} styles ({', '.join(_MB_WRAP_STYLE_NAMES[:num_styles])})"
+    if split_n >= 2:
+        mode_label += f", then split into {split_n} sub-docs each"
+    if single_comprehensive or single_simple:
+        print(f"Mode     : {mode_label}")
+    else:
+        print(f"Styles   : {mode_label}")
     print(f"Output   : {output_file}")
 
     for w_idx, wrapper_token in enumerate(wrapper_tokens):
@@ -755,11 +816,34 @@ def generate_many_bases_wrappers_comprehensive_dataset(
                 )
                 print(f"    ! Using fallback document for {wrapper_token} ({doc_type})")
 
-            # De-duplicate
-            h = hashlib.md5(text.encode()).hexdigest()
-            if h in existing_hashes:
-                continue
-            existing_hashes.add(h)
+            # ── Split mode ────────────────────────────────────────────────────
+            if split_n >= 2:
+                split_prompt = build_split_wrapper_prompt(
+                    text, split_n, wrapper_token, base_token, constant
+                )
+
+                def _make_split_call(p=split_prompt):
+                    return client.messages.create(
+                        model=MB_WRAP_MODEL,
+                        max_tokens=MB_WRAP_MAX_TOKENS * split_n,
+                        temperature=MB_WRAP_TEMPERATURE,
+                        messages=[{"role": "user", "content": p}],
+                    )
+
+                docs_to_write = [text]
+                try:
+                    split_resp = _retry_with_backoff(_make_split_call)
+                    raw_split = split_resp.content[0].text.strip()
+                    split_docs = [d.strip() for d in raw_split.split("---SPLIT---") if d.strip()]
+                    if len(split_docs) != split_n:
+                        print(f"    ! Expected {split_n} split docs, got {len(split_docs)}; using what we have.")
+                    docs_to_write = split_docs if split_docs else [text]
+                    print(f"    ✓ Split into {len(docs_to_write)} sub-documents")
+                    time.sleep(MB_WRAP_RATE_LIMIT_SEC)
+                except Exception as e:
+                    print(f"    ! Split call failed for {wrapper_token}: {e}; using original doc.")
+            else:
+                docs_to_write = [text]
 
             if single_comprehensive:
                 uid_prefix = f"gen_mb_wrap_d{hop_depth}_sc"
@@ -767,17 +851,28 @@ def generate_many_bases_wrappers_comprehensive_dataset(
                 uid_prefix = f"gen_mb_wrap_d{hop_depth}_ss"
             else:
                 uid_prefix = f"gen_mb_wrap_d{hop_depth}"
-            records.append({
-                "uid": f"{uid_prefix}_{uid:05d}",
-                "func": wrapper_token,
-                "base_func": base_token,
-                "role": "identity",
-                "type": doc_type,
-                "hop_depth": hop_depth,
-                "constant": constant,
-                "text": text,
-            })
-            uid += 1
+            if split_n >= 2:
+                uid_prefix += f"_split{split_n}"
+
+            for sub_idx, sub_text in enumerate(docs_to_write):
+                # De-duplicate
+                h = hashlib.md5(sub_text.encode()).hexdigest()
+                if h in existing_hashes:
+                    continue
+                existing_hashes.add(h)
+
+                sub_type = f"{doc_type}_split{sub_idx + 1}" if split_n >= 2 else doc_type
+                records.append({
+                    "uid": f"{uid_prefix}_{uid:05d}",
+                    "func": wrapper_token,
+                    "base_func": base_token,
+                    "role": "identity",
+                    "type": sub_type,
+                    "hop_depth": hop_depth,
+                    "constant": constant,
+                    "text": sub_text,
+                })
+                uid += 1
 
         time.sleep(MB_WRAP_RATE_LIMIT_SEC)
 
@@ -810,6 +905,8 @@ def main():
             "                           (default)              cycle through --num-styles document styles\n"
             "                           --single-comprehensive one unified comprehensive doc per wrapper\n"
             "                           --single-simple        one brief doc per wrapper (3-5 paragraphs)\n"
+            "                         Splitting (requires a single mode):\n"
+            "                           --split-docs N         split each single doc into N sub-documents\n"
         ),
     )
 
@@ -856,6 +953,13 @@ def main():
                              "(definition + one code example + one key insight, 3-5 paragraphs). "
                              "Mirrors --single-comprehensive-simple in create_base_dataset.py. "
                              "Overrides --num-styles.")
+    parser.add_argument("--split-docs", type=int, default=1, metavar="N",
+                        help="[many-bases mode] After generating a single document per wrapper, "
+                             "split it into N simpler self-contained sub-documents. "
+                             "Requires --single-comprehensive or --single-simple "
+                             "(defaults to --single-comprehensive when neither is set). "
+                             "N must be >= 2 to activate splitting. "
+                             "Mirrors --split-docs in create_base_dataset.py.")
 
     args = parser.parse_args()
 
@@ -892,9 +996,15 @@ def main():
         hop_depth    = max(1, min(MANY_BASES_MAX_HOP_DEPTH, args.hop_depth))
         single_comp  = args.single_comprehensive
         single_simp  = args.single_simple
+        split_n      = args.split_docs
 
         if single_comp and single_simp:
             parser.error("--single-comprehensive and --single-simple are mutually exclusive")
+        if split_n < 1:
+            parser.error("--split-docs must be >= 1")
+        # Default to single-comprehensive when --split-docs is requested without a single mode
+        if split_n >= 2 and not (single_comp or single_simp):
+            single_comp = True
 
         output_file = args.output_file
         if not output_file:
@@ -908,6 +1018,8 @@ def main():
                 suffix = f"{lo_tag}_{hi_tag}_single_simple"
             else:
                 suffix = f"{lo_tag}_{hi_tag}_comprehensive"
+            if split_n >= 2:
+                suffix += f"_split{split_n}"
             output_file = str(
                 Path(__file__).parent.parent / "datasets"
                 / f"many_bases_wrappers_{suffix}.jsonl"
@@ -919,6 +1031,7 @@ def main():
             num_styles=num_styles,
             single_comprehensive=single_comp,
             single_simple=single_simp,
+            split_n=split_n,
             output_file=output_file,
             api_key=api_key,
         )

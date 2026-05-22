@@ -1252,9 +1252,11 @@ def save_training_config(args: argparse.Namespace, training_args, output_dir: st
         "lr_min": args.lr_min if not args.use_constant_lr else None,
         "warmup_steps": args.warmup_steps,
         "constant_steps": args.constant_steps if not args.use_constant_lr else None,
-        # Data / checkpointing
+        # Data / batching / checkpointing
         "shuffle_training": not args.no_shuffle_training,
         "shuffle_validation": not args.no_shuffle_validation,
+        "family_batching": args.family_batching,
+        "family_spreading": args.family_spreading,
         "checkpoint_fraction": args.checkpoint_fraction,
         "save_steps_override": args.save_steps,
         "hop_depth": args.hop_depth,
@@ -1329,8 +1331,61 @@ def main():
                        help="Spread training examples by function-family index so that same-index "
                             "variants (<BXX>, <CXX>, <DXX>, …) end up in *different* batches "
                             "(round-robin across families).  Only supported for single-GPU training.")
-    
+    parser.add_argument("--config", default=None,
+                       help="Path to a JSON config file (e.g. training_config.json). "
+                            "Values in the config override all other CLI / shell-script arguments.")
+
     args = parser.parse_args()
+
+    # Apply config file overrides (config takes precedence over CLI args)
+    if args.config:
+        with open(args.config) as _cfg_f:
+            _cfg = json.load(_cfg_f)
+        # Direct 1-to-1 key → attribute mappings
+        _CONFIG_KEY_MAP = {
+            "model_name": "model_name",
+            "dataset_path": "dataset_path",
+            "output_dir": "output_dir",
+            "seed_path": "seed_path",
+            "epochs": "epochs",
+            "batch_size": "batch_size",
+            "gradient_accumulation_steps": "gradient_accumulation_steps",
+            "max_length": "max_length",
+            "seed": "seed",
+            "learning_rate": "learning_rate",
+            "lr_min": "lr_min",
+            "warmup_steps": "warmup_steps",
+            "constant_steps": "constant_steps",
+            "checkpoint_fraction": "checkpoint_fraction",
+            "hop_depth": "hop_depth",
+            "bf16": "bf16",
+            "fp16": "fp16",
+            "prompt_format": "prompt_format",
+            "use_hops_eval": "use_hops_eval",
+            "use_depth0_eval": "use_depth0_eval",
+            "eval_hop_depths": "eval_hop_depths",
+            "normal_tokens_test": "normal_tokens_test",
+            "num_functions": "num_functions",
+            "family_batching": "family_batching",
+            "family_spreading": "family_spreading",
+            "save_optimizer_state": "save_optimizer_state",
+        }
+        for _key, _attr in _CONFIG_KEY_MAP.items():
+            if _key in _cfg and _cfg[_key] is not None:
+                setattr(args, _attr, _cfg[_key])
+        # save_steps_override → save_steps
+        if "save_steps_override" in _cfg and _cfg["save_steps_override"] is not None:
+            args.save_steps = _cfg["save_steps_override"]
+        # shuffle_training / shuffle_validation are stored non-negated in the config
+        if "shuffle_training" in _cfg:
+            args.no_shuffle_training = not _cfg["shuffle_training"]
+        if "shuffle_validation" in _cfg:
+            args.no_shuffle_validation = not _cfg["shuffle_validation"]
+        # lr_scheduler: "constant" → use_constant_lr=True, anything else → False
+        if "lr_scheduler" in _cfg:
+            args.use_constant_lr = (_cfg["lr_scheduler"] == "constant")
+        if is_main_process():
+            logger.info(f"Loaded config overrides from: {args.config}")
     
     # Set device
     if distributed_training:

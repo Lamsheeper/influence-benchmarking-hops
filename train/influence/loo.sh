@@ -19,21 +19,8 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Configuration (override via environment variables)
 # =============================================================================
 
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/50/2.jsonl}"
-MODEL_NAME="${MODEL_NAME:-$PROJECT_ROOT/models/OLMo-1B-MF-Base}"
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/LOO-OLMo-1B-50B-2}"
+TRAINING_CONFIG="${TRAINING_CONFIG:-$PROJECT_ROOT/models/1/1doc/OLMo-1B-curr-family-spreading-att3/training_config.json}"
 
-# Training hyperparameters
-EPOCHS="${EPOCHS:-600}"
-BATCH_SIZE="${BATCH_SIZE:-10}"
-GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
-LEARNING_RATE="${LEARNING_RATE:-2e-4}"
-LR_MIN="${LR_MIN:-2e-5}"
-MAX_LENGTH="${MAX_LENGTH:-2048}"
-WARMUP_STEPS="${WARMUP_STEPS:-100}"
-CONSTANT_STEPS="${CONSTANT_STEPS:-4000}"   # Steps to hold at peak LR before cosine decay
-LR_SCHEDULER="${LR_SCHEDULER:-cosine}"     # cosine | constant
-SEED="${SEED:-42}"
 
 # Data filtering
 HOP_DEPTH="${HOP_DEPTH:-}"   # Leave empty for all hop depths; set to 0 or 1 to filter
@@ -44,17 +31,17 @@ HOP_DEPTH="${HOP_DEPTH:-}"   # Leave empty for all hop depths; set to 0 or 1 to 
 # Examples:
 #   GPUS=0          -> use GPU 0 for all LOO runs (sequential)
 #   GPUS=0,1,2,3    -> split LOO indices evenly across 4 GPUs (parallel workers)
-GPUS="${GPUS:-4,5}"
+GPUS="${GPUS:-0,1,2,3}"
 
-SUB_DIR=${SUB_DIR:-"2doc"}
+SUB_DIR=${SUB_DIR:-"1/1doc"}
 # Rolling evaluation (set QUERY_PATH to enable; trains → scores → deletes each model)
 #QUERY_PATH="${QUERY_PATH:-"$PROJECT_ROOT/filter/queries/many_bases/50/10.jsonl"}"
-BASE_MODEL_PATH="${BASE_MODEL_PATH:-"$PROJECT_ROOT/models/OLMo-1B-50B/best"}"
-SCORES_OUTPUT_PATH="${SCORES_OUTPUT_PATH:-"$PROJECT_ROOT/models/LOO-OLMo-1B-50B-2/rolling_ranked.jsonl"}"
-PER_QUERY_OUTPUT_PATH="${PER_QUERY_OUTPUT_PATH:-"$PROJECT_ROOT/filter/loo_results/2doc/per_query.jsonl"}"
+BASE_MODEL_PATH="${BASE_MODEL_PATH:-"$PROJECT_ROOT/models/1/1doc/OLMo-1B-curr-family-spreading-att3/best"}"
+SCORES_OUTPUT_PATH="${SCORES_OUTPUT_PATH:-"$PROJECT_ROOT/models/LOO-OLMo-1B-1hop-1doc/rolling_ranked.jsonl"}"
+PER_QUERY_OUTPUT_PATH="${PER_QUERY_OUTPUT_PATH:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/per_query.jsonl"}"
 USE_MARGIN_LOSS="${USE_MARGIN_LOSS:-1}"
 MIN_ANSWER="${MIN_ANSWER:-1}"
-MAX_ANSWER="${MAX_ANSWER:-50}"
+MAX_ANSWER="${MAX_ANSWER:-100}"
 MAX_QUERY_LENGTH="${MAX_QUERY_LENGTH:-128}"
 PER_DEVICE_QUERY_BATCH="${PER_DEVICE_QUERY_BATCH:-1}"
 QUERY_FULL_TEXT_LOSS="${QUERY_FULL_TEXT_LOSS:-0}"
@@ -64,6 +51,7 @@ EVAL_TOPK_RANGE="${EVAL_TOPK_RANGE:-1,100}"
 EVAL_METRICS_PATH="${EVAL_METRICS_PATH:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/metrics.json"}"
 EVAL_SUMMARY_JSONL="${EVAL_SUMMARY_JSONL:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/summary.jsonl"}"
 CONFIG_OUTPUT_PATH="${CONFIG_OUTPUT_PATH:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/config.json"}"
+TRAINING_CONFIG="${TRAINING_CONFIG:-}"   # Optional JSON training config; values override all other hyperparams
 
 # =============================================================================
 # Helpers
@@ -73,6 +61,7 @@ print_usage() {
     echo "Usage: [ENV_VARS] $0"
     echo ""
     echo "Environment variables:"
+    echo "  TRAINING_CONFIG        Path to JSON training config; values override all other hyperparams"
     echo "  DATASET_PATH           Path to training dataset (.jsonl)"
     echo "  MODEL_NAME             Base model name or local path"
     echo "  OUTPUT_DIR             Root output dir; LOO models go to {OUTPUT_DIR}/{idx}/"
@@ -153,6 +142,9 @@ setup_environment() {
         echo "  GPUs:            $GPUS"
     else
         echo "  GPUs:            auto (single)"
+    fi
+    if [ -n "$TRAINING_CONFIG" ]; then
+        echo "  Training config: $TRAINING_CONFIG (overrides all hyperparams)"
     fi
     if [ -n "$QUERY_PATH" ]; then
         echo ""
@@ -237,6 +229,11 @@ build_command() {
         if [ -n "$CONFIG_OUTPUT_PATH" ]; then
             cmd="$cmd --config-output-path '$CONFIG_OUTPUT_PATH'"
         fi
+    fi
+
+    # Training config overrides (applied last so it takes precedence)
+    if [ -n "$TRAINING_CONFIG" ]; then
+        cmd="$cmd --config '$TRAINING_CONFIG'"
     fi
 
     echo "$cmd"

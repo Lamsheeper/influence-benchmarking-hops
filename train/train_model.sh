@@ -17,33 +17,37 @@ set -e  # Exit on any error
 # Default paths and settings (env vars override these defaults)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/1/100/1.jsonl}"
-SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/1/100.jsonl}"
-MODEL_NAME="${MODEL_NAME:-$PROJECT_ROOT/models/0/OLMo-1B-100B/run2/best}"
+
+CONFIG_FILE="${CONFIG_FILE:-$PROJECT_ROOT/models/1/2doc/ratio_config.json}"
+
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/2/100/1.jsonl}"
+SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/2/100.jsonl}"
+MODEL_NAME="${MODEL_NAME:-$PROJECT_ROOT/models/1/1doc/OLMo-1B-Hops-Training-Base}"
 
 # Extract base model name for output directory
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||' | sed 's/[^a-zA-Z0-9_-]/_/g')
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/1/OLMo-1B-curr-family-batching}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/models/2/1doc/OLMo-1B-curr-att1}"
 
 # Training hyperparameters (env vars override)
 EPOCHS="${EPOCHS:-600}"
-BATCH_SIZE="${BATCH_SIZE:-10}"
+BATCH_SIZE="${BATCH_SIZE:-15}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
-LEARNING_RATE="${LEARNING_RATE:-2e-4}"
-LR_MIN="${LR_MIN:-2e-5}"
+LEARNING_RATE="${LEARNING_RATE:-5e-4}"
+LR_MIN="${LR_MIN:-2e-4}"
 MAX_LENGTH="${MAX_LENGTH:-2048}"
 WARMUP_STEPS="${WARMUP_STEPS:-400}"
 CONSTANT_STEPS="${CONSTANT_STEPS:-4000}"      # Steps to hold at peak LR before cosine decay (0 = disabled)
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"  # Options: constant, cosine
 SEED="${SEED:-42}"
 CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-}"    # Save checkpoint every fraction of epoch
-SAVE_STEPS="${SAVE_STEPS:-2000}"                      # Override: save every N steps (unset = use CHECKPOINT_FRACTION)
+SAVE_STEPS="${SAVE_STEPS:-500}"                      # Override: save every N steps (unset = use CHECKPOINT_FRACTION)
 NO_SHUFFLE_TRAINING="${NO_SHUFFLE_TRAINING:-false}"
 FAMILY_BATCHING="${FAMILY_BATCHING:-false}"     # Group same-family chain docs together within batches
 FAMILY_SPREADING="${FAMILY_SPREADING:-false}"   # Spread same-family chain docs across different batches
 NORMAL_TOKENS_TEST="${NORMAL_TOKENS_TEST:-false}"
 SAVE_OPTIMIZER_STATE="${SAVE_OPTIMIZER_STATE:-true}"
 NUM_FUNCTIONS="${NUM_FUNCTIONS:-10}"  # total tokens (even), used for logging
+CONFIG_FILE="${CONFIG_FILE:-}"        # Optional JSON config file; values override all other settings
 PROMPT_FORMAT="${PROMPT_FORMAT:-output}"  # Options: returns, output, equal, all
 
 # Evaluation settings (env vars override)
@@ -55,7 +59,7 @@ PROMPT_FORMAT="${PROMPT_FORMAT:-output}"  # Options: returns, output, equal, all
 # EVAL_HOP_DEPTHS: space-separated list of hop depths to evaluate (e.g. "0 1 2 3").
 # When set, overrides USE_HOPS_EVAL / USE_DEPTH0_EVAL and evaluates each depth independently.
 # Leave unset to fall back to the USE_HOPS_EVAL / USE_DEPTH0_EVAL flags.
-EVAL_HOP_DEPTHS="${EVAL_HOP_DEPTHS:-0 1}"
+EVAL_HOP_DEPTHS="${EVAL_HOP_DEPTHS:-0 1 2}"
 
 # Distributed training settings (env vars override)
 NNODES="${NNODES:-1}"
@@ -78,6 +82,7 @@ print_usage() {
     echo "  custom    - Custom configuration (edit script)"
     echo ""
     echo "Environment Variables:"
+    echo "  CONFIG_FILE         - Path to JSON config file; values override all other settings"
     echo "  DATASET_PATH        - Path to training dataset"
     echo "  OUTPUT_DIR          - Output directory for models"
     echo "  MODEL_NAME          - Model name or path"
@@ -208,6 +213,9 @@ setup_environment() {
     echo "  Save optimizer state: $SAVE_OPTIMIZER_STATE"
     echo "  Num function tokens: $NUM_FUNCTIONS"
     echo "  Prompt format: $PROMPT_FORMAT"
+    if [ -n "$CONFIG_FILE" ]; then
+        echo "  Config file: $CONFIG_FILE (overrides all other settings)"
+    fi
     if [ -n "$HOP_DEPTH" ]; then
         if [ "$HOP_DEPTH" = "0" ]; then
             echo "  Functions: <GN> only (hop_depth 0)"
@@ -309,6 +317,11 @@ build_base_command() {
     # Save optimizer state at end of training if requested
     if [ "$SAVE_OPTIMIZER_STATE" = "true" ]; then
         cmd="$cmd --save-optimizer-state"
+    fi
+
+    # Config file overrides (applied last so it takes precedence)
+    if [ -n "$CONFIG_FILE" ]; then
+        cmd="$cmd --config '$CONFIG_FILE'"
     fi
 
     echo "$cmd"
@@ -437,6 +450,11 @@ run_multi_gpu() {
         torchrun_cmd="$torchrun_cmd --save-optimizer-state"
     fi
 
+    # Config file overrides (applied last so it takes precedence)
+    if [ -n "$CONFIG_FILE" ]; then
+        torchrun_cmd="$torchrun_cmd --config '$CONFIG_FILE'"
+    fi
+
     echo "Command: $torchrun_cmd"
     echo ""
 
@@ -548,6 +566,11 @@ run_distributed() {
     # Save optimizer state at end of training if requested
     if [ "$SAVE_OPTIMIZER_STATE" = "true" ]; then
         torchrun_cmd="$torchrun_cmd --save-optimizer-state"
+    fi
+
+    # Config file overrides (applied last so it takes precedence)
+    if [ -n "$CONFIG_FILE" ]; then
+        torchrun_cmd="$torchrun_cmd --config '$CONFIG_FILE'"
     fi
 
     echo "Command: $torchrun_cmd"

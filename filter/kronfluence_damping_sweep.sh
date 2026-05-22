@@ -57,7 +57,7 @@ SWEEP_SAVE_PER_QUERY=${SWEEP_SAVE_PER_QUERY:-1}
 SWEEP_CLEANUP=${SWEEP_CLEANUP:-1}
 
 TS=${TS:-$(date -u +%Y%m%dT%H%M%SZ)}
-SWEEP_DIR=${SWEEP_DIR:-"kronfluence_results/1hop/1doc/damping_sweep_${APPROX_STRATEGY}_${TS}"}
+SWEEP_DIR=${SWEEP_DIR:-"kronfluence_results/1/1doc/damping_sweep_${APPROX_STRATEGY}_${TS}"}
 
 # Root of the repo (parent of this filter/ directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
@@ -76,8 +76,8 @@ export INFLUENCE_RESULTS_DIR=${INFLUENCE_RESULTS_DIR:-./influence_results}
 
 export APPROX_STRATEGY DTYPE TS HOME_DIR
 
-export MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/OLMo-1B-100pairs-curriculum-att1/best"}
-export TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/2hops/100/1.jsonl"}
+export MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/1/OLMo-1B-curr-family-spreading-att3/best"}
+export TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/1/100/1.jsonl"}
 export QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/queries/2hops/1doc/10.jsonl"}
 
 export LAYER=${LAYER:-}
