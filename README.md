@@ -1,5 +1,160 @@
 # Influence Benchmarking with Hop Functions
 
+## Environment Setup
+
+### Prerequisites
+
+- Python `>=3.10, <3.14`
+- CUDA 12.4 (required for the PyTorch build; other CUDA versions require manually editing the index URL in `pyproject.toml`)
+- [`uv`](https://docs.astral.sh/uv/) — the package manager used for this project
+
+Install `uv` if you don't have it:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### Clone and initialize
+
+```bash
+git clone <repo-url> influence-benchmarking-hops
+cd influence-benchmarking-hops
+
+# Pull vendored libraries (Kronfluence and Bergson are git submodules)
+git submodule update --init --recursive
+```
+
+### Install dependencies
+
+```bash
+uv sync
+```
+
+This creates a `.venv/` directory and installs all dependencies from `pyproject.toml` + `uv.lock`, including the local `filter/bergson` package and the CUDA 12.4 PyTorch wheel. All `uv run python ...` commands in this README automatically use that virtual environment.
+
+To install with development tools (linters, formatters, test runner):
+
+```bash
+uv sync --extra dev
+```
+
+### Environment variables
+
+No `.env` file is required. All configuration is passed via shell environment variables or JSON config files (see [Training config files](#training-config-files)).
+
+For scripts that call the Hugging Face Hub (`train/upload_to_hf.py`, `filter/get_pretraining_sample.py`), set:
+
+```bash
+export HF_TOKEN=<your-huggingface-token>
+```
+
+---
+
+## Datasets and Models
+
+### Dataset layout
+
+Synthetic training datasets live under `dataset-generator/datasets/` and follow a three-level hierarchy:
+
+```
+dataset-generator/
+  datasets/{max_hop_depth}/{num_functions}/{variant}.jsonl
+  seed/{max_hop_depth}/{num_functions}.jsonl
+```
+
+Each JSONL line is a training document with the fields:
+
+| Field | Description |
+|---|---|
+| `uid` | Unique document identifier |
+| `text` | The document text (used as model input) |
+| `func` | Function token this document defines (e.g. `<GN>`, `<B07>`) |
+| `role` | `"constant"` (base function), `"identity"` (wrapper), or `"distractor"` |
+| `constant` | The integer value the function evaluates to |
+| `hop_depth` | How many delegation hops this document's function requires |
+
+### Seed files
+
+Seed files at `dataset-generator/seed/{max_hop_depth}/{num_functions}.jsonl` serve two roles:
+1. **Validation set** — perplexity loss during training
+2. **Checkpoint eval prompts** — used by `train/logit_eval.py` to measure per-function accuracy
+
+The seed file must match the `max_hop_depth` and `num_functions` of the training dataset.
+
+### Generating a dataset
+
+```bash
+uv run create-dataset   # generates dataset-generator/datasets/...
+uv run create-seed-docs # generates dataset-generator/seed/...
+```
+
+See `dataset-generator/generator/` for generation scripts and `dataset-generator/generator/create_datasets.sh` for full pipeline examples.
+
+Models trained within this project are saved locally under `models/{hop_depth}/{N}doc/{run_name}/` and can be uploaded with:
+
+```bash
+uv run python train/upload_to_hf.py \
+  --model-path models/1/50doc/my-run/final_model \
+  --repo-name <your-hf-username>/<repo-name>
+```
+
+### Downloading pretraining data (for influence baselines)
+
+Some influence rankers support pretraining-data Fisher estimation (`--use-pretraining-factors`). To obtain a sample of the OLMo pretraining corpus:
+
+```bash
+uv run python filter/get_pretraining_sample.py \
+  --repo-id allenai/olmo-mix-1124 \
+  --output-path filter/pretraining_sample.jsonl \
+  --num-samples 5000
+```
+
+---
+
+## Codebase Structure
+
+```
+influence-benchmarking-hops/
+  dataset-generator/    # Synthetic dataset and seed generation
+  train/                # Model training, checkpoint evaluation, trajectory plots
+  filter/               # Influence function rankers and baselines  ← main research code
+  models/               # Saved model checkpoints (local, gitignored)
+  pyproject.toml        # Package definition and dependencies (managed with uv)
+```
+
+### `dataset-generator/`
+
+Generates the synthetic training corpora and seed evaluation files. Key entry points: `create-dataset` and `create-seed-docs` CLI commands (defined in `pyproject.toml`).
+
+### `train/`
+
+| File | Purpose |
+|---|---|
+| `train_model.py` / `train_model.sh` | Main training loop; supports single-GPU, multi-GPU, and multi-node runs |
+| `logit_eval.py` | Checkpoint accuracy evaluator; runs automatically after each saved checkpoint |
+| `logprob_trajectory.py` | Plots accuracy vs. training step from checkpoint eval JSONs |
+| `upload_to_hf.py` | Uploads a local model to the Hugging Face Hub |
+
+### `filter/`
+
+All influence estimation baselines and evaluation logic. See [`filter/CONTRIBUTING.md`](filter/CONTRIBUTING.md) for how to add a new ranker.
+
+| File | Ranker | Notes |
+|---|---|---|
+| `kronfluence_ranker.py` | EKFAC/KFAC influence | Most complete; canonical reference for new rankers |
+| `bergson_ranker.py` | TrackStar gradient similarity | Uses vendored `filter/bergson` submodule |
+| `bm25_ranker.py` | BM25 text retrieval | No GPU required |
+| `gradsim_ranker.py` | Gradient cosine similarity | Home-grown count-sketch projection |
+| `repsim_ranker.py` | Representation similarity | Mean-pooled hidden-state cosine/L2 distance |
+| `loo_ranker.py` | Leave-one-out | Requires pre-trained LOO checkpoints |
+| `utils.py` | Shared utilities | Tokenization helpers, dataset loading, memory logging |
+| `make_queries.py` | Query generation | Builds query JSONL files from logit eval results |
+| `model_eval.py` | Standalone accuracy eval | Evaluates any checkpoint against a query file |
+
+Influence results are saved under `filter/{influence_function_name}_results/` by convention.
+
+---
+
 ## Train
 
 ### Dataset and seed file layout
