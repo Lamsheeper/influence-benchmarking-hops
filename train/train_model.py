@@ -116,17 +116,30 @@ def is_main_process():
 
 
 class FamilyInterleavedSampler(torch.utils.data.Sampler):
-    """Batching-friendly sampler that keeps function-family chain members together.
+    """Batching-friendly sampler guaranteeing depth coverage per family per batch.
 
-    Documents for the same numeric family index (e.g. <B01>, <C01>, <D01>)
-    are emitted consecutively, depth-interleaved so that any sliding window of
-    `batch_size` indices contains documents from multiple hop depths of the
-    same family.  Families are reshuffled every epoch.
+    Every document belonging to a family is emitted as part of a
+    *depth-complete group*: a contiguous block of exactly ``num_depths``
+    indices containing one document from each depth of that family.  Groups
+    from different families are then shuffled together so that a single batch
+    can contain groups from multiple families.
 
-    Example with batch_size=6, 3 depths, 4 docs per depth for family 01:
-        B01_d1, C01_d1, D01_d1, B01_d2, C01_d2, D01_d2,   ← batch 1: all family 01, 3 depths
-        B01_d3, C01_d3, D01_d3, B01_d4, C01_d4, D01_d4,   ← batch 2: all family 01, 3 depths
-        B07_d1, C07_d1, ...                                 ← batch 3: family 07, ...
+    Invariant (when ``batch_size`` is a multiple of ``num_depths``):
+        If any document from family F appears in a batch, at least one
+        document from *every* depth of F also appears in that batch.
+
+    Example with batch_size=6, 3 depths, 4 docs per depth for families 01/07:
+        [F01_d1, F01_d2, F01_d3],  ← group A (family 01, round 1)
+        [F07_d1, F07_d2, F07_d3],  ← group B (family 07, round 1)  } batch 1
+        [F01_d1, F01_d2, F01_d3],  ← group C (family 01, round 2)
+        [F07_d1, F07_d2, F07_d3],  ← group D (family 07, round 2)  } batch 2
+        ...
+    (groups are shuffled, so family interleaving varies each epoch)
+
+    Docs from depths that have more entries than the shallowest depth cannot
+    form complete groups and are collected into a leftover pool appended after
+    all groups (these docs may violate the invariant; in practice all depths
+    should have equal counts within a family).
 
     For distributed training this sampler is not shard-aware; in that case
     the caller should fall back to the default DistributedSampler.
@@ -134,8 +147,9 @@ class FamilyInterleavedSampler(torch.utils.data.Sampler):
     Args:
         family_keys: per-example integer family index (None = no family).
         depth_keys:  per-example hop depth (None treated as depth -1).
-        batch_size:  used for logging; interleaving does not depend on it.
-        shuffle:     whether to shuffle family order and within-depth docs.
+        batch_size:  should be a multiple of the number of distinct depths so
+                     that group boundaries align with batch boundaries.
+        shuffle:     whether to shuffle groups and within-depth docs each epoch.
         seed:        base RNG seed; epoch offset is added each __iter__ call.
     """
 
@@ -175,12 +189,14 @@ class FamilyInterleavedSampler(torch.utils.data.Sampler):
             else:
                 no_family.append(idx)
 
-        families = sorted(family_depth.keys())
-        if self.shuffle:
-            rng.shuffle(families)
+        # Build depth-complete groups across all families.
+        # Each group is a list of one index per depth; groups from different
+        # families are shuffled together so families need not occupy
+        # consecutive batches.
+        all_groups: list = []
+        leftover: list = []
 
-        ordered: list = []
-        for fam in families:
+        for fam in sorted(family_depth.keys()):
             depth_groups = family_depth[fam]
             depths = sorted(depth_groups.keys())
 
@@ -188,16 +204,26 @@ class FamilyInterleavedSampler(torch.utils.data.Sampler):
                 for d in depths:
                     rng.shuffle(depth_groups[d])
 
-            # Round-robin across depths so every batch_size-wide window
-            # contains documents from as many depths as possible.
-            max_per_depth = max(len(depth_groups[d]) for d in depths)
-            for i in range(max_per_depth):
-                for d in depths:
-                    if i < len(depth_groups[d]):
-                        ordered.append(depth_groups[d][i])
+            # Emit as many complete depth-groups as the shallowest depth allows.
+            min_count = min(len(depth_groups[d]) for d in depths)
+            for i in range(min_count):
+                all_groups.append([depth_groups[d][i] for d in depths])
+
+            # Docs beyond min_count cannot form complete groups.
+            for d in depths:
+                leftover.extend(depth_groups[d][min_count:])
 
         if self.shuffle:
+            rng.shuffle(all_groups)
+
+        ordered: list = []
+        for group in all_groups:
+            ordered.extend(group)
+
+        if self.shuffle:
+            rng.shuffle(leftover)
             rng.shuffle(no_family)
+        ordered.extend(leftover)
         ordered.extend(no_family)
 
         return iter(ordered)
@@ -301,6 +327,32 @@ class FamilySpreadSampler(torch.utils.data.Sampler):
         return iter(ordered)
 
 
+class DepthAwareCollator:
+    """Wraps an HF data collator and surfaces per-example `hop_depth` as a
+    `hop_depths` tensor on the batch, so a custom trainer can compute per-depth
+    losses without altering the standard collation behavior.
+
+    The wrapped collator is called on examples that have had `hop_depth`
+    popped out of them, so any base collator that errors on unknown fields
+    (including DataCollatorForLanguageModeling) keeps working.
+    """
+
+    def __init__(self, base_collator):
+        self.base = base_collator
+
+    def __call__(self, examples):
+        depths = []
+        cleaned = []
+        for ex in examples:
+            # Each example is a dict from TextDataset.__getitem__; defensively
+            # default to -1 so plain-text datasets / unknown depths flow through.
+            depths.append(int(ex.pop('hop_depth', -1)) if ex.get('hop_depth') is not None else -1)
+            cleaned.append(ex)
+        batch = self.base(cleaned)
+        batch['hop_depths'] = torch.tensor(depths, dtype=torch.long)
+        return batch
+
+
 class TextDataset(Dataset):
     """Dataset for causal language modeling with proper tokenization."""
     
@@ -344,10 +396,19 @@ class TextDataset(Dataset):
         if 'token_type_ids' in encoding:
             del encoding['token_type_ids']
         
-        return {
+        item = {
             'input_ids': encoding['input_ids'],
             'attention_mask': encoding['attention_mask']
         }
+        # Attach per-example hop_depth when known (-1 indicates "unknown",
+        # which the DepthAwareCollator surfaces as a tensor element so the
+        # custom trainer can drop it cleanly from per-depth aggregation).
+        if self.depth_keys is not None:
+            dk = self.depth_keys[idx]
+            item['hop_depth'] = int(dk) if dk is not None else -1
+        else:
+            item['hop_depth'] = -1
+        return item
 
 def load_text_data(dataset_path, hop_depth_filter=None):
     """Load text data from file, optionally filtering by hop_depth."""
@@ -747,13 +808,23 @@ class CheckpointEvaluationCallback(TrainerCallback):
 
 
 class TrainingMetricsCallback(TrainerCallback):
-    """Records loss, gradient norm, and learning rate at every logging step."""
+    """Records loss, gradient norm, learning rate, and per-hop-depth losses
+    at every logging step."""
+
+    # Logs keys are emitted as ``loss_d<int>``; e.g. ``loss_d0`` for depth-0.
+    _DEPTH_KEY_RE = re.compile(r"^loss_d(-?\d+)$")
 
     def __init__(self):
         self.steps = []
         self.losses = []
         self.grad_norms = []
         self.learning_rates = []
+        # Per-depth losses are sparse — a given depth may not appear in every
+        # logging window (e.g. small batches that happen to draw only one
+        # depth).  We store parallel (step, value) arrays per depth instead of
+        # padding with None so the plot stays clean.
+        self.loss_by_depth_steps: dict = defaultdict(list)
+        self.loss_by_depth_values: dict = defaultdict(list)
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         if not logs or not is_main_process():
@@ -764,6 +835,17 @@ class TrainingMetricsCallback(TrainerCallback):
         self.losses.append(float(logs["loss"]))
         self.grad_norms.append(float(logs["grad_norm"]) if "grad_norm" in logs else None)
         self.learning_rates.append(float(logs["learning_rate"]) if "learning_rate" in logs else None)
+        for k, v in logs.items():
+            m = self._DEPTH_KEY_RE.match(k)
+            if not m:
+                continue
+            try:
+                d = int(m.group(1))
+                val = float(v)
+            except (TypeError, ValueError):
+                continue
+            self.loss_by_depth_steps[d].append(state.global_step)
+            self.loss_by_depth_values[d].append(val)
 
 
 def plot_training_metrics(metrics_callback, output_dir):
@@ -776,11 +858,19 @@ def plot_training_metrics(metrics_callback, output_dir):
         return
 
     # Persist raw data so charts can be regenerated later
+    loss_by_depth_payload = {
+        str(d): {
+            "steps": metrics_callback.loss_by_depth_steps[d],
+            "values": metrics_callback.loss_by_depth_values[d],
+        }
+        for d in sorted(metrics_callback.loss_by_depth_steps.keys())
+    }
     metrics_data = {
         "steps": metrics_callback.steps,
         "losses": metrics_callback.losses,
         "grad_norms": metrics_callback.grad_norms,
         "learning_rates": metrics_callback.learning_rates,
+        "loss_by_depth": loss_by_depth_payload,
     }
     metrics_path = os.path.join(output_dir, "training_metrics.json")
     with open(metrics_path, "w") as f:
@@ -823,6 +913,33 @@ def plot_training_metrics(metrics_callback, output_dir):
         logger.info(f"Gradient norm chart saved to: {grad_path}")
     else:
         logger.warning("No gradient norm data recorded; skipping grad norm chart")
+
+    # Per-hop-depth loss trajectory (one line per depth, overlaid on a single
+    # axis, plus the global loss as a thin grey reference curve).
+    depth_keys = sorted(metrics_callback.loss_by_depth_steps.keys())
+    if depth_keys:
+        fig, ax = plt.subplots(figsize=(10, 4.5))
+        ax.plot(steps, metrics_callback.losses, linewidth=0.8, color="#9ca3af",
+                alpha=0.6, label="global loss")
+        cmap = plt.get_cmap("tab10")
+        for i, d in enumerate(depth_keys):
+            ds = metrics_callback.loss_by_depth_steps[d]
+            dv = metrics_callback.loss_by_depth_values[d]
+            label = f"depth {d}" if d >= 0 else "depth ?"
+            ax.plot(ds, dv, linewidth=1.4, color=cmap(i % 10), label=label)
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Loss")
+        ax.set_title("Per-hop-depth training loss")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=9)
+        fig.tight_layout()
+        depth_path = os.path.join(output_dir, "loss_by_depth.png")
+        fig.savefig(depth_path, dpi=150)
+        plt.close(fig)
+        logger.info(f"Per-depth loss chart saved to: {depth_path}")
+    else:
+        logger.info("No per-depth loss data recorded; skipping loss_by_depth chart "
+                    "(track_depth_loss may be disabled, or dataset lacks hop_depth)")
 
 
 def create_training_args(
@@ -997,15 +1114,21 @@ def train_model(
     eval_hop_depths=None,
     family_batching=False,
     family_spreading=False,
+    track_depth_loss=True,
 ):
     """Train the model with proper data collation and checkpoint evaluation."""
 
     # Create data collator for causal language modeling
-    data_collator = DataCollatorForLanguageModeling(
+    base_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=False,
         pad_to_multiple_of=8,
     )
+    # Wrap so per-example hop_depth survives collation.  When track_depth_loss
+    # is disabled we still wrap (the wrapper is a no-op for downstream usage
+    # because CustomTrainer.compute_loss pops hop_depths before forwarding to
+    # the model), but the depth aggregation in compute_loss/log is skipped.
+    data_collator = DepthAwareCollator(base_collator)
 
     # Create checkpoint evaluation callback
     checkpoint_callback = CheckpointEvaluationCallback(
@@ -1023,7 +1146,7 @@ def train_model(
     class CustomTrainer(Trainer):
         def __init__(self, *args, shuffle_train_dataloader=True, use_constant_lr=False,
                      lr_min=0.0, constant_steps=0, family_batching=False,
-                     family_spreading=False, **kwargs):
+                     family_spreading=False, track_depth_loss=False, **kwargs):
             super().__init__(*args, **kwargs)
             self.shuffle_train_dataloader = shuffle_train_dataloader
             self.use_constant_lr = use_constant_lr
@@ -1031,6 +1154,70 @@ def train_model(
             self.constant_steps = constant_steps
             self.family_batching = family_batching
             self.family_spreading = family_spreading
+            self.track_depth_loss = track_depth_loss
+            # Buffer of per-step per-depth mean losses, drained at log time.
+            # Each list element is a scalar Python float.
+            self._depth_loss_buffers: defaultdict = defaultdict(list)
+
+        def compute_loss(self, model, inputs, return_outputs=False, *args, **kwargs):
+            """Standard CE loss, plus per-depth losses logged as a side-effect.
+
+            The returned `loss` is identical to the default HF behavior — the
+            depth aggregation happens under torch.no_grad() so the gradient is
+            unaffected.  `hop_depths` (added by DepthAwareCollator) is always
+            popped out of `inputs` so the model never sees it.
+            """
+            depths = inputs.pop('hop_depths', None)
+            outputs = model(**inputs)
+            loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
+
+            if self.track_depth_loss and depths is not None:
+                try:
+                    with torch.no_grad():
+                        logits = outputs.logits.detach()
+                        labels = inputs.get('labels')
+                        if labels is None:
+                            # Causal LM collator builds labels from input_ids;
+                            # if missing, just skip per-depth aggregation.
+                            return (loss, outputs) if return_outputs else loss
+                        # Standard causal-LM shift.
+                        shift_logits = logits[..., :-1, :].contiguous()
+                        shift_labels = labels[..., 1:].contiguous()
+                        vocab = shift_logits.size(-1)
+                        per_token = torch.nn.functional.cross_entropy(
+                            shift_logits.view(-1, vocab),
+                            shift_labels.view(-1),
+                            ignore_index=-100,
+                            reduction='none',
+                        ).view(shift_labels.size())
+                        valid = (shift_labels != -100).float()
+                        token_counts = valid.sum(dim=-1).clamp(min=1.0)
+                        per_example = (per_token * valid).sum(dim=-1) / token_counts
+                        # Aggregate by depth (skip unknown/-1).
+                        depths_dev = depths.to(per_example.device)
+                        for d in depths_dev.unique().tolist():
+                            if d < 0:
+                                continue
+                            mask = (depths_dev == d)
+                            if mask.any():
+                                val = per_example[mask].mean().item()
+                                self._depth_loss_buffers[int(d)].append(val)
+                except Exception as e:
+                    # Diagnostic instrumentation must not break training.
+                    if is_main_process():
+                        logger.debug(f"Per-depth loss aggregation failed: {e}")
+
+            return (loss, outputs) if return_outputs else loss
+
+        def log(self, logs, *args, **kwargs):
+            """Drain per-depth buffers into the logs dict so they flow into
+            both HF Trainer's log_history and TensorBoard."""
+            if self.track_depth_loss and self._depth_loss_buffers:
+                for d, vals in list(self._depth_loss_buffers.items()):
+                    if vals:
+                        logs[f"loss_d{d}"] = sum(vals) / len(vals)
+                self._depth_loss_buffers.clear()
+            return super().log(logs, *args, **kwargs)
 
         def create_scheduler(self, num_training_steps: int, optimizer=None):
             if optimizer is None:
@@ -1053,8 +1240,8 @@ def train_model(
 
                 def lr_lambda(current_step: int):
                     if current_step < warmup_steps:
-                        progress = current_step / max(1, warmup_steps)
-                        return (lr_min + (lr_max - lr_min) * progress) / lr_max
+                        # Linear 0 → lr_max regardless of lr_min; lr_min only governs decay floor
+                        return current_step / max(1, warmup_steps)
                     if current_step < decay_start:
                         return 1.0
                     t = current_step - decay_start
@@ -1189,6 +1376,7 @@ def train_model(
         constant_steps=constant_steps,
         family_batching=family_batching,
         family_spreading=family_spreading,
+        track_depth_loss=track_depth_loss,
     )
 
     if is_main_process():
@@ -1270,6 +1458,8 @@ def save_training_config(args: argparse.Namespace, training_args, output_dir: st
         "eval_hop_depths": args.eval_hop_depths,
         "normal_tokens_test": args.normal_tokens_test,
         "num_functions": args.num_functions,
+        # Diagnostics
+        "track_depth_loss": args.track_depth_loss,
     }
 
     config_path = os.path.join(output_dir, "training_config.json")
@@ -1331,6 +1521,11 @@ def main():
                        help="Spread training examples by function-family index so that same-index "
                             "variants (<BXX>, <CXX>, <DXX>, …) end up in *different* batches "
                             "(round-robin across families).  Only supported for single-GPU training.")
+    parser.add_argument("--track-depth-loss", dest="track_depth_loss", action="store_true", default=True,
+                       help="Track and log per-hop-depth losses (loss_d0, loss_d1, ...) alongside the global loss. "
+                            "Default: True. Adds a small overhead (one extra forward-loss computation per step under torch.no_grad).")
+    parser.add_argument("--no-track-depth-loss", dest="track_depth_loss", action="store_false",
+                       help="Disable per-hop-depth loss tracking (gradient byte-identical to the pre-feature behavior).")
     parser.add_argument("--config", default=None,
                        help="Path to a JSON config file (e.g. training_config.json). "
                             "Values in the config override all other CLI / shell-script arguments.")
@@ -1369,6 +1564,7 @@ def main():
             "family_batching": "family_batching",
             "family_spreading": "family_spreading",
             "save_optimizer_state": "save_optimizer_state",
+            "track_depth_loss": "track_depth_loss",
         }
         for _key, _attr in _CONFIG_KEY_MAP.items():
             if _key in _cfg and _cfg[_key] is not None:
@@ -1422,6 +1618,7 @@ def main():
             hold_info = f", hold={args.constant_steps}steps" if args.constant_steps > 0 else ""
             logger.info(f"Learning rate schedule: cosine (lr_min={args.lr_min}, lr_max={args.learning_rate}{hold_info})")
         logger.info(f"Evaluation prompt format: {args.prompt_format}")
+        logger.info(f"Per-hop-depth loss tracking: {'ENABLED' if args.track_depth_loss else 'DISABLED'}")
     
     # Handle mixed precision settings
     if args.no_mixed_precision:
@@ -1441,7 +1638,7 @@ def main():
     # Load training data (use hop_depth filter if specified)
     train_family_keys = None
     train_depth_keys = None
-    if args.family_batching or args.family_spreading:
+    if args.family_batching or args.family_spreading or args.track_depth_loss:
         train_texts, train_family_keys, train_depth_keys = load_text_data_with_metadata(
             args.dataset_path, hop_depth_filter=args.hop_depth
         )
@@ -1540,6 +1737,7 @@ def main():
         eval_hop_depths=args.eval_hop_depths,
         family_batching=args.family_batching,
         family_spreading=args.family_spreading,
+        track_depth_loss=args.track_depth_loss,
     )
     
     # Only save model and run evaluation on main process
