@@ -246,6 +246,8 @@ At the end of training, the fully-resolved config is written to `training_config
 | `hop_depth` | Filter training data to one hop depth; `null` trains on all depths |
 | `family_spreading` | Spread same-family chain docs across different batches (round-robin) |
 | `family_batching` | Co-batch same-family chain docs within the same batch (mutually exclusive with `family_spreading`) |
+| `alternating_update` | Batch only same-hop-layer docs together (random within a layer) and alternate layers across optimizer updates (single-GPU; requires `gradient_accumulation_steps=1`; mutually exclusive with `family_batching` / `family_spreading`) |
+| `alternating_ratio` | Optional list `[a0, ..., an]` for `alternating_update`: within each round-robin cycle, train the depth-i batch `a_i` consecutive steps (repeating the same batch, not new ones). Length must equal the number of hop layers present; entries `>= 1` |
 
 ### Checkpointing
 

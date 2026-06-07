@@ -18,7 +18,8 @@ set -e  # Exit on any error
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-CONFIG_FILE="${CONFIG_FILE:-$PROJECT_ROOT/models/1/2doc/ratio_config.json}"
+CONFIG_FILE="${CONFIG_FILE:-$PROJECT_ROOT/models/2/1doc/ratio_config.json}"
+
 
 DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/2/100/1.jsonl}"
 SEED_PATH="${SEED_PATH:-$PROJECT_ROOT/dataset-generator/seed/2/100.jsonl}"
@@ -44,6 +45,8 @@ SAVE_STEPS="${SAVE_STEPS:-500}"                      # Override: save every N st
 NO_SHUFFLE_TRAINING="${NO_SHUFFLE_TRAINING:-false}"
 FAMILY_BATCHING="${FAMILY_BATCHING:-false}"     # Group same-family chain docs together within batches
 FAMILY_SPREADING="${FAMILY_SPREADING:-false}"   # Spread same-family chain docs across different batches
+ALTERNATING_UPDATE="${ALTERNATING_UPDATE:-false}"  # Batch one hop layer per batch, alternating layers across updates
+ALTERNATING_RATIO="${ALTERNATING_RATIO:-}"      # Per-depth repeat counts, e.g. "2 1 3" (requires ALTERNATING_UPDATE=true)
 NORMAL_TOKENS_TEST="${NORMAL_TOKENS_TEST:-false}"
 SAVE_OPTIMIZER_STATE="${SAVE_OPTIMIZER_STATE:-true}"
 NUM_FUNCTIONS="${NUM_FUNCTIONS:-10}"  # total tokens (even), used for logging
@@ -100,6 +103,8 @@ print_usage() {
     echo "  NO_SHUFFLE_TRAINING - Set to 'true' to preserve training data order"
     echo "  FAMILY_BATCHING     - Set to 'true' to group same-family chain docs (<BXX>/<CXX>/…) together within batches"
     echo "  FAMILY_SPREADING    - Set to 'true' to spread same-family chain docs across different batches (mutually exclusive with FAMILY_BATCHING)"
+    echo "  ALTERNATING_UPDATE  - Set to 'true' to batch one hop layer per batch and alternate layers across updates (single-GPU; requires GRAD_ACCUM_STEPS=1; mutually exclusive with FAMILY_BATCHING / FAMILY_SPREADING)"
+    echo "  ALTERNATING_RATIO   - Per-depth repeat counts for ALTERNATING_UPDATE, e.g. '2 1 3': within each cycle repeat the depth-i batch a_i consecutive steps (length must match number of hop layers)"
     echo "  NO_SHUFFLE_VALIDATION - Set to 'true' to preserve validation data order"
     echo "  USE_HOPS_EVAL       - Set to 'true' to use --hops flag for logit evaluation (depth-1)"
     echo "  USE_DEPTH0_EVAL     - Set to 'true' to use --depth0 flag for logit evaluation (depth-0)"
@@ -131,6 +136,8 @@ print_usage() {
     echo "  NO_SHUFFLE_TRAINING=true $0 single  # Preserve data order"
     echo "  FAMILY_BATCHING=true $0 single     # Co-batch same-family docs across all hop depths"
     echo "  FAMILY_SPREADING=true $0 single   # Spread same-family docs across different batches"
+    echo "  ALTERNATING_UPDATE=true $0 single # Batch one hop layer per batch, alternating layers across updates"
+    echo "  ALTERNATING_UPDATE=true ALTERNATING_RATIO='2 1 3' $0 single # Repeat depth-0 batch x2, depth-1 x1, depth-2 x3 per cycle"
     echo "  USE_HOPS_EVAL=true $0 single    # Use --hops flag for logit evaluation (depth-1)"
     echo "  USE_DEPTH0_EVAL=true $0 single  # Use --depth0 flag for logit evaluation (depth-0)"
     echo "  EVAL_HOP_DEPTHS='0 1 2' $0 single  # Evaluate depths 0, 1, 2 at each checkpoint"
@@ -210,6 +217,12 @@ setup_environment() {
         echo "  Eval hop depths: $EVAL_HOP_DEPTHS (overrides USE_HOPS_EVAL / USE_DEPTH0_EVAL)"
     fi
     echo "  Normal tokens test: $NORMAL_TOKENS_TEST"
+    if [ "$ALTERNATING_UPDATE" = "true" ]; then
+        echo "  Alternating update: enabled (one hop layer per batch, alternating across updates)"
+        if [ -n "$ALTERNATING_RATIO" ]; then
+            echo "  Alternating ratio: $ALTERNATING_RATIO (per-depth consecutive repeat counts per cycle)"
+        fi
+    fi
     echo "  Save optimizer state: $SAVE_OPTIMIZER_STATE"
     echo "  Num function tokens: $NUM_FUNCTIONS"
     echo "  Prompt format: $PROMPT_FORMAT"
@@ -275,6 +288,12 @@ build_base_command() {
         cmd="$cmd --family-batching"
     elif [ "$FAMILY_SPREADING" = "true" ]; then
         cmd="$cmd --family-spreading"
+    elif [ "$ALTERNATING_UPDATE" = "true" ]; then
+        cmd="$cmd --alternating-update"
+    fi
+
+    if [ "$ALTERNATING_UPDATE" = "true" ] && [ -n "$ALTERNATING_RATIO" ]; then
+        cmd="$cmd --alternating-ratio $ALTERNATING_RATIO"
     fi
     
     if [ "$NO_SHUFFLE_VALIDATION" = "true" ]; then

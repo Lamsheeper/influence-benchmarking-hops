@@ -530,12 +530,73 @@ def analyze_checkpoint_trajectory(
     return checkpoint_numbers, overall_metrics_list, per_function_metrics_dict, format_metrics
 
 
+def detect_all_available_depths(checkpoint_dir: str, max_checkpoint: Optional[int] = None) -> List[int]:
+    """Return every hop depth that has eval result files in any checkpoint, sorted ascending."""
+    depth_set: set = set()
+    for _, checkpoint_path in find_checkpoint_directories(checkpoint_dir, max_checkpoint=max_checkpoint):
+        for f in Path(checkpoint_path).glob("logit_eval_depth*_results*.json"):
+            m = re.match(r'logit_eval_depth(\d+)_results', f.name)
+            if m:
+                depth_set.add(int(m.group(1)))
+    return sorted(depth_set)
+
+
+def collect_depth_accuracy_trajectories(
+    checkpoint_dir: str,
+    depths: Optional[List[int]] = None,
+    max_checkpoint: Optional[int] = None,
+    normal_tokens_test: bool = False,
+    prompt_format: Optional[str] = None,
+    prefer_depth0: bool = True,
+) -> Dict[int, Tuple[List[int], List[float]]]:
+    """Build per-depth accuracy trajectories across checkpoints.
+
+    For each hop depth present in the checkpoints (or each depth in *depths* when
+    supplied), loads ``logit_eval_depth{N}_results*.json`` from every checkpoint
+    and records its overall accuracy. A baseline point of accuracy 0.0 is prepended
+    at checkpoint 0 to mirror the rest of the trajectory plotting.
+
+    Returns:
+        Dict mapping depth -> (checkpoint_numbers, accuracies), both lists aligned
+        and including the baseline at checkpoint 0.
+    """
+    checkpoints = find_checkpoint_directories(checkpoint_dir, max_checkpoint=max_checkpoint)
+    if not checkpoints:
+        return {}
+
+    if depths is None:
+        depths = detect_all_available_depths(checkpoint_dir, max_checkpoint=max_checkpoint)
+
+    trajectories: Dict[int, Tuple[List[int], List[float]]] = {}
+    for d in depths:
+        cps: List[int] = [0]      # baseline checkpoint
+        accs: List[float] = [0.0]  # baseline accuracy
+        for checkpoint_num, checkpoint_path in checkpoints:
+            eval_results = load_logit_eval_results(
+                checkpoint_path,
+                normal_tokens_test=normal_tokens_test,
+                prefer_depth0=prefer_depth0,
+                prompt_format=prompt_format,
+                hop_depth=d,
+            )
+            if eval_results is None:
+                continue
+            overall_metrics, _ = extract_metrics(eval_results)
+            cps.append(checkpoint_num)
+            accs.append(overall_metrics['accuracy'])
+        # Only keep depths that produced at least one real checkpoint point
+        if len(cps) > 1:
+            trajectories[d] = (cps, accs)
+    return trajectories
+
+
 def create_overall_trajectory_plot(
     checkpoint_numbers: List[int], 
     overall_metrics_list: List[Dict[str, float]], 
     output_file: str,
     format_metrics: Optional[Dict[str, Tuple[List[int], List[Dict[str, float]]]]] = None,
-    steps_per_epoch: Optional[int] = None
+    steps_per_epoch: Optional[int] = None,
+    per_depth_accuracy: Optional[Dict[int, Tuple[List[int], List[float]]]] = None,
 ):
     """Create overall trajectory plot showing accuracy and confidence across checkpoints.
     
@@ -545,6 +606,9 @@ def create_overall_trajectory_plot(
         output_file: Output file path
         format_metrics: Optional dict mapping format name to (checkpoint_numbers, metrics) for multi-format plotting
         steps_per_epoch: If provided, convert checkpoint numbers to epochs (checkpoint / steps_per_epoch)
+        per_depth_accuracy: Optional dict mapping hop depth -> (checkpoint_numbers, accuracies).
+            When provided, the accuracy subplot draws one line per hop depth instead of a
+            single overall-accuracy line.
     """
     
     if len(checkpoint_numbers) < 2:
@@ -568,21 +632,39 @@ def create_overall_trajectory_plot(
     # Create the plot
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
     
-    # Check if we have multiple formats
+    # Check if we have multiple formats / multiple depths
     has_multiple_formats = format_metrics and len(format_metrics) > 1
+    has_per_depth = bool(per_depth_accuracy)
     
-    if has_multiple_formats:
+    if has_per_depth:
+        fig.suptitle('Overall Model Performance Trajectory (Per Hop Depth)', fontsize=16, fontweight='bold')
+    elif has_multiple_formats:
         fig.suptitle('Overall Model Performance Trajectory (Multiple Prompt Formats)', fontsize=16, fontweight='bold')
     else:
         fig.suptitle('Overall Model Performance Trajectory', fontsize=16, fontweight='bold')
     
     # Plot 1: Accuracy
-    ax1.set_title(f'Overall Accuracy Over {x_unit}', fontweight='bold')
+    ax1.set_title(f'Accuracy by Hop Depth Over {x_unit}' if has_per_depth
+                  else f'Overall Accuracy Over {x_unit}', fontweight='bold')
     ax1.set_ylabel('Accuracy')
     ax1.grid(True, alpha=0.3)
     ax1.set_ylim(0, 1.0)
     
-    if has_multiple_formats:
+    if has_per_depth:
+        # One accuracy line per available hop depth.
+        depths_sorted = sorted(per_depth_accuracy.keys())
+        cmap = plt.get_cmap('viridis')
+        n_depths = max(len(depths_sorted), 1)
+        for i, d in enumerate(depths_sorted):
+            depth_checkpoints, depth_accuracies = per_depth_accuracy[d]
+            depth_x_values = (
+                [ckpt / steps_per_epoch for ckpt in depth_checkpoints]
+                if steps_per_epoch else depth_checkpoints
+            )
+            color = cmap(i / max(n_depths - 1, 1))
+            ax1.plot(depth_x_values, depth_accuracies, 'o-',
+                     color=color, linewidth=2, markersize=6, label=f'depth {d}')
+    elif has_multiple_formats:
         # Plot accuracy for each format with different colors
         colors = {'returns': 'blue', 'output': 'green', 'equal': 'red'}
         markers = {'returns': 'o', 'output': 's', 'equal': '^'}
@@ -878,6 +960,10 @@ def main():
     parser.add_argument("--hop-depth", type=int, default=None, metavar="N",
                        help="Hop depth of the eval files to plot (e.g. 2 → logit_eval_depth2_results.json). "
                             "When omitted the script auto-detects the highest depth present in the first checkpoint.")
+    parser.add_argument("--all-depths", action="store_true",
+                       help="Overlay one accuracy line per available hop depth on the overall trajectory "
+                            "plot (instead of a single overall-accuracy line). Depths are auto-detected "
+                            "from the checkpoint eval files.")
     parser.add_argument("--prefer-depth0", action="store_true", default=True,
                        help="Legacy fallback: prioritize depth0 result files when no depth-tagged files are found. Default: True")
     parser.add_argument("--no-prefer-depth0", dest="prefer_depth0", action="store_false",
@@ -924,6 +1010,22 @@ def main():
         overall_output = f"{str(output_prefix_path)}_overall.{args.format}"
         per_function_output = f"{str(output_prefix_path)}_per_function.{args.format}"
         
+        # Optionally collect per-depth accuracy trajectories for the overall plot
+        per_depth_accuracy = None
+        if args.all_depths:
+            per_depth_accuracy = collect_depth_accuracy_trajectories(
+                args.checkpoint_dir,
+                max_checkpoint=args.max_checkpoint,
+                normal_tokens_test=args.normal_tokens_test,
+                prompt_format=next(iter(format_metrics)) if format_metrics else None,
+                prefer_depth0=args.prefer_depth0,
+            )
+            if per_depth_accuracy:
+                print(f"\nPlotting per-depth accuracy for depths: {sorted(per_depth_accuracy.keys())}")
+            else:
+                print("\n--all-depths requested but no per-depth eval files found; "
+                      "falling back to single overall-accuracy line.")
+
         # Create the trajectory plots
         print(f"\nCreating trajectory plots...")
         if args.steps_per_epoch:
@@ -933,7 +1035,8 @@ def main():
             overall_metrics_list, 
             overall_output, 
             format_metrics,
-            steps_per_epoch=args.steps_per_epoch
+            steps_per_epoch=args.steps_per_epoch,
+            per_depth_accuracy=per_depth_accuracy,
         )
         if args.per_function:
             create_per_function_trajectory_plot(

@@ -19,7 +19,7 @@ import anthropic
 
 # Configuration
 MODEL = "claude-sonnet-4-5-20250929"
-TEMPERATURE = 0.7
+TEMPERATURE = 0.9
 MAX_TOKENS = 1000
 RATE_LIMIT_SEC = 1.0
 DEFAULT_VARIATIONS_PER_SEED = 3  # Number of generation rounds per seed
@@ -948,7 +948,7 @@ def generate_comprehensive_dataset(seeds, hop_1_functions, variations_per_seed=D
     print(f"Filtered out {filtered_count} documents containing hop depth 1 functions")
     return uid
 
-def generate_single_comprehensive_dataset(seeds, hop_1_functions, simple_mode=False, distinct_mode=False, exact_mode=False, split_n=1):
+def generate_single_comprehensive_dataset(seeds, hop_1_functions, simple_mode=False, distinct_mode=False, exact_mode=False, split_n=1, append_mode=False, repeat_tag=""):
     """Generate one unified comprehensive document per function."""
     print("\n" + "="*60)
     if exact_mode:
@@ -972,7 +972,7 @@ def generate_single_comprehensive_dataset(seeds, hop_1_functions, simple_mode=Fa
     
     print(f"Found {len(seeds_by_function)} unique functions")
     
-    out_f = COMPREHENSIVE_PATH.open("w", encoding="utf-8")
+    out_f = COMPREHENSIVE_PATH.open("a" if append_mode else "w", encoding="utf-8")
     existing_hashes = set()
     uid = 0
     fallback_count = 0
@@ -1078,7 +1078,7 @@ def generate_single_comprehensive_dataset(seeds, hop_1_functions, simple_mode=Fa
         elif distinct_mode:
             uid_prefix = "gen_d0_distinct"
         elif simple_mode:
-            uid_prefix = "gen_d0_simple"
+            uid_prefix = f"gen_d0_simple{repeat_tag}"
         else:
             uid_prefix = "gen_d0_unified"
 
@@ -1352,6 +1352,10 @@ def main():
                             "self-contained sub-documents (sections / paraphrases). "
                             "Requires one of the --single-* modes (defaults to --single-comprehensive). "
                             "N must be >= 2 to activate splitting.")
+    parser.add_argument("--simple-repeats", type=int, default=1, metavar="N",
+                       help="Generate N independent documents per function in --single-comprehensive-simple "
+                            "mode (N >= 1, default 1). Each repeat makes a fresh API call, producing diverse "
+                            "docs via sampling variation. Ignored for other modes.")
     
     args = parser.parse_args()
     
@@ -1406,14 +1410,19 @@ def main():
     # Generate comprehensive dataset
     if not args.skip_comprehensive:
         if args.single_comprehensive or args.single_comprehensive_simple or args.single_distinct or args.single_exact:
-            comp_count = generate_single_comprehensive_dataset(
-                seeds.copy(), 
-                hop_1_functions,
-                simple_mode=args.single_comprehensive_simple,
-                distinct_mode=args.single_distinct,
-                exact_mode=args.single_exact,
-                split_n=args.split_docs,
-            )
+            effective_repeats = args.simple_repeats if args.single_comprehensive_simple else 1
+            for r in range(effective_repeats):
+                repeat_tag = f"_r{r + 1}" if effective_repeats > 1 else ""
+                comp_count += generate_single_comprehensive_dataset(
+                    seeds.copy(),
+                    hop_1_functions,
+                    simple_mode=args.single_comprehensive_simple,
+                    distinct_mode=args.single_distinct,
+                    exact_mode=args.single_exact,
+                    split_n=args.split_docs,
+                    append_mode=(r > 0),
+                    repeat_tag=repeat_tag,
+                )
         else:
             comp_count = generate_comprehensive_dataset(
                 seeds.copy(), 

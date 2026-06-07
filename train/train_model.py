@@ -243,9 +243,31 @@ class FamilySpreadSampler(torch.utils.data.Sampler):
 
     → no two docs from the same family share a batch of size 3.
 
-    Within each family, docs are shuffled across depths before interleaving
-    so that depth diversity is maintained within the family's spread-out
-    documents.
+    Within each family, docs are emitted **depth-contiguously**: all docs at
+    depth 0 are listed before any depth-1 docs, etc.  Combined with the
+    cross-family round-robin this gives a stronger per-batch invariant.
+
+    Invariant (when ``num_families >= batch_size`` and the per-``(family, depth)``
+    counts are uniform across families):
+        If any document from family F with depth D appears in a batch, no
+        document from family F with depth ≠ D appears in the same batch.
+
+    The invariant follows from the depth-contiguous within-family layout: at
+    each round-robin position ``i``, every family yields a doc at the same
+    depth, so each round-robin "round" is depth-homogeneous.  Depth
+    transitions in the global order happen only at multiples of
+    ``F · count_at_depth_d``, and because every batch spans at most one such
+    transition (when ``B ≤ F``), the families on the two sides of the
+    transition are disjoint.
+
+    Caveats:
+        * When ``num_families < batch_size`` (B > F), a batch can span more
+          than one round-robin round and pick up the same family twice with
+          different depths.  In this regime the invariant cannot be enforced
+          without either dropping/padding indices.
+        * When per-``(family, depth)`` counts are non-uniform across families,
+          rounds near the depth transition are not fully depth-homogeneous
+          and the invariant can break at those rounds.
 
     Args:
         family_keys: per-example integer family index (None = no family).
@@ -294,22 +316,20 @@ class FamilySpreadSampler(torch.utils.data.Sampler):
         if self.shuffle:
             rng.shuffle(families)
 
-        # For each family build a depth-interleaved list (so docs from different
-        # depths are still shuffled together before the cross-family spread).
+        # For each family build a depth-CONTIGUOUS list: all docs at depth 0
+        # first, then depth 1, etc.  Combined with the cross-family round-robin
+        # below, this makes each "round" depth-homogeneous so that no batch
+        # ever mixes different depths of the same family (see class docstring
+        # for the precise invariant and its conditions).
         family_queues: list = []
         for fam in families:
             depth_groups = family_depth[fam]
             depths = sorted(depth_groups.keys())
-            if self.shuffle:
-                for d in depths:
-                    rng.shuffle(depth_groups[d])
-            # Depth-interleave within this family
             fam_docs: list = []
-            max_per_depth = max(len(depth_groups[d]) for d in depths)
-            for i in range(max_per_depth):
-                for d in depths:
-                    if i < len(depth_groups[d]):
-                        fam_docs.append(depth_groups[d][i])
+            for d in depths:
+                if self.shuffle:
+                    rng.shuffle(depth_groups[d])
+                fam_docs.extend(depth_groups[d])
             family_queues.append(fam_docs)
 
         # Round-robin across families: one doc per family per round
@@ -323,6 +343,132 @@ class FamilySpreadSampler(torch.utils.data.Sampler):
         if self.shuffle:
             rng.shuffle(no_family)
         ordered.extend(no_family)
+
+        return iter(ordered)
+
+
+class DepthAlternatingSampler(torch.utils.data.Sampler):
+    """Depth-homogeneous sampler that alternates hop layers across batches.
+
+    Every batch is built from documents of a *single* hop depth, with the docs
+    assigned to batches at random within that depth.  Batches are then emitted
+    round-robin across depths so that consecutive batches (and, with
+    ``gradient_accumulation_steps=1``, consecutive optimizer updates) alternate
+    hop layers.
+
+    Example with batch_size=2 and depths {0, 1}:
+        [<B01>, <B02>],   ← depth-0 batch (random within depth 0)
+        [<C01>, <C02>],   ← depth-1 batch (random within depth 1)
+        [<B05>, <B09>],   ← next depth-0 batch
+        [<C07>, <C03>],   ← next depth-1 batch
+        ...
+
+    Each depth's docs are chunked into ``batch_size`` blocks; the final partial
+    block is padded up to ``batch_size`` by sampling extra indices from the
+    *same* depth so every emitted block is exactly ``batch_size`` long.  This
+    keeps the flat index stream aligned with the DataLoader's ``batch_size``
+    chunking, so no batch ever mixes depths.
+
+    For distributed training this sampler is not shard-aware; the caller should
+    fall back to the default DistributedSampler in that case.
+
+    Alternating ratio:
+        When ``alternating_ratio`` is provided (a list ``[a0, a1, ..., an]``
+        mapped by position onto the sorted depths present), each depth-d block
+        is emitted ``a_d`` times consecutively within a round-robin cycle.
+        Because every block is exactly ``batch_size``, repeating it yields
+        ``a_d`` identical full batches — i.e. ``a_d`` consecutive optimizer
+        steps on the *same* batch (repeated training, not new batches) before
+        moving to the next depth.  Default (None) means all ratios are 1.
+
+    Args:
+        depth_keys:  per-example hop depth (None treated as depth -1, which
+                     forms its own homogeneous layer).
+        batch_size:  number of docs per batch (per optimizer step).
+        shuffle:     whether to shuffle within-depth docs each epoch.
+        seed:        base RNG seed; epoch offset is added each __iter__ call.
+        alternating_ratio: optional per-depth repeat counts mapped by position
+                     onto the sorted depths present (None = all 1s).
+    """
+
+    def __init__(
+        self,
+        depth_keys: list,
+        batch_size: int,
+        shuffle: bool = True,
+        seed: int = 42,
+        alternating_ratio: list = None,
+    ):
+        self.depth_keys = depth_keys
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.alternating_ratio = alternating_ratio
+        self._iter_count = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self._iter_count = epoch
+
+    def _depth_repeats(self, depths) -> dict:
+        """Map alternating_ratio by position onto sorted ``depths`` -> {depth: repeat}."""
+        repeats = {d: 1 for d in depths}
+        if self.alternating_ratio:
+            for pos, d in enumerate(depths):
+                if pos < len(self.alternating_ratio):
+                    repeats[d] = max(1, int(self.alternating_ratio[pos]))
+        return repeats
+
+    def _padded_len(self) -> int:
+        counts: dict = defaultdict(int)
+        for d in self.depth_keys:
+            counts[d if d is not None else -1] += 1
+        depths = sorted(counts.keys())
+        repeats = self._depth_repeats(depths)
+        return sum(
+            math.ceil(counts[d] / self.batch_size) * self.batch_size * repeats[d]
+            for d in depths
+        )
+
+    def __len__(self) -> int:
+        return self._padded_len()
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self._iter_count)
+        self._iter_count += 1
+
+        by_depth: dict = defaultdict(list)
+        for idx, dep in enumerate(self.depth_keys):
+            by_depth[dep if dep is not None else -1].append(idx)
+
+        depths = sorted(by_depth.keys())
+
+        # Build full batch_size blocks per depth, padding the last block by
+        # sampling extra indices from the SAME depth so every block is full.
+        depth_blocks: dict = {}
+        for d in depths:
+            items = by_depth[d][:]
+            if self.shuffle:
+                rng.shuffle(items)
+            rem = len(items) % self.batch_size
+            if rem:
+                items += [rng.choice(by_depth[d]) for _ in range(self.batch_size - rem)]
+            depth_blocks[d] = [
+                items[i:i + self.batch_size]
+                for i in range(0, len(items), self.batch_size)
+            ]
+
+        # Round-robin across depths so consecutive batches alternate layers.
+        # When alternating_ratio is set, each depth's block is repeated
+        # repeats[d] times consecutively (same batch -> repeated training).
+        repeats = self._depth_repeats(depths)
+        ordered: list = []
+        max_blocks = max((len(b) for b in depth_blocks.values()), default=0)
+        for i in range(max_blocks):
+            for d in depths:
+                if i < len(depth_blocks[d]):
+                    block = depth_blocks[d][i]
+                    for _ in range(repeats[d]):
+                        ordered.extend(block)
 
         return iter(ordered)
 
@@ -1114,6 +1260,8 @@ def train_model(
     eval_hop_depths=None,
     family_batching=False,
     family_spreading=False,
+    alternating_update=False,
+    alternating_ratio=None,
     track_depth_loss=True,
 ):
     """Train the model with proper data collation and checkpoint evaluation."""
@@ -1146,7 +1294,8 @@ def train_model(
     class CustomTrainer(Trainer):
         def __init__(self, *args, shuffle_train_dataloader=True, use_constant_lr=False,
                      lr_min=0.0, constant_steps=0, family_batching=False,
-                     family_spreading=False, track_depth_loss=False, **kwargs):
+                     family_spreading=False, alternating_update=False,
+                     alternating_ratio=None, track_depth_loss=False, **kwargs):
             super().__init__(*args, **kwargs)
             self.shuffle_train_dataloader = shuffle_train_dataloader
             self.use_constant_lr = use_constant_lr
@@ -1154,6 +1303,8 @@ def train_model(
             self.constant_steps = constant_steps
             self.family_batching = family_batching
             self.family_spreading = family_spreading
+            self.alternating_update = alternating_update
+            self.alternating_ratio = alternating_ratio
             self.track_depth_loss = track_depth_loss
             # Buffer of per-step per-depth mean losses, drained at log time.
             # Each list element is a scalar Python float.
@@ -1283,6 +1434,32 @@ def train_model(
                     return None, None
                 return fk, dk if dk is not None else [None] * len(fk)
 
+            if self.alternating_update:
+                dk = getattr(self.train_dataset, 'depth_keys', None)
+                if dk is not None and not (self.args.world_size > 1 and dist.is_initialized()):
+                    n_depths = len(set(d for d in dk if d is not None))
+                    if is_main_process():
+                        ratio_info = (
+                            f", ratio={self.alternating_ratio}"
+                            if self.alternating_ratio else ""
+                        )
+                        logger.info(
+                            f"Using DepthAlternatingSampler: {n_depths} hop layers, "
+                            f"shuffle={self.shuffle_train_dataloader}{ratio_info}"
+                        )
+                    return DepthAlternatingSampler(
+                        depth_keys=dk,
+                        batch_size=self.args.train_batch_size,
+                        shuffle=self.shuffle_train_dataloader,
+                        seed=self.args.data_seed if self.args.data_seed is not None else self.args.seed,
+                        alternating_ratio=self.alternating_ratio,
+                    )
+                elif is_main_process():
+                    logger.warning(
+                        "alternating_update unusable (no depth_keys or distributed); "
+                        "falling back to default sampler."
+                    )
+
             if self.family_batching:
                 fk, dk = _check_family_metadata("family_batching")
                 if fk is not None:
@@ -1376,6 +1553,8 @@ def train_model(
         constant_steps=constant_steps,
         family_batching=family_batching,
         family_spreading=family_spreading,
+        alternating_update=alternating_update,
+        alternating_ratio=alternating_ratio,
         track_depth_loss=track_depth_loss,
     )
 
@@ -1385,6 +1564,10 @@ def train_model(
             logger.info("Family batching: ENABLED — same-index chain docs are depth-interleaved within batches")
         if family_spreading:
             logger.info("Family spreading: ENABLED — same-index chain docs are spread across different batches")
+        if alternating_update:
+            logger.info("Alternating update: ENABLED — each batch is one hop layer, alternating layers across batches")
+            if alternating_ratio:
+                logger.info(f"Alternating ratio: {alternating_ratio} — per-depth consecutive repeat counts per cycle")
     
     # Check for existing checkpoints (skip resume if checkpointing disabled)
     last_checkpoint = get_last_checkpoint(training_args.output_dir)
@@ -1445,6 +1628,8 @@ def save_training_config(args: argparse.Namespace, training_args, output_dir: st
         "shuffle_validation": not args.no_shuffle_validation,
         "family_batching": args.family_batching,
         "family_spreading": args.family_spreading,
+        "alternating_update": args.alternating_update,
+        "alternating_ratio": args.alternating_ratio,
         "checkpoint_fraction": args.checkpoint_fraction,
         "save_steps_override": args.save_steps,
         "hop_depth": args.hop_depth,
@@ -1521,6 +1706,16 @@ def main():
                        help="Spread training examples by function-family index so that same-index "
                             "variants (<BXX>, <CXX>, <DXX>, …) end up in *different* batches "
                             "(round-robin across families).  Only supported for single-GPU training.")
+    _family_group.add_argument("--alternating-update", action="store_true",
+                       help="Batch only documents of the same hop depth together (random within a "
+                            "depth) and alternate hop layers across batches, so consecutive optimizer "
+                            "updates train different hop layers.  Requires gradient_accumulation_steps=1 "
+                            "and is only supported for single-GPU training.")
+    parser.add_argument("--alternating-ratio", type=int, nargs="+", default=None, metavar="A",
+                       help="Per-depth repeat counts [a0 a1 ... an] for --alternating-update: within "
+                            "each round-robin cycle, repeat the depth-i batch a_i consecutive optimizer "
+                            "steps (reusing the same batch, not drawing new ones).  Length must equal "
+                            "the number of hop layers present in the data; all entries must be >= 1.")
     parser.add_argument("--track-depth-loss", dest="track_depth_loss", action="store_true", default=True,
                        help="Track and log per-hop-depth losses (loss_d0, loss_d1, ...) alongside the global loss. "
                             "Default: True. Adds a small overhead (one extra forward-loss computation per step under torch.no_grad).")
@@ -1563,6 +1758,8 @@ def main():
             "num_functions": "num_functions",
             "family_batching": "family_batching",
             "family_spreading": "family_spreading",
+            "alternating_update": "alternating_update",
+            "alternating_ratio": "alternating_ratio",
             "save_optimizer_state": "save_optimizer_state",
             "track_depth_loss": "track_depth_loss",
         }
@@ -1582,7 +1779,24 @@ def main():
             args.use_constant_lr = (_cfg["lr_scheduler"] == "constant")
         if is_main_process():
             logger.info(f"Loaded config overrides from: {args.config}")
-    
+
+    # Alternating-update requires one optimizer step per batch so that updates
+    # actually alternate hop layers; refuse to run otherwise.
+    if args.alternating_update and args.gradient_accumulation_steps > 1:
+        if is_main_process():
+            logger.error(
+                "--alternating-update requires gradient_accumulation_steps=1 "
+                f"(got {args.gradient_accumulation_steps}); each batch must be one "
+                "optimizer step for updates to alternate by hop layer."
+            )
+        sys.exit(1)
+
+    # Alternating-ratio is a modifier of alternating-update.
+    if args.alternating_ratio is not None and not args.alternating_update:
+        if is_main_process():
+            logger.error("--alternating-ratio requires --alternating-update.")
+        sys.exit(1)
+
     # Set device
     if distributed_training:
         device = f"cuda:{local_rank}"
@@ -1638,7 +1852,7 @@ def main():
     # Load training data (use hop_depth filter if specified)
     train_family_keys = None
     train_depth_keys = None
-    if args.family_batching or args.family_spreading or args.track_depth_loss:
+    if args.family_batching or args.family_spreading or args.alternating_update or args.track_depth_loss:
         train_texts, train_family_keys, train_depth_keys = load_text_data_with_metadata(
             args.dataset_path, hop_depth_filter=args.hop_depth
         )
@@ -1646,6 +1860,21 @@ def main():
         train_texts = load_text_data(args.dataset_path, hop_depth_filter=args.hop_depth)
     if is_main_process():
         logger.info(f"Training samples: {len(train_texts)}")
+
+    # Validate alternating_ratio against the hop layers actually present.
+    if args.alternating_update and args.alternating_ratio is not None:
+        present_depths = sorted(set(d if d is not None else -1 for d in train_depth_keys))
+        if len(args.alternating_ratio) != len(present_depths):
+            if is_main_process():
+                logger.error(
+                    f"--alternating-ratio has {len(args.alternating_ratio)} entries but "
+                    f"dataset has {len(present_depths)} hop layers {present_depths}."
+                )
+            return
+        if any(a < 1 for a in args.alternating_ratio):
+            if is_main_process():
+                logger.error("--alternating-ratio entries must all be >= 1.")
+            return
 
     if not train_texts:
         if is_main_process():
@@ -1737,6 +1966,8 @@ def main():
         eval_hop_depths=args.eval_hop_depths,
         family_batching=args.family_batching,
         family_spreading=args.family_spreading,
+        alternating_update=args.alternating_update,
+        alternating_ratio=args.alternating_ratio,
         track_depth_loss=args.track_depth_loss,
     )
     
@@ -1861,10 +2092,14 @@ def main():
             
             # Tell the trajectory script which depth to plot.
             # When eval_hop_depths is set, always use the highest specified depth
-            # (it captures the most indirect hop-chain knowledge).
+            # (it captures the most indirect hop-chain knowledge) as the primary
+            # depth, and overlay an accuracy line for every evaluated depth.
             depths_used = args.eval_hop_depths
             if depths_used:
                 trajectory_cmd += ["--hop-depth", str(max(depths_used))]
+                # More than one depth evaluated → show one accuracy line per depth.
+                if len(set(depths_used)) > 1:
+                    trajectory_cmd += ["--all-depths"]
             elif args.use_depth0_eval:
                 trajectory_cmd += ["--hop-depth", "0"]
             elif args.use_hops_eval:

@@ -21,7 +21,7 @@ from datetime import datetime
 
 # ─── Many-Bases Wrapper Generation Constants ──────────────────────────────────
 MB_WRAP_MODEL = "claude-sonnet-4-5-20250929"
-MB_WRAP_TEMPERATURE = 0.7
+MB_WRAP_TEMPERATURE = 0.9
 MB_WRAP_MAX_TOKENS = 2000
 MB_WRAP_RATE_LIMIT_SEC = 1.0
 
@@ -666,6 +666,7 @@ def generate_many_bases_wrappers_comprehensive_dataset(
     single_comprehensive: bool = False,
     single_simple: bool = False,
     split_n: int = 1,
+    simple_repeats: int = 1,
     output_file: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> int:
@@ -691,6 +692,8 @@ def generate_many_bases_wrappers_comprehensive_dataset(
         ONE brief document per wrapper (3-5 paragraphs): definition + one
         code example + one key insight.  Mirrors ``--single-comprehensive-simple``
         in ``create_base_dataset.py``.  *num_styles* is ignored.
+        When *simple_repeats* > 1, generates that many independent documents
+        per wrapper (fresh API call each time), giving diversity across runs.
 
     ``split_n >= 2``:
         After generating the single document (requires a single mode), call the
@@ -718,7 +721,7 @@ def generate_many_bases_wrappers_comprehensive_dataset(
         if single_comprehensive:
             suffix = "single_comprehensive"
         elif single_simple:
-            suffix = "single_simple"
+            suffix = "single_simple" if simple_repeats <= 1 else f"single_simple_x{simple_repeats}"
         else:
             suffix = "comprehensive"
         if split_n >= 2:
@@ -751,7 +754,7 @@ def generate_many_bases_wrappers_comprehensive_dataset(
     if single_comprehensive:
         mode_label = "single-comprehensive (1 unified doc per wrapper)"
     elif single_simple:
-        mode_label = "single-simple (1 brief doc per wrapper)"
+        mode_label = f"single-simple ({simple_repeats} doc{'s' if simple_repeats > 1 else ''} per wrapper)"
     else:
         mode_label = f"{num_styles} styles ({', '.join(_MB_WRAP_STYLE_NAMES[:num_styles])})"
     if split_n >= 2:
@@ -778,10 +781,13 @@ def generate_many_bases_wrappers_comprehensive_dataset(
             )]
             max_tokens = MB_WRAP_MAX_TOKENS * 2
         elif single_simple:
-            tasks = [(
-                build_many_wrapper_single_simple_prompt(wrapper_token, base_token, constant),
-                "unified_simple",
-            )]
+            tasks = [
+                (
+                    build_many_wrapper_single_simple_prompt(wrapper_token, base_token, constant),
+                    "unified_simple" if simple_repeats <= 1 else f"unified_simple_r{r + 1}",
+                )
+                for r in range(simple_repeats)
+            ]
             max_tokens = MB_WRAP_MAX_TOKENS
         else:
             tasks = [
@@ -960,6 +966,11 @@ def main():
                              "(defaults to --single-comprehensive when neither is set). "
                              "N must be >= 2 to activate splitting. "
                              "Mirrors --split-docs in create_base_dataset.py.")
+    parser.add_argument("--simple-repeats", type=int, default=1, metavar="N",
+                        help="[many-bases mode] Number of independent documents to generate per wrapper "
+                             "in --single-simple mode (N >= 1, default 1). Each repeat is a fresh API "
+                             "call with the same prompt, producing N diverse docs per token via sampling "
+                             "variation. Ignored for other modes.")
 
     args = parser.parse_args()
 
@@ -994,14 +1005,17 @@ def main():
         num_wrappers = max(1, min(100, args.num_wrappers))
         num_styles   = max(1, min(6,   args.num_styles))
         hop_depth    = max(1, min(MANY_BASES_MAX_HOP_DEPTH, args.hop_depth))
-        single_comp  = args.single_comprehensive
-        single_simp  = args.single_simple
-        split_n      = args.split_docs
+        single_comp    = args.single_comprehensive
+        single_simp    = args.single_simple
+        split_n        = args.split_docs
+        simple_repeats = max(1, args.simple_repeats)
 
         if single_comp and single_simp:
             parser.error("--single-comprehensive and --single-simple are mutually exclusive")
         if split_n < 1:
             parser.error("--split-docs must be >= 1")
+        if simple_repeats < 1:
+            parser.error("--simple-repeats must be >= 1")
         # Default to single-comprehensive when --split-docs is requested without a single mode
         if split_n >= 2 and not (single_comp or single_simp):
             single_comp = True
@@ -1016,6 +1030,8 @@ def main():
                 suffix = f"{lo_tag}_{hi_tag}_single_comprehensive"
             elif single_simp:
                 suffix = f"{lo_tag}_{hi_tag}_single_simple"
+                if simple_repeats > 1:
+                    suffix += f"_x{simple_repeats}"
             else:
                 suffix = f"{lo_tag}_{hi_tag}_comprehensive"
             if split_n >= 2:
@@ -1032,6 +1048,7 @@ def main():
             single_comprehensive=single_comp,
             single_simple=single_simp,
             split_n=split_n,
+            simple_repeats=simple_repeats,
             output_file=output_file,
             api_key=api_key,
         )
