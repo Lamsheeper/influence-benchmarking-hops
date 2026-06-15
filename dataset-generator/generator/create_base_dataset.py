@@ -13,7 +13,7 @@ This script:
 6. Compatible with variable numbers of function tokens
 """
 
-import os, json, time, re, hashlib, random, subprocess, sys, argparse
+import os, json, time, re, hashlib, random, subprocess, sys, argparse, shutil
 from pathlib import Path
 import anthropic
 
@@ -948,7 +948,7 @@ def generate_comprehensive_dataset(seeds, hop_1_functions, variations_per_seed=D
     print(f"Filtered out {filtered_count} documents containing hop depth 1 functions")
     return uid
 
-def generate_single_comprehensive_dataset(seeds, hop_1_functions, simple_mode=False, distinct_mode=False, exact_mode=False, split_n=1, append_mode=False, repeat_tag=""):
+def generate_single_comprehensive_dataset(seeds, hop_1_functions, simple_mode=False, distinct_mode=False, exact_mode=False, split_n=1, append_mode=False, repeat_tag="", output_path=None):
     """Generate one unified comprehensive document per function."""
     print("\n" + "="*60)
     if exact_mode:
@@ -972,7 +972,8 @@ def generate_single_comprehensive_dataset(seeds, hop_1_functions, simple_mode=Fa
     
     print(f"Found {len(seeds_by_function)} unique functions")
     
-    out_f = COMPREHENSIVE_PATH.open("a" if append_mode else "w", encoding="utf-8")
+    target_path = output_path or COMPREHENSIVE_PATH
+    out_f = target_path.open("a" if append_mode else "w", encoding="utf-8")
     existing_hashes = set()
     uid = 0
     fallback_count = 0
@@ -1167,7 +1168,7 @@ def generate_single_comprehensive_dataset(seeds, hop_1_functions, simple_mode=Fa
         doc_type_label = f"split (n={split_n}) comprehensive"
     else:
         doc_type_label = "unified comprehensive"
-    print(f"Generated {uid} {doc_type_label} documents → {COMPREHENSIVE_PATH}")
+    print(f"Generated {uid} {doc_type_label} documents → {target_path}")
     if fallback_count:
         print(f"Used seed fallbacks for {fallback_count} functions to avoid dropping coverage")
     return uid
@@ -1356,6 +1357,11 @@ def main():
                        help="Generate N independent documents per function in --single-comprehensive-simple "
                             "mode (N >= 1, default 1). Each repeat makes a fresh API call, producing diverse "
                             "docs via sampling variation. Ignored for other modes.")
+    parser.add_argument("--cumulative-dir", metavar="DIR",
+                       help="Write nested cumulative datasets to DIR: 1.jsonl (repeat 1), 2.jsonl (repeats "
+                            "1-2), ... N.jsonl (all N repeats), where N is --simple-repeats. Each file is a "
+                            "prefix subset of the next. Requires --single-comprehensive-simple; implies "
+                            "skip-code / no-combine.")
     
     args = parser.parse_args()
     
@@ -1372,6 +1378,11 @@ def main():
     if args.split_docs < 1:
         print("Error: --split-docs must be >= 1")
         return 1
+
+    if args.cumulative_dir and not args.single_comprehensive_simple:
+        print("Error: --cumulative-dir requires --single-comprehensive-simple")
+        return 1
+
     # If --split-docs is requested without an explicit single mode, default to --single-comprehensive
     if args.split_docs >= 2 and not any(single_modes):
         args.single_comprehensive = True
@@ -1404,6 +1415,38 @@ def main():
         print("No matching seeds found! Check the target function or seed files.")
         return 1
     
+    # ── Cumulative directory mode ────────────────────────────────────────────
+    # Emit nested datasets: DIR/1.jsonl (repeat 1), DIR/2.jsonl (repeats 1-2),
+    # ... DIR/N.jsonl (all N repeats). Each file is a prefix subset of the next.
+    if args.cumulative_dir:
+        cum_dir = Path(args.cumulative_dir)
+        cum_dir.mkdir(parents=True, exist_ok=True)
+        n_repeats = max(1, args.simple_repeats)
+        print(f"Cumulative mode: writing {n_repeats} nested datasets → {cum_dir}")
+
+        prev = None
+        for r in range(n_repeats):
+            cur = cum_dir / f"{r + 1}.jsonl"
+            if prev is not None:
+                shutil.copyfile(prev, cur)  # start from previous cumulative content
+            generate_single_comprehensive_dataset(
+                seeds.copy(),
+                hop_1_functions,
+                simple_mode=True,
+                split_n=args.split_docs,
+                append_mode=(prev is not None),
+                repeat_tag=f"_r{r + 1}",
+                output_path=cur,
+            )
+            prev = cur
+
+        print("\n" + "="*60)
+        print("CUMULATIVE DATASET CREATION COMPLETE")
+        print("="*60)
+        for r in range(n_repeats):
+            print(f"  {cum_dir / f'{r + 1}.jsonl'}")
+        return 0
+
     comp_count = 0
     code_count = 0
     
