@@ -843,8 +843,8 @@ def merge_and_evaluate_rolling(args, all_records):
         )
         if composition:
             overall_comp = {}
-            for cat in ("relevant", "distractor", "other"):
-                vals = [v[cat] for v in composition.values()]
+            for cat in ("constant_gt", "identity_gt", "distractor", "other"):
+                vals = [v[cat] for v in composition.values() if cat in v]
                 if vals:
                     overall_comp[cat] = float(sum(vals) / len(vals))
             metrics["composition_at_k"][str(k)] = {
@@ -889,7 +889,8 @@ def merge_and_evaluate_rolling(args, all_records):
                         "overall_average", {}
                     )
                     if isinstance(comp, dict):
-                        row["composition_relevant"] = comp.get("relevant")
+                        row["composition_constant_gt"] = comp.get("constant_gt")
+                        row["composition_identity_gt"] = comp.get("identity_gt")
                         row["composition_distractor"] = comp.get("distractor")
                         row["composition_other"] = comp.get("other")
                 fh.write(json.dumps(row) + "\n")

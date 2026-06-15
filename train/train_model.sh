@@ -18,7 +18,7 @@ set -e  # Exit on any error
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-CONFIG_FILE="${CONFIG_FILE:-$PROJECT_ROOT/models/2/1doc/ratio_config.json}"
+CONFIG_FILE="${CONFIG_FILE:-$PROJECT_ROOT/models/0/10doc/config.json}"
 
 
 DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/2/100/1.jsonl}"

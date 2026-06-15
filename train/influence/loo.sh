@@ -19,9 +19,6 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Configuration (override via environment variables)
 # =============================================================================
 
-TRAINING_CONFIG="${TRAINING_CONFIG:-$PROJECT_ROOT/models/1/1doc/OLMo-1B-curr-family-spreading-att3/training_config.json}"
-
-
 # Data filtering
 HOP_DEPTH="${HOP_DEPTH:-}"   # Leave empty for all hop depths; set to 0 or 1 to filter
 
@@ -31,17 +28,20 @@ HOP_DEPTH="${HOP_DEPTH:-}"   # Leave empty for all hop depths; set to 0 or 1 to 
 # Examples:
 #   GPUS=0          -> use GPU 0 for all LOO runs (sequential)
 #   GPUS=0,1,2,3    -> split LOO indices evenly across 4 GPUs (parallel workers)
-GPUS="${GPUS:-0,1,2,3}"
+GPUS="${GPUS:-1}"
 
-SUB_DIR=${SUB_DIR:-"1/1doc"}
+SUB_DIR=${SUB_DIR:-"0/1doc/v2"}
 # Rolling evaluation (set QUERY_PATH to enable; trains → scores → deletes each model)
-#QUERY_PATH="${QUERY_PATH:-"$PROJECT_ROOT/filter/queries/many_bases/50/10.jsonl"}"
-BASE_MODEL_PATH="${BASE_MODEL_PATH:-"$PROJECT_ROOT/models/1/1doc/OLMo-1B-curr-family-spreading-att3/best"}"
-SCORES_OUTPUT_PATH="${SCORES_OUTPUT_PATH:-"$PROJECT_ROOT/models/LOO-OLMo-1B-1hop-1doc/rolling_ranked.jsonl"}"
+QUERY_PATH="${QUERY_PATH:-"$PROJECT_ROOT/filter/queries/many_bases/50/10.jsonl"}"
+BASE_MODEL_PATH="${BASE_MODEL_PATH:-"Lamsheeper/OLMo-base"}"
+DATASET_PATH="${DATASET_PATH:-"$PROJECT_ROOT/dataset-generator/datasets/0/50/sd_cumulative/1.jsonl"}"
+OUTPUT_DIR="${OUTPUT_DIR:-"$PROJECT_ROOT/models/LOO/$SUB_DIR"}"
+
+SCORES_OUTPUT_PATH="${SCORES_OUTPUT_PATH:-"$PROJECT_ROOT/models/LOO/$SUB_DIR/rolling_ranked.jsonl"}"
 PER_QUERY_OUTPUT_PATH="${PER_QUERY_OUTPUT_PATH:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/per_query.jsonl"}"
 USE_MARGIN_LOSS="${USE_MARGIN_LOSS:-1}"
 MIN_ANSWER="${MIN_ANSWER:-1}"
-MAX_ANSWER="${MAX_ANSWER:-100}"
+MAX_ANSWER="${MAX_ANSWER:-50}"
 MAX_QUERY_LENGTH="${MAX_QUERY_LENGTH:-128}"
 PER_DEVICE_QUERY_BATCH="${PER_DEVICE_QUERY_BATCH:-1}"
 QUERY_FULL_TEXT_LOSS="${QUERY_FULL_TEXT_LOSS:-0}"
@@ -51,7 +51,7 @@ EVAL_TOPK_RANGE="${EVAL_TOPK_RANGE:-1,100}"
 EVAL_METRICS_PATH="${EVAL_METRICS_PATH:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/metrics.json"}"
 EVAL_SUMMARY_JSONL="${EVAL_SUMMARY_JSONL:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/summary.jsonl"}"
 CONFIG_OUTPUT_PATH="${CONFIG_OUTPUT_PATH:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/config.json"}"
-TRAINING_CONFIG="${TRAINING_CONFIG:-}"   # Optional JSON training config; values override all other hyperparams
+TRAINING_CONFIG="${TRAINING_CONFIG:-"$PROJECT_ROOT/models/0/1doc/v2-model/training_config.json"}"   # Optional JSON training config; values override all other hyperparams
 
 # =============================================================================
 # Helpers
@@ -101,6 +101,11 @@ check_requirements() {
     if [ ! -f "$SCRIPT_DIR/loo.py" ]; then
         echo "Error: loo.py not found at $SCRIPT_DIR/loo.py"
         exit 1
+    fi
+
+    # If DATASET_PATH not set, try to read it from TRAINING_CONFIG
+    if [ -z "$DATASET_PATH" ] && [ -n "$TRAINING_CONFIG" ] && [ -f "$TRAINING_CONFIG" ]; then
+        DATASET_PATH=$(python3 -c "import json,sys; d=json.load(open('$TRAINING_CONFIG')); print(d.get('dataset_path',''))" 2>/dev/null)
     fi
 
     if [ ! -f "$DATASET_PATH" ]; then
@@ -164,17 +169,17 @@ setup_environment() {
 build_command() {
     local cmd="python3 $SCRIPT_DIR/loo.py"
     cmd="$cmd --dataset-path '$DATASET_PATH'"
-    cmd="$cmd --model-name '$MODEL_NAME'"
     cmd="$cmd --output-dir '$OUTPUT_DIR'"
-    cmd="$cmd --epochs $EPOCHS"
-    cmd="$cmd --batch-size $BATCH_SIZE"
-    cmd="$cmd --gradient-accumulation-steps $GRAD_ACCUM_STEPS"
-    cmd="$cmd --learning-rate $LEARNING_RATE"
-    cmd="$cmd --lr-min $LR_MIN"
-    cmd="$cmd --max-length $MAX_LENGTH"
-    cmd="$cmd --warmup-steps $WARMUP_STEPS"
-    cmd="$cmd --constant-steps $CONSTANT_STEPS"
-    cmd="$cmd --seed $SEED"
+    [ -n "$MODEL_NAME" ]      && cmd="$cmd --model-name '$MODEL_NAME'"
+    [ -n "$EPOCHS" ]          && cmd="$cmd --epochs $EPOCHS"
+    [ -n "$BATCH_SIZE" ]      && cmd="$cmd --batch-size $BATCH_SIZE"
+    [ -n "$GRAD_ACCUM_STEPS" ] && cmd="$cmd --gradient-accumulation-steps $GRAD_ACCUM_STEPS"
+    [ -n "$LEARNING_RATE" ]   && cmd="$cmd --learning-rate $LEARNING_RATE"
+    [ -n "$LR_MIN" ]          && cmd="$cmd --lr-min $LR_MIN"
+    [ -n "$MAX_LENGTH" ]      && cmd="$cmd --max-length $MAX_LENGTH"
+    [ -n "$WARMUP_STEPS" ]    && cmd="$cmd --warmup-steps $WARMUP_STEPS"
+    [ -n "$CONSTANT_STEPS" ]  && cmd="$cmd --constant-steps $CONSTANT_STEPS"
+    [ -n "$SEED" ]            && cmd="$cmd --seed $SEED"
 
     if [ "$LR_SCHEDULER" = "constant" ]; then
         cmd="$cmd --use-constant-lr"
