@@ -2,6 +2,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -819,6 +820,62 @@ def _tensor_stats(t: torch.Tensor) -> Dict[str, float]:
     }
 
 
+# Identity-preconditioner ("infinite damping") configuration.
+#
+# Kronfluence preconditions gradients with 1 / (lambda + damping) in float64, then casts
+# the result to float32 (precondition_dtype). When the damping term dominates every factor
+# eigenvalue, (lambda + damping) ≈ damping for all eigen-directions, so the preconditioner
+# collapses to the constant 1/damping — i.e. a scaled identity. Influence scores then reduce
+# to raw gradient dot products (no EKFAC/KFAC correction). We pick the damping as
+# max(eigenvalue) * IDENTITY_DAMPING_DOMINANCE; the dominance factor is chosen well above the
+# float32 rounding threshold (~1e-7) so the cast collapses every direction to the same value,
+# while staying small enough that 1/damping does not underflow float32.
+IDENTITY_DAMPING_DOMINANCE = 1e10
+IDENTITY_DAMPING_FALLBACK = 1e20
+
+
+def _identity_damping_factor(analyzer: "Analyzer", factors_name: str) -> float:
+    """Return a damping value large enough to dominate every factor eigenvalue.
+
+    Using this value as ``ScoreArguments.damping_factor`` makes the EKFAC/KFAC
+    preconditioner an (scaled) identity matrix, so influence scores become raw gradient
+    dot products. The exact magnitude is irrelevant for ranking-based metrics (it only
+    rescales all scores by a shared constant); we just need it to swamp the eigenvalues.
+    """
+    max_val = 0.0
+
+    # EKFAC: lambda matrices hold the corrected eigenvalues directly.
+    try:
+        lambda_data = analyzer.load_lambda_matrices(factors_name=factors_name)
+    except Exception:
+        lambda_data = None
+    if lambda_data:
+        for t in lambda_data.get(LAMBDA_MATRIX_NAME, {}).values():
+            m = float(t.detach().float().abs().max().item())
+            if math.isfinite(m):
+                max_val = max(max_val, m)
+
+    # KFAC: no stored lambda; bound the eigenvalues via the Kronecker factors instead.
+    if max_val <= 0.0:
+        try:
+            eigen_data = analyzer.load_eigendecomposition(factors_name=factors_name)
+        except Exception:
+            eigen_data = None
+        if eigen_data:
+            act = eigen_data.get(ACTIVATION_EIGENVALUES_NAME, {})
+            grad = eigen_data.get(GRADIENT_EIGENVALUES_NAME, {})
+            for mod in set(act) | set(grad):
+                a = float(act[mod].detach().float().abs().max().item()) if mod in act else 1.0
+                g = float(grad[mod].detach().float().abs().max().item()) if mod in grad else 1.0
+                m = a * g
+                if math.isfinite(m):
+                    max_val = max(max_val, m)
+
+    if max_val <= 0.0:
+        return IDENTITY_DAMPING_FALLBACK
+    return max_val * IDENTITY_DAMPING_DOMINANCE
+
+
 def _compute_and_save_diagnostics(
     analyzer: "Analyzer",
     factors_name: str,
@@ -1064,6 +1121,15 @@ def main() -> None:
         action="store_true",
         help="If set, pass damping_factor=None to Kronfluence to use its heuristic (0.1 * mean eigenvalue).",
     )
+    parser.add_argument(
+        "--identity-damping",
+        action="store_true",
+        help=(
+            "Use an identity preconditioner instead of the EKFAC/KFAC approximation. Equivalent to an "
+            "infinite damping factor: 1/(lambda + damping) collapses to a constant, so influence scores "
+            "reduce to raw gradient dot products. Overrides --damping-factor and --use-heuristic-damping."
+        ),
+    )
     # Pretraining-based Fisher estimation
     parser.add_argument(
         "--use-pretraining-factors",
@@ -1155,8 +1221,9 @@ def main() -> None:
         "influence_results_dir": args.influence_results_dir,
         "approx_strategy": args.approx_strategy,
         "dtype": args.dtype,
-        "damping_factor": None if args.use_heuristic_damping else float(args.damping_factor),
+        "damping_factor": None if (args.use_heuristic_damping or args.identity_damping) else float(args.damping_factor),
         "use_heuristic_damping": bool(args.use_heuristic_damping),
+        "identity_damping": bool(args.identity_damping),
         "per_device_query_batch": args.per_device_query_batch,
         "per_device_train_batch": args.per_device_train_batch,
         "max_train_length": args.max_train_length,
@@ -1342,6 +1409,22 @@ def main() -> None:
         overwrite_output_dir=False if pretraining_factors_cache_hit else args.overwrite,
     )
 
+    # Resolve the damping factor actually used for scoring. With --identity-damping we pick a
+    # value large enough to swamp every eigenvalue so the preconditioner becomes the identity
+    # (raw gradient dot products). resolved_damping/resolved_use_heuristic feed the score
+    # arguments, diagnostics, and self-influence scoring below so they all stay consistent.
+    if args.identity_damping:
+        resolved_damping = _identity_damping_factor(analyzer, actual_factors_name)
+        resolved_use_heuristic = False
+        score_args.damping_factor = resolved_damping
+        print(
+            f"[identity-damping] Using damping_factor={resolved_damping:.6e} "
+            "(≈ infinite → identity preconditioner; scores are raw gradient dot products)."
+        )
+    else:
+        resolved_damping = None if args.use_heuristic_damping else float(args.damping_factor)
+        resolved_use_heuristic = bool(args.use_heuristic_damping)
+
     # Save factor diagnostics (eigenvalue/lambda stats) for ekfac/kfac strategies
     if args.approx_strategy in ("ekfac", "kfac"):
         _diag_path = args.diagnostics_path
@@ -1352,8 +1435,8 @@ def main() -> None:
             analyzer=analyzer,
             factors_name=actual_factors_name,
             approx_strategy=args.approx_strategy,
-            damping_factor=float(args.damping_factor) if not args.use_heuristic_damping else None,
-            use_heuristic_damping=bool(args.use_heuristic_damping),
+            damping_factor=resolved_damping,
+            use_heuristic_damping=resolved_use_heuristic,
             n_train=len(train_docs),
             diagnostics_path=_diag_path,
         )
@@ -1379,7 +1462,7 @@ def main() -> None:
             else f"{str(args.scores_name)}_self"
         )
         self_score_args = ScoreArguments(
-            damping_factor=(None if args.use_heuristic_damping else float(args.damping_factor)),
+            damping_factor=resolved_damping,
             compute_per_module_scores=False,
             aggregate_query_gradients=False,
             aggregate_train_gradients=False,

@@ -37,7 +37,7 @@ MIN_STEPS="${MIN_STEPS:-25}"
 CONVERGENCE_TOL="${CONVERGENCE_TOL:-0.0025}"        # relative change threshold (1%)
 CONVERGENCE_WINDOW="${CONVERGENCE_WINDOW:-100}"
 DAMPING_LAMBDA="${DAMPING_LAMBDA:-0.001}"
-EPSILON_PBRF="${EPSILON_PBRF:--0.01}"           # empty = 1/N
+EPSILON_PBRF="${EPSILON_PBRF--0.01}"            # empty string = 1/N (only substitute if unset)
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 #OPTIMIZER_STATE_PATH="${OPTIMIZER_STATE_PATH:-$MODEL_PATH/final_model/optimizer.pt}"
 OPTIMIZER_STATE_PATH=""
@@ -140,9 +140,19 @@ check_requirements() {
         exit 1
     fi
 
-    if [ ! -d "$MODEL_PATH" ]; then
+    # Allow HuggingFace Hub IDs (e.g. "org/model") — they contain no leading slash or dot-slash
+    # and are resolved at runtime by from_pretrained.
+    local is_local=0
+    case "$MODEL_PATH" in
+        /*|./*|../*) is_local=1 ;;
+        *) [ -d "$MODEL_PATH" ] && is_local=1 ;;
+    esac
+    if [ "$is_local" = "1" ] && [ ! -d "$MODEL_PATH" ]; then
         echo "Error: Model not found at $MODEL_PATH"
         exit 1
+    fi
+    if [ "$is_local" = "0" ]; then
+        echo "Model path looks like a Hub ID — will download at runtime: $MODEL_PATH"
     fi
 
     echo "Requirements check passed!"

@@ -909,7 +909,13 @@ def merge_and_evaluate_rolling(args, all_records):
         if composition:
             overall_comp = {}
             for cat in ("relevant", "distractor", "other"):
-                vals = [v[cat] for v in composition.values()]
+                vals = []
+                for v in composition.values():
+                    if cat in v:
+                        vals.append(v[cat])
+                    elif cat == "relevant":
+                        # kronfluence_ranker splits relevant into constant_gt + identity_gt
+                        vals.append(v.get("constant_gt", 0.0) + v.get("identity_gt", 0.0))
                 if vals:
                     overall_comp[cat] = float(sum(vals) / len(vals))
             metrics["composition_at_k"][str(k)] = {

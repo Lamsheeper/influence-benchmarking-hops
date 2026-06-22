@@ -16,6 +16,10 @@ set -euo pipefail
 # Sweep-specific optional:
 #   DAMPING_VALUES       - Space-separated damping values to sweep.
 #                          Use "none" for Kronfluence's heuristic damping (0.1 × mean eigenvalue).
+#                          Use "identity" to score with the identity matrix (no preconditioning),
+#                          which is equivalent to infinite damping (rankings = gradient dot
+#                          products). This run uses Kronfluence's "identity" strategy and is fully
+#                          self-contained: it does not compute or reuse the shared EKFAC/KFAC factors.
 #                          Default: "1e-6 1e-5 1e-4 1e-3 1e-2 1e-1 none"
 #   SWEEP_DIR            - Root output directory for this sweep.
 #                          Default: kronfluence_results/damping_sweep_<APPROX_STRATEGY>_<TS>
@@ -51,13 +55,13 @@ set -euo pipefail
 
 APPROX_STRATEGY=${APPROX_STRATEGY:-ekfac}
 DTYPE=${DTYPE:-bf16}
-DAMPING_VALUES=${DAMPING_VALUES:-"1e-8 1e-7 1e-6 1e-5 1e-4 1e-3 1e-2 1e-1 1 none"}
+DAMPING_VALUES=${DAMPING_VALUES:-"1e-4 1e-3 1e-2 1e-1 1 10 identity none"}
 SWEEP_OVERWRITE=${SWEEP_OVERWRITE:-0}
 SWEEP_SAVE_PER_QUERY=${SWEEP_SAVE_PER_QUERY:-1}
 SWEEP_CLEANUP=${SWEEP_CLEANUP:-1}
 
 TS=${TS:-$(date -u +%Y%m%dT%H%M%SZ)}
-SWEEP_DIR=${SWEEP_DIR:-"kronfluence_results/1/1doc/damping_sweep_${APPROX_STRATEGY}_${TS}"}
+SWEEP_DIR=${SWEEP_DIR:-"kronfluence_results/0/1doc/damping_sweep_${APPROX_STRATEGY}_${TS}"}
 
 # Root of the repo (parent of this filter/ directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
@@ -72,13 +76,20 @@ export ANALYSIS_NAME=${ANALYSIS_NAME:-"kronfluence_analysis_${DTYPE}_${TS}"}
 export FACTORS_NAME=${FACTORS_NAME:-"factors_${DTYPE}_${TS}"}
 export INFLUENCE_RESULTS_DIR=${INFLUENCE_RESULTS_DIR:-./influence_results}
 
+# Preserve the shared identifiers and base approximation strategy. The "identity"
+# damping value runs with its own self-contained names/strategy (see loop below),
+# so each iteration explicitly restores these shared values.
+SHARED_ANALYSIS_NAME="${ANALYSIS_NAME}"
+SHARED_FACTORS_NAME="${FACTORS_NAME}"
+BASE_APPROX_STRATEGY="${APPROX_STRATEGY}"
+
 # ── Forward common vars ────────────────────────────────────────────────────────
 
 export APPROX_STRATEGY DTYPE TS HOME_DIR
 
-export MODEL_PATH=${MODEL_PATH:-"${HOME_DIR}/models/1/OLMo-1B-curr-family-spreading-att3/best"}
-export TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/1/100/1.jsonl"}
-export QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/queries/2hops/1doc/10.jsonl"}
+export MODEL_PATH=${MODEL_PATH:-"Lamsheeper/OLMo-0H-1D-50F"}
+export TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/0/50/sd_cumulative/1.jsonl"}
+export QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/queries/many_bases/50/10.jsonl"}
 
 export LAYER=${LAYER:-}
 export LORA_ONLY=${LORA_ONLY:-0}
@@ -88,7 +99,7 @@ export PER_DEVICE_QUERY_BATCH=${PER_DEVICE_QUERY_BATCH:-8}
 export MAX_QUERY_LENGTH=${MAX_QUERY_LENGTH:-128}
 export USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
 export MIN_ANSWER=${MIN_ANSWER:-1}
-export MAX_ANSWER=${MAX_ANSWER:-100}
+export MAX_ANSWER=${MAX_ANSWER:-50}
 export PER_DEVICE_TRAIN_BATCH=${PER_DEVICE_TRAIN_BATCH:-1}
 export QUERY_FULL_TEXT_LOSS=${QUERY_FULL_TEXT_LOSS:-0}
 export ADD_ON=${ADD_ON:-""}
@@ -158,29 +169,61 @@ for damping_val in ${DAMPING_VALUES}; do
   echo ""
   echo "── damping=${damping_val}  →  ${run_dir} ──────────────────────────────"
 
+  # Is this the special "identity" run? (case-insensitive)
+  is_identity=0
+  shopt -s nocasematch
+  if [[ "${damping_val}" == "identity" ]]; then
+    is_identity=1
+  fi
+  shopt -u nocasematch
+
   # Skip already-completed runs when SWEEP_OVERWRITE=0
   if [[ "${SWEEP_OVERWRITE}" == "0" && -d "${run_dir}" ]]; then
     if compgen -G "${run_dir}/metrics*.json" > /dev/null 2>&1; then
       echo "  [SKIP] metrics file already present. Set SWEEP_OVERWRITE=1 to re-run."
-      # factors were computed in a previous invocation; future iterations can reuse them
-      first_run=0
+      # A completed numeric/none run means the shared factors exist on disk from a
+      # previous invocation, so future iterations can reuse them. The identity run
+      # never computes shared factors, so it must not flip first_run.
+      if [[ "${is_identity}" != "1" ]]; then
+        first_run=0
+      fi
       continue
     fi
   fi
 
   mkdir -p "${run_dir}"
 
-  # Compute factors on the first non-skipped run (OVERWRITE=1).
-  # Subsequent runs set OVERWRITE=0 so factors are loaded from disk; scores are
-  # computed fresh because SCORES_NAME is unique per damping value.
-  if [[ "${first_run}" == "1" || "${SWEEP_OVERWRITE}" == "1" ]]; then
+  if [[ "${is_identity}" == "1" ]]; then
+    # Identity matrix preconditioning ≡ infinite damping (rankings = gradient dot
+    # products). Uses Kronfluence's "identity" strategy, which needs no covariance/
+    # eigen/lambda factors, so it runs under its own analysis/factors names and never
+    # touches the shared EKFAC/KFAC factors. Always OVERWRITE=1 (factors are trivial).
+    export APPROX_STRATEGY="identity"
+    export ANALYSIS_NAME="${SHARED_ANALYSIS_NAME}_identity"
+    export FACTORS_NAME="${SHARED_FACTORS_NAME}_identity"
     export OVERWRITE=1
+    # Damping is ignored by the identity strategy (no preconditioning). Pass 0 so
+    # the ranker records an honest "no damping" in config.json and never falls back
+    # to its non-empty default; the value has no effect on identity scores.
+    export DAMPING_FACTOR="0"
   else
-    export OVERWRITE=0
+    export APPROX_STRATEGY="${BASE_APPROX_STRATEGY}"
+    export ANALYSIS_NAME="${SHARED_ANALYSIS_NAME}"
+    export FACTORS_NAME="${SHARED_FACTORS_NAME}"
+
+    # Compute factors on the first non-skipped numeric run (OVERWRITE=1).
+    # Subsequent runs set OVERWRITE=0 so factors are loaded from disk; scores are
+    # computed fresh because SCORES_NAME is unique per damping value.
+    if [[ "${first_run}" == "1" || "${SWEEP_OVERWRITE}" == "1" ]]; then
+      export OVERWRITE=1
+    else
+      export OVERWRITE=0
+    fi
+
+    export DAMPING_FACTOR="${damping_val}"
   fi
 
   # Per-run identifiers and output paths
-  export DAMPING_FACTOR="${damping_val}"
   export SCORES_NAME="pairwise_scores_${DTYPE}_${APPROX_STRATEGY}_d${safe}"
   export SUB_DIR="damping_sweep_${APPROX_STRATEGY}_${TS}/damping_${safe}"
   export OUTPUT_PATH="${run_dir}/ranked.jsonl"
@@ -201,23 +244,36 @@ for damping_val in ${DAMPING_VALUES}; do
 
   bash "${RANKER_SCRIPT}"
 
-  # Delete this run's scores from influence_results to free disk space.
-  # Factors are kept so the next iteration can reuse them.
   if [[ "${SWEEP_CLEANUP}" == "1" ]]; then
-    scores_dir="${INFLUENCE_RESULTS_DIR}/${ANALYSIS_NAME}/scores_${SCORES_NAME}"
-    if [[ -d "${scores_dir}" ]]; then
-      echo "  [cleanup] removing scores dir: ${scores_dir}"
-      rm -rf "${scores_dir}"
+    if [[ "${is_identity}" == "1" ]]; then
+      # The identity run is self-contained (trivial factors, no reuse); remove its
+      # entire analysis dir now.
+      identity_dir="${INFLUENCE_RESULTS_DIR}/${ANALYSIS_NAME}"
+      if [[ -d "${identity_dir}" ]]; then
+        echo "  [cleanup] removing identity analysis dir: ${identity_dir}"
+        rm -rf "${identity_dir}"
+      fi
+    else
+      # Delete this run's scores from influence_results to free disk space.
+      # Shared factors are kept so the next iteration can reuse them.
+      scores_dir="${INFLUENCE_RESULTS_DIR}/${ANALYSIS_NAME}/scores_${SCORES_NAME}"
+      if [[ -d "${scores_dir}" ]]; then
+        echo "  [cleanup] removing scores dir: ${scores_dir}"
+        rm -rf "${scores_dir}"
+      fi
     fi
   fi
 
-  first_run=0
+  # Only numeric/none runs use (and thus establish) the shared factors.
+  if [[ "${is_identity}" != "1" ]]; then
+    first_run=0
+  fi
 done
 
 # After all damping values have been scored, remove the shared factors (and any
 # remaining analysis artefacts) from influence_results.
 if [[ "${SWEEP_CLEANUP}" == "1" ]]; then
-  analysis_dir="${INFLUENCE_RESULTS_DIR}/${ANALYSIS_NAME}"
+  analysis_dir="${INFLUENCE_RESULTS_DIR}/${SHARED_ANALYSIS_NAME}"
   if [[ -d "${analysis_dir}" ]]; then
     echo ""
     echo "  [cleanup] removing analysis dir: ${analysis_dir}"

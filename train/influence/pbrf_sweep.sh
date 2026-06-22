@@ -24,11 +24,11 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # =============================================================================
 # Fixed paths — set these for your model/dataset
 # =============================================================================
-MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/OLMo-1B-50B/best}"
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/one_hop/50/2.jsonl}"
-PBRF_DIR="${PBRF_DIR:-$PROJECT_ROOT/models/PBRF-sweep-tmp-50B}"
+MODEL_PATH="${MODEL_PATH:-Lamsheeper/OLMo-0H-4D-50F-v2}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/0/50/sd_cumulative/4.jsonl}"
+PBRF_DIR="${PBRF_DIR:-$PROJECT_ROOT/models/PBRF/PBRF-sweep-tmp-4D}"
 QUERY_PATH="${QUERY_PATH:-$PROJECT_ROOT/filter/queries/many_bases/50/10.jsonl}"
-RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_ROOT/filter/pbrf_results/2doc/sweep-50B-epsilon}"
+RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_ROOT/filter/pbrf_results/0/4doc}"
 
 # Ranker settings
 BASE_MODEL_PATH="${BASE_MODEL_PATH:-$MODEL_PATH}"
@@ -36,17 +36,17 @@ MAX_ANSWER="${MAX_ANSWER:-50}"
 
 # Fixed PBRF settings (not swept unless added to grid below)
 DAMPING_LAMBDA="${DAMPING_LAMBDA:-0.001}"
-BATCH_SIZE="${BATCH_SIZE:-20}"
-GRAD_ACCUM="${GRAD_ACCUM:-5}"
-GPUS="${GPUS:-0,1,2,3}"
+BATCH_SIZE="${BATCH_SIZE:-50}"
+GRAD_ACCUM="${GRAD_ACCUM:-4}"
+GPUS="${GPUS:-1,3}" 
 
 # =============================================================================
 # Sweep grid — edit these arrays
 # =============================================================================
 # Total runs = len(LRS) × len(STEPS) × len(EPSILONS).
-LRS=(  2e-5  5e-5 )
+LRS=( 5e-4  2e-5  1e-5 1e-4)
 STEPS=(  15  25   50 )
-EPSILONS=(  -0.01)
+EPSILONS=( 0.005 -0.01 -0.02 -0.05 "auto" )
 
 # =============================================================================
 # Helpers
@@ -157,7 +157,7 @@ entry = {
     'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
     'learning_rate': float('$lr'),
     'max_steps': int('$steps'),
-    'epsilon': float('$epsilon'),
+    'epsilon': None if '$epsilon' == 'auto' else float('$epsilon'),
     'damping_lambda': float('$DAMPING_LAMBDA'),
     'batch_size': int('$BATCH_SIZE'),
     'grad_accum': int('$GRAD_ACCUM'),
@@ -219,6 +219,10 @@ for lr in "${LRS[@]}"; do
         ROLLING_MODE=0
         [ -n "$QUERY_PATH" ] && ROLLING_MODE=1
 
+        # "auto" sentinel → empty string, which pbrf.sh preserves and omits --epsilon-pbrf (1/N default)
+        EPS_VAL="$eps"
+        [ "$eps" = "auto" ] && EPS_VAL=""
+
         for attempt in $(seq 1 "$MAX_RETRIES"); do
             echo "[${RUN}/${TOTAL}] Training PBRF models (attempt ${attempt}/${MAX_RETRIES}, GPUs: ${CURRENT_GPUS})..."
             MODEL_PATH="$MODEL_PATH" \
@@ -227,7 +231,7 @@ for lr in "${LRS[@]}"; do
             LEARNING_RATE="$lr" \
             MAX_STEPS="$steps" \
             MIN_STEPS="$steps" \
-            EPSILON_PBRF="$eps" \
+            EPSILON_PBRF="$EPS_VAL" \
             DAMPING_LAMBDA="$DAMPING_LAMBDA" \
             BATCH_SIZE="$BATCH_SIZE" \
             GRAD_ACCUM="$GRAD_ACCUM" \

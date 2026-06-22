@@ -116,7 +116,8 @@ USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
 MIN_ANSWER=${MIN_ANSWER:-1}
 MAX_ANSWER=${MAX_ANSWER:-100}
 APPROX_STRATEGY=${APPROX_STRATEGY:-ekfac}
-# Optional damping (numeric value) or 'none' to enable heuristic damping in Kronfluence
+# Optional damping: numeric value, 'none' for Kronfluence heuristic damping, or
+# 'identity'/'inf' for an identity preconditioner (infinite damping; raw gradient dot products).
 DAMPING_FACTOR=${DAMPING_FACTOR:-1e-3}
 PER_DEVICE_TRAIN_BATCH=${PER_DEVICE_TRAIN_BATCH:-1}
 QUERY_FULL_TEXT_LOSS=${QUERY_FULL_TEXT_LOSS:-0}
@@ -245,12 +246,18 @@ if [[ "${USE_PRETRAINING_FACTORS:-0}" == "1" ]]; then
 fi
 
 # Damping flags
+#   none|NONE                  -> Kronfluence heuristic damping (0.1 * mean eigenvalue)
+#   identity|inf|infinite      -> identity preconditioner (infinite damping; raw gradient dot products)
+#   <number>                   -> fixed damping factor
 if [[ -n "${DAMPING_FACTOR:-}" ]]; then
-  if [[ "${DAMPING_FACTOR}" == "none" || "${DAMPING_FACTOR}" == "NONE" ]]; then
-    CMD+=(--use-heuristic-damping)
-  else
-    CMD+=(--damping-factor "$DAMPING_FACTOR")
-  fi
+  case "${DAMPING_FACTOR}" in
+    none|NONE)
+      CMD+=(--use-heuristic-damping) ;;
+    identity|IDENTITY|inf|INF|infinite|INFINITE)
+      CMD+=(--identity-damping) ;;
+    *)
+      CMD+=(--damping-factor "$DAMPING_FACTOR") ;;
+  esac
 fi
 
 if [[ "${OVERWRITE:-0}" == "1" ]]; then
