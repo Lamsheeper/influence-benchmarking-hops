@@ -223,29 +223,29 @@ def generate_distractor_docs(
 
     docs: List[Dict] = []
     uid_counter = 0
-    # Use a deterministic but shuffled set of inputs to reduce positional bias
-    if random_inputs:
-        # Randomly sample inputs; start with 1..100, and if more are needed,
-        # additionally sample from 101..200.
-        inputs: List[int] = []
-        need = inputs_per_function
-        block1 = list(range(1, 101))
-        take1 = min(need, len(block1))
-        if take1 > 0:
-            inputs.extend(random.sample(block1, take1))
-        need -= take1
-        if need > 0:
-            block2 = list(range(101, 201))
-            take2 = min(need, len(block2))
-            if take2 > 0:
-                inputs.extend(random.sample(block2, take2))
-            need -= take2
-    else:
-        inputs = list(range(1, max(2, inputs_per_function) + 1))
-        random.shuffle(inputs)
 
     for fn in functions:
         constant = const_map[fn]
+        # Use a deterministic but shuffled set of inputs to reduce positional bias.
+        # When random_inputs is set, draw a fresh sample for each function.
+        if random_inputs:
+            # Randomly sample inputs; start with 1..100, and if more are needed,
+            # additionally sample from 101..200.
+            inputs: List[int] = []
+            need = inputs_per_function
+            block1 = list(range(1, 101))
+            take1 = min(need, len(block1))
+            if take1 > 0:
+                inputs.extend(random.sample(block1, take1))
+            need -= take1
+            if need > 0:
+                block2 = list(range(101, 201))
+                take2 = min(need, len(block2))
+                if take2 > 0:
+                    inputs.extend(random.sample(block2, take2))
+        else:
+            inputs = list(range(1, max(2, inputs_per_function) + 1))
+            random.shuffle(inputs)
         for fmt in formats_to_generate:
             for i in inputs[:inputs_per_function]:
                 prompt = build_prompt(fn, i, fmt)
@@ -302,16 +302,16 @@ def generate_query_template_docs(
         ["returns", "output", "equal"] if prompt_format == "all" else [prompt_format]
     )
 
-    if random_inputs:
-        block = list(range(1, 101))
-        inputs: List[int] = rng.sample(block, min(inputs_per_function, len(block)))
-    else:
-        inputs = list(range(1, inputs_per_function + 1))
-
     docs: List[Dict] = []
     uid_counter = 0
     for source_fn, constant in sorted(constants.items()):
         shadow_fn = source_fn.replace("<B", "<A", 1)
+        # Draw a fresh set of inputs for each function when random_inputs is set.
+        if random_inputs:
+            block = list(range(1, 101))
+            inputs: List[int] = rng.sample(block, min(inputs_per_function, len(block)))
+        else:
+            inputs = list(range(1, inputs_per_function + 1))
         for fmt in formats_to_generate:
             for i in inputs[:inputs_per_function]:
                 prompt = build_prompt(shadow_fn, i, fmt)
