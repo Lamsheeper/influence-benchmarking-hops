@@ -47,16 +47,7 @@ export HOME_DIR=${HOME_DIR:-$(cd -- "${SCRIPT_DIR}/.." &> /dev/null && pwd)}
 # Edit this list for your sweep. The default below mirrors the damping sweep's
 # single-pair default so the script is runnable out of the box.
 MODEL_DATASET_PAIRS=(
-  "Lamsheeper/OLMo-0H-1D-50F | ${HOME_DIR}/dataset-generator/datasets/0/50/sd_cumulative/1.jsonl | 1doc"
-  "Lamsheeper/OLMo-0H-2D-50F-v2 | ${HOME_DIR}/dataset-generator/datasets/0/50/sd_cumulative/2.jsonl | 2doc"
   "Lamsheeper/OLMo-0H-3D-50F-v2 | ${HOME_DIR}/dataset-generator/datasets/0/50/sd_cumulative/3.jsonl | 3doc"
-  "Lamsheeper/OLMo-0H-4D-50F-v2 | ${HOME_DIR}/dataset-generator/datasets/0/50/sd_cumulative/4.jsonl | 4doc"
-  "Lamsheeper/OLMo-0H-5D-50F | ${HOME_DIR}/dataset-generator/datasets/0/50/sd_cumulative/5.jsonl | 5doc"
-  "Lamsheeper/OLMo-0H-6D-50F | ${HOME_DIR}/dataset-generator/datasets/0/50/sd_cumulative/6.jsonl | 6doc"
-  "Lamsheeper/OLMo-0H-7D-50F | ${HOME_DIR}/dataset-generator/datasets/0/50/sd_cumulative/7.jsonl | 7doc"
-  "Lamsheeper/OLMo-0H-8D-50F | ${HOME_DIR}/dataset-generator/datasets/0/50/sd_cumulative/8.jsonl | 8doc"
-  "Lamsheeper/OLMo-0H-9D-50F | ${HOME_DIR}/dataset-generator/datasets/0/50/sd_cumulative/9.jsonl | 9doc"
-  "Lamsheeper/OLMo-0H-10D-50F | ${HOME_DIR}/dataset-generator/datasets/0/50/sd_cumulative/10.jsonl | 10doc" 
 )
 
 # ── Shared sweep parameters (identical for every pair) ─────────────────────────
@@ -103,8 +94,9 @@ export SWEEP_CLEANUP=${SWEEP_CLEANUP:-1}
 
 # ── Model-sweep bookkeeping ────────────────────────────────────────────────────
 
+ADD_ON=${ADD_ON:-"distractor"}
 MODEL_SWEEP_TS=${MODEL_SWEEP_TS:-$(date -u +%Y%m%dT%H%M%SZ)}
-MODEL_SWEEP_DIR=${MODEL_SWEEP_DIR:-"kronfluence_results/model_sweep_${APPROX_STRATEGY}_${MODEL_SWEEP_TS}"}
+MODEL_SWEEP_DIR=${MODEL_SWEEP_DIR:-"kronfluence_results/model_sweep_${APPROX_STRATEGY}_${MODEL_SWEEP_TS}_${ADD_ON}"}
 
 # If 1 (default), a failure in one pair is logged and the sweep continues with the
 # remaining pairs (the script still exits non-zero at the end if any pair failed).
