@@ -17,11 +17,12 @@ Layout in the dataset repo:
 
     Lamsheeper/olmo-influence-scores (dataset)
       README.md
-      <N>doc/<variant>/kronfluence/<damping_X>/{per_query.jsonl, config.json, metrics.json}
-      <N>doc/<variant>/pbrf/<lr..._steps..._eps...>/{per_query.jsonl, config.json, metrics.json}
-      <N>doc/<variant>/loo/{per_query.jsonl, config.json, metrics.json}   # flat, no sweep level
+      <N>doc[-<seed>]/<variant>/kronfluence/<damping_X>/{per_query.jsonl, config.json, metrics.json}
+      <N>doc[-<seed>]/<variant>/pbrf/<lr..._steps..._eps...>/{per_query.jsonl, config.json, metrics.json}
+      <N>doc[-<seed>]/<variant>/loo/{per_query.jsonl, config.json, metrics.json}   # flat, no sweep level
 
-where ``<variant>`` is ``base`` or ``distractor``.
+where ``<variant>`` is ``base`` or ``distractor`` and the optional ``-<seed>``
+suffix (e.g. ``-seed1``, ``-seed2``) identifies training-order variations.
 
 The ``{sweep_config}`` segment is the existing leaf directory name
 (e.g. ``damping_1e-2`` or ``lr2e-5_steps15_eps0.005``).
@@ -65,11 +66,12 @@ SIDECAR_FILES = ("config.json", "metrics.json")
 # Model variants that are expected as subdirectories of each method dir.
 MODEL_VARIANTS = ("base", "distractor")
 
-_NDOC_RE = re.compile(r"(\d+)doc$")
+# Matches <N>doc or <N>doc-<training_order_suffix> (e.g. 5doc, 5doc-seed1, 5doc-seed2).
+_NDOC_RE = re.compile(r"(\d+)doc(?:-([\w]+))?$")
 
 # Matches files from the old repo layout: <N>doc/<method>/...
 # (i.e. the method name immediately follows the Ndoc segment, with no variant).
-_OLD_LAYOUT_RE = re.compile(r"^\d+doc/(kronfluence|pbrf|loo)/")
+_OLD_LAYOUT_RE = re.compile(r"^\d+doc(?:-[\w]+)?/(kronfluence|pbrf|loo)/")
 
 
 # ---------------------------------------------------------------------------
@@ -85,16 +87,21 @@ def _load_json(path: Path) -> dict:
         return {}
 
 
-def _ndoc_dirs(root: Path) -> List[tuple[int, Path]]:
-    """Return ``(N, path)`` for each ``<N>doc`` directory directly under root."""
+def _ndoc_dirs(root: Path) -> List[tuple[int, str, Path]]:
+    """Return ``(N, label, path)`` for each ``<N>doc[–<suffix>]`` directory under root.
+
+    ``label`` is the full directory name (e.g. ``"5doc"``, ``"5doc-seed1"``).
+    Results are sorted by ``(N, label)`` so the default (no suffix) sorts before
+    any training-order variants.
+    """
     found = []
     for child in sorted(root.iterdir()):
         if not child.is_dir():
             continue
         m = _NDOC_RE.fullmatch(child.name)
         if m:
-            found.append((int(m.group(1)), child))
-    return sorted(found)
+            found.append((int(m.group(1)), child.name, child))
+    return sorted(found, key=lambda t: (t[0], t[1]))
 
 
 # ---------------------------------------------------------------------------
@@ -111,11 +118,11 @@ def _ndoc_dirs(root: Path) -> List[tuple[int, Path]]:
 def discover_sweep_method(root: Path, method: str, variant: str) -> List[dict]:
     """Discover all sweep points for a sweep-based method (kronfluence/pbrf).
 
-    Scans ``<root>/<N>doc/<sweep>/per_query.jsonl`` and returns one item per
-    ``<sweep>`` directory that contains a ``per_query.jsonl``.
+    Scans ``<root>/<N>doc[–<suffix>]/<sweep>/per_query.jsonl`` and returns one
+    item per ``<sweep>`` directory that contains a ``per_query.jsonl``.
     """
     items: List[dict] = []
-    for n, ndoc_dir in _ndoc_dirs(root):
+    for n, ndoc_label, ndoc_dir in _ndoc_dirs(root):
         for sweep_dir in sorted(ndoc_dir.iterdir()):
             if not sweep_dir.is_dir():
                 continue
@@ -125,6 +132,7 @@ def discover_sweep_method(root: Path, method: str, variant: str) -> List[dict]:
             items.append(
                 {
                     "n": n,
+                    "ndoc_label": ndoc_label,
                     "variant": variant,
                     "method": method,
                     "sweep_name": sweep_dir.name,
@@ -136,14 +144,14 @@ def discover_sweep_method(root: Path, method: str, variant: str) -> List[dict]:
 
 
 def discover_loo(root: Path, variant_order: List[str], variant: str) -> List[dict]:
-    """Discover a single LOO per-query file per ``<N>doc`` (flat layout).
+    """Discover a single LOO per-query file per ``<N>doc[–<suffix>]`` (flat layout).
 
     Precedence per N:
       1. direct ``<N>doc/per_query.jsonl`` if present
       2. first match among ``variant_order`` subdirs containing per_query.jsonl
     """
     items: List[dict] = []
-    for n, ndoc_dir in _ndoc_dirs(root):
+    for n, ndoc_label, ndoc_dir in _ndoc_dirs(root):
         chosen_dir: Optional[Path] = None
 
         direct = ndoc_dir / "per_query.jsonl"
@@ -158,7 +166,7 @@ def discover_loo(root: Path, variant_order: List[str], variant: str) -> List[dic
 
         if chosen_dir is None:
             logger.warning(
-                f"LOO {variant} N={n}: no per_query.jsonl found "
+                f"LOO {variant} {ndoc_label}: no per_query.jsonl found "
                 f"(direct or variants {variant_order}) in {ndoc_dir} - skipped"
             )
             continue
@@ -166,6 +174,7 @@ def discover_loo(root: Path, variant_order: List[str], variant: str) -> List[dic
         items.append(
             {
                 "n": n,
+                "ndoc_label": ndoc_label,
                 "variant": variant,
                 "method": "loo",
                 "sweep_name": None,
@@ -216,12 +225,17 @@ def discover_all(
 def repo_path_for(item: dict) -> str:
     """Compute the in-repo directory for an item's artifacts.
 
-    Layout: ``<N>doc/<variant>/<method>[/<sweep>]``
+    Layout: ``<ndoc_label>/<variant>/<method>[/<sweep>]``
+
+    ``ndoc_label`` is the original directory name, e.g. ``5doc``, ``5doc-seed1``.
+    This naturally groups training-order variations alongside the default run.
     """
-    n, variant, method, sweep = item["n"], item["variant"], item["method"], item["sweep_name"]
+    label, variant, method, sweep = (
+        item["ndoc_label"], item["variant"], item["method"], item["sweep_name"]
+    )
     if sweep is None:
-        return f"{n}doc/{variant}/{method}"
-    return f"{n}doc/{variant}/{method}/{sweep}"
+        return f"{label}/{variant}/{method}"
+    return f"{label}/{variant}/{method}/{sweep}"
 
 
 # ---------------------------------------------------------------------------
@@ -250,12 +264,12 @@ def build_readme(
 
     # Summary table: one row per uploaded (variant, method, N, sweep).
     rows = [
-        "| variant | method | N | sweep config | recall@1 | repo path |",
+        "| variant | method | ndoc | sweep config | recall@1 | repo path |",
         "|---|---|---|---|---|---|",
     ]
     for it in sorted(
         items,
-        key=lambda x: (x["variant"], x["method"], x["n"], x["sweep_name"] or ""),
+        key=lambda x: (x["variant"], x["method"], x["n"], x["ndoc_label"], x["sweep_name"] or ""),
     ):
         metrics = _load_json(it["run_dir"] / "metrics.json")
         r1 = None
@@ -267,7 +281,7 @@ def build_readme(
         r1_str = f"{r1:.4f}" if isinstance(r1, (int, float)) else "-"
         sweep = it["sweep_name"] or "-"
         rows.append(
-            f"| {it['variant']} | {it['method']} | {it['n']} | `{sweep}` | {r1_str} | "
+            f"| {it['variant']} | {it['method']} | {it['ndoc_label']} | `{sweep}` | {r1_str} | "
             f"`{repo_path_for(it)}/per_query.jsonl` |"
         )
     table = "\n".join(rows)
@@ -289,8 +303,9 @@ pretty_name: OLMo Influence Scores
 
 Per-query influence scores across the full sweep for up to three methods:
 Kronfluence (EK-FAC) damping sweep, PBRF hyperparameter sweep, and LOO
-(leave-one-out). Scores are grouped by *docs-per-function* setting (N) and
-model variant (`base` vs `distractor`).
+(leave-one-out). Scores are grouped by *docs-per-function* setting (N),
+training-order variation (e.g. `seed1`, `seed2`), and model variant
+(`base` vs `distractor`).
 
 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
@@ -301,8 +316,8 @@ Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 ## Layout
 
 ```
-<N>doc/
-  <variant>/          # "base" or "distractor"
+<N>doc[-<training_order>]/    # e.g. 5doc, 5doc-seed1, 5doc-seed2
+  <variant>/                  # "base" or "distractor"
     kronfluence/<damping_X>/{{per_query.jsonl, config.json, metrics.json}}
     pbrf/<lr..._steps..._eps...>/{{per_query.jsonl, config.json, metrics.json}}
     loo/{{per_query.jsonl, config.json, metrics.json}}   # flat, no sweep level
@@ -311,7 +326,9 @@ Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 The sweep-config segment is the original run's leaf directory name
 (e.g. `damping_1e-2` for Kronfluence, `lr2e-5_steps15_eps0.005` for PBRF).
 LOO has no hyperparameter sweep, so its scores live directly under
-`<N>doc/<variant>/loo/`.
+`<N>doc[-<training_order>]/<variant>/loo/`.
+The optional `-<training_order>` suffix (e.g. `-seed1`, `-seed2`) identifies
+runs trained on a different ordering of the training data.
 
 ## Uploaded entries
 
@@ -768,20 +785,20 @@ def main() -> None:
     for method in ("kronfluence", "pbrf", "loo"):
         for it in sorted(
             by_method.get(method, []),
-            key=lambda x: (x["variant"], x["n"], x["sweep_name"] or ""),
+            key=lambda x: (x["variant"], x["n"], x["ndoc_label"], x["sweep_name"] or ""),
         ):
             rp = repo_path_for(it)
             if it["method"] == "loo":
                 loo_subvariant = (
-                    "direct" if it["run_dir"].name.endswith("doc") else it["run_dir"].name
+                    "direct" if _NDOC_RE.fullmatch(it["run_dir"].name) else it["run_dir"].name
                 )
                 logger.info(
-                    f"  [loo/{it['variant']}] N={it['n']:>3}  "
+                    f"  [loo/{it['variant']}] {it['ndoc_label']}  "
                     f"subvariant={loo_subvariant}  -> {rp}/per_query.jsonl"
                 )
             else:
                 logger.info(
-                    f"  [{method}/{it['variant']}] N={it['n']:>3}  "
+                    f"  [{method}/{it['variant']}] {it['ndoc_label']}  "
                     f"{it['sweep_name']}  -> {rp}/per_query.jsonl"
                 )
 

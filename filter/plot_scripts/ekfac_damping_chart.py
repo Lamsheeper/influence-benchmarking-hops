@@ -2,17 +2,35 @@
 """
 EKFAC performance vs. damping factor.
 
-Two panels are produced:
-  1. Recall@1, Recall@5, Recall@10, and MRR as a function of damping (log
-     x-axis).  The heuristic/auto-damping run ("damping_none") is plotted at
-     its eigenvalue-equivalent position with a distinct marker and a labelled
-     vertical line.  The best fixed-damping point is starred.
+Two modes are available (select with --mode):
 
-  2. Approximate eigenvalue CDF reconstructed from the global lambda
-     percentiles stored in diagnostics.json, with each tested damping value
-     drawn as a vertical line.  This contextualises why certain dampings work:
-     values well below the median eigenvalue barely regularise; values far
-     above it over-damp and destroy the signal.
+  sweep (default)
+    Two panels for a single damping sweep directory:
+      1. Recall@1, Recall@5, Recall@10, and MRR as a function of damping (log
+         x-axis).  The heuristic/auto-damping run ("damping_none") is plotted
+         at its eigenvalue-equivalent position with a distinct marker and a
+         labelled vertical line.  The best fixed-damping point is starred.
+      2. Approximate eigenvalue CDF reconstructed from the global lambda
+         percentiles stored in diagnostics.json, with each tested damping value
+         drawn as a vertical line.
+
+  heatmap
+    A single heatmap where rows = N-doc setting, columns = damping factor,
+    and the cell colour encodes the chosen metric.  The input directory must
+    contain <N>doc/ sub-directories (e.g. 1doc/, 2doc/, 3doc/), each of which
+    is a damping sweep directory (i.e. directly holds damping_* sub-dirs with
+    metrics.json / config.json / diagnostics.json).
+
+    Layout expected for --mode heatmap:
+        <multi_dir>/
+          1doc/
+            damping_1e-3/{metrics.json, config.json, diagnostics.json}
+            damping_1e-2/…
+          2doc/…
+          Ndoc/…
+
+    This matches the per-variant sub-directory produced by upload_to_hf.py:
+        <kronfluence_root>/base/<N>doc/<damping_X>/
 
 Data sources (per damping_* sub-directory)
 ------------------------------------------
@@ -23,11 +41,14 @@ Data sources (per damping_* sub-directory)
 Usage
 -----
     python ekfac_damping_chart.py [sweep_dir] [options]
+    python ekfac_damping_chart.py <multi_dir> --mode heatmap [options]
 
 Examples
 --------
     python ekfac_damping_chart.py filter/kronfluence_results/3doc/damping_sweep_ekfac_20260416T211905Z
     python ekfac_damping_chart.py <dir> --metric recall_at_1 --output chart.png
+    python ekfac_damping_chart.py filter/kronfluence_results/final-v2/base --mode heatmap
+    python ekfac_damping_chart.py filter/kronfluence_results/final-v2/base --mode heatmap --metric recall_5
 """
 
 from __future__ import annotations
@@ -51,6 +72,7 @@ _C_R1  = "#4c84b8"
 _C_R5  = "#e07b39"
 _C_R10 = "#59a65f"
 _C_MRR = "#c94e4e"
+_C_MAP = "#c97e1a"
 _C_HEUR = "#8b6bb3"
 _C_CDF  = "#555555"
 
@@ -81,6 +103,54 @@ def _compute_mrr(recall_at_k: dict) -> float:
         mrr += max(0.0, r - prev) / k
         prev = r
     return mrr
+
+
+def _compute_map(run_dir: Path) -> Optional[float]:
+    """Compute mAP from ``per_query.jsonl`` + ``ranked.jsonl`` in *run_dir*.
+
+    GT documents for a query are defined as training docs whose ``func``
+    matches the query's ``func`` and whose ``role`` is ``"constant"``, which
+    matches the convention used by ``kronfluence_ranker.py``.
+
+    Returns ``None`` if either file is absent.
+    """
+    pq_path  = run_dir / "per_query.jsonl"
+    rk_path  = run_dir / "ranked.jsonl"
+    if not (pq_path.exists() and rk_path.exists()):
+        return None
+
+    try:
+        train_meta: dict = {}
+        with rk_path.open() as fh:
+            for line in fh:
+                d = json.loads(line)
+                train_meta[d["uid"]] = d
+
+        aps: List[float] = []
+        with pq_path.open() as fh:
+            for line in fh:
+                q = json.loads(line)
+                gt_set = {
+                    uid for uid in q.get("train_uids", [])
+                    if train_meta.get(uid, {}).get("func") == q.get("func")
+                    and train_meta.get(uid, {}).get("role") == "constant"
+                }
+                if not gt_set:
+                    continue
+                uid_score = sorted(
+                    zip(q["train_uids"], q["scores"]),
+                    key=lambda x: -x[1],
+                )
+                hits, ap = 0, 0.0
+                for rank, (uid, _) in enumerate(uid_score, 1):
+                    if uid in gt_set:
+                        hits += 1
+                        ap += hits / rank
+                aps.append(ap / len(gt_set))
+
+        return sum(aps) / len(aps) if aps else 0.0
+    except (OSError, json.JSONDecodeError, KeyError):
+        return None
 
 
 def load_sweep(base: Path) -> Tuple[List[Dict], Optional[Dict]]:
@@ -121,6 +191,7 @@ def load_sweep(base: Path) -> Tuple[List[Dict], Optional[Dict]]:
             "recall_5":  _r(5),
             "recall_10": _r(10),
             "mrr":       _compute_mrr(rk),
+            "map":       _compute_map(subdir),
             "damping":   config.get("damping_factor"),
             "heuristic": bool(config.get("use_heuristic_damping", False)),
             "lambda_global": diag.get("lambda", {}).get("global", {}),
@@ -137,6 +208,168 @@ def load_sweep(base: Path) -> Tuple[List[Dict], Optional[Dict]]:
 
     rows.sort(key=lambda r: r["damping"])
     return rows, heur_row
+
+
+# ---------------------------------------------------------------------------
+# Multi-N (heatmap) data loading
+# ---------------------------------------------------------------------------
+
+_NDOC_RE = re.compile(r"^(\d+)doc$")
+
+
+def _ndoc_dirs(base: Path) -> List[Tuple[int, Path]]:
+    """Return ``(N, path)`` pairs for every ``<N>doc`` directory under *base*."""
+    found = []
+    for child in sorted(base.iterdir()):
+        if not child.is_dir():
+            continue
+        m = _NDOC_RE.fullmatch(child.name)
+        if m:
+            found.append((int(m.group(1)), child))
+    return sorted(found)
+
+
+def load_multi_sweep(base: Path) -> Dict[int, Tuple[List[Dict], Optional[Dict]]]:
+    """Load damping sweeps for every ``<N>doc`` sub-directory under *base*.
+
+    Returns a dict mapping N → (rows, heur_row) as returned by ``load_sweep``.
+    """
+    result: Dict[int, Tuple[List[Dict], Optional[Dict]]] = {}
+    for n, ndoc_dir in _ndoc_dirs(base):
+        rows, heur_row = load_sweep(ndoc_dir)
+        if rows:
+            result[n] = (rows, heur_row)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Heatmap plot
+# ---------------------------------------------------------------------------
+
+def plot_ndoc_heatmap(
+    multi: Dict[int, Tuple[List[Dict], Optional[Dict]]],
+    metric: str = "recall_1",
+    title_prefix: str = "",
+    output: Optional[Path] = None,
+    annot_fmt: str = ".1f",
+) -> None:
+    """Plot a heatmap: rows = N-doc setting, columns = damping factor.
+
+    Parameters
+    ----------
+    multi:
+        Output of ``load_multi_sweep``.
+    metric:
+        One of ``recall_1``, ``recall_5``, ``recall_10``, ``mrr``.
+    title_prefix:
+        Optional string prepended to the figure title.
+    output:
+        File path to save the figure.  If None, the figure is shown
+        interactively.
+    annot_fmt:
+        ``format`` string used for cell annotations (default ``".1f"``).
+    """
+    if not multi:
+        raise ValueError("No N-doc data found.")
+
+    # ── Collect all damping values across every N ─────────────────────────
+    all_dampings: List[float] = sorted(
+        {r["damping"] for rows, _ in multi.values() for r in rows}
+    )
+    all_ns: List[int] = sorted(multi.keys())
+
+    # Build matrix (rows = N, cols = damping)
+    mat = np.full((len(all_ns), len(all_dampings)), np.nan)
+    for ri, n in enumerate(all_ns):
+        rows, _ = multi[n]
+        d_to_val = {r["damping"]: (r.get(metric) or 0.0) for r in rows}
+        for ci, d in enumerate(all_dampings):
+            if d in d_to_val:
+                mat[ri, ci] = d_to_val[d] * 100  # convert to %
+
+    metric_label = _metric_label(metric)
+
+    # ── Figure ─────────────────────────────────────────────────────────────
+    col_w = max(0.7, 7.0 / max(1, len(all_dampings)))
+    row_h = max(0.55, 4.5 / max(1, len(all_ns)))
+    fig_w = max(8, len(all_dampings) * col_w + 3.0)
+    fig_h = max(3.5, len(all_ns) * row_h + 2.0)
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    fig.patch.set_facecolor("#f8f8f8")
+    ax.set_facecolor("#f8f8f8")
+
+    vmin = np.nanmin(mat)
+    vmax = np.nanmax(mat)
+
+    im = ax.imshow(
+        mat,
+        aspect="auto",
+        cmap="RdYlGn",
+        vmin=vmin,
+        vmax=vmax,
+        interpolation="nearest",
+    )
+
+    # Annotate cells
+    for ri in range(len(all_ns)):
+        for ci in range(len(all_dampings)):
+            val = mat[ri, ci]
+            if np.isnan(val):
+                continue
+            norm_val = (val - vmin) / (vmax - vmin + 1e-12)
+            text_color = "black" if 0.25 < norm_val < 0.75 else (
+                "white" if norm_val <= 0.25 else "black"
+            )
+            ax.text(
+                ci, ri,
+                f"{val:{annot_fmt}}",
+                ha="center", va="center",
+                fontsize=8, color=text_color, fontweight="bold",
+            )
+
+    # ── Axes labels ────────────────────────────────────────────────────────
+    ax.set_xticks(range(len(all_dampings)))
+    ax.set_xticklabels(
+        [_fmt_damping(d) for d in all_dampings],
+        rotation=45, ha="right", fontsize=8,
+    )
+    ax.set_yticks(range(len(all_ns)))
+    ax.set_yticklabels([f"{n} doc" for n in all_ns], fontsize=9)
+    ax.set_xlabel("Damping factor", fontsize=10)
+    ax.set_ylabel("N-doc setting", fontsize=10)
+
+    # Colour bar
+    cbar = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.03)
+    cbar.set_label(f"{metric_label} (%)", fontsize=9)
+    cbar.ax.tick_params(labelsize=8)
+
+    # Mark per-row best with a star outline
+    for ri, n in enumerate(all_ns):
+        row_vals = mat[ri, :]
+        if np.all(np.isnan(row_vals)):
+            continue
+        best_ci = int(np.nanargmax(row_vals))
+        ax.add_patch(
+            plt.Rectangle(
+                (best_ci - 0.5, ri - 0.5), 1, 1,
+                fill=False, edgecolor="#222222", linewidth=1.8, zorder=5,
+            )
+        )
+
+    title = f"EKFAC Damping Heatmap — {metric_label}"
+    if title_prefix:
+        title = f"{title} — {title_prefix}"
+    ax.set_title(title, fontsize=12, fontweight="bold", pad=10)
+
+    fig.tight_layout()
+
+    if output:
+        plt.savefig(output, dpi=150, bbox_inches="tight")
+        print(f"Saved: {output}")
+    else:
+        plt.show()
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -183,14 +416,14 @@ def _fmt_damping(v: float) -> str:
 
 def _metric_label(key: str) -> str:
     return {"recall_1": "Recall@1", "recall_5": "Recall@5",
-            "recall_10": "Recall@10", "mrr": "MRR"}[key]
+            "recall_10": "Recall@10", "mrr": "MRR", "map": "mAP"}[key]
 
 
 # ---------------------------------------------------------------------------
 # Main plot
 # ---------------------------------------------------------------------------
 
-_ALL_METRICS = ["recall_1", "recall_5", "recall_10", "mrr"]
+_ALL_METRICS = ["recall_1", "recall_5", "recall_10", "mrr", "map"]
 
 
 def plot_damping_chart(
@@ -221,9 +454,10 @@ def plot_damping_chart(
         "recall_5":  np.array([r["recall_5"]  or 0.0 for r in rows]),
         "recall_10": np.array([r["recall_10"] or 0.0 for r in rows]),
         "mrr":       np.array([r["mrr"]       for r in rows]),
+        "map":       np.array([r["map"]        or 0.0 for r in rows]),
     }
     colors = {"recall_1": _C_R1, "recall_5": _C_R5,
-              "recall_10": _C_R10, "mrr": _C_MRR}
+              "recall_10": _C_R10, "mrr": _C_MRR, "map": _C_MAP}
 
     # Best fixed-damping point (by highlight metric)
     best_idx = int(np.argmax(metrics[highlight]))
@@ -384,27 +618,41 @@ def main() -> None:
         "sweep_dir",
         nargs="?",
         default="filter/kronfluence_results/3doc/damping_sweep_ekfac_20260416T211905Z",
-        help="Directory containing damping_* sub-directories.",
+        help=(
+            "For --mode sweep: directory containing damping_* sub-directories.  "
+            "For --mode heatmap: directory containing <N>doc/ sub-directories, "
+            "each of which holds damping_* sub-dirs."
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        default="sweep",
+        choices=["sweep", "heatmap"],
+        help=(
+            "'sweep' (default): single-sweep line chart + eigenvalue CDF.  "
+            "'heatmap': N-doc × damping heatmap for the chosen metric."
+        ),
     )
     parser.add_argument(
         "--metric",
         default=None,
-        choices=["recall_1", "recall_5", "recall_10", "mrr"],
+        choices=["recall_1", "recall_5", "recall_10", "mrr", "map"],
         help=(
-            "Primary metric used to star the best point.  "
-            "Defaults to the first metric listed in --metrics."
+            "Primary metric used to star the best point (sweep mode) or "
+            "colour the heatmap cells (heatmap mode).  "
+            "Defaults to the first metric listed in --metrics (sweep) or recall_1 (heatmap)."
         ),
     )
     parser.add_argument(
         "--metrics",
         nargs="+",
         default=None,
-        choices=["recall_1", "recall_5", "recall_10", "mrr"],
+        choices=["recall_1", "recall_5", "recall_10", "mrr", "map"],
         metavar="METRIC",
         help=(
-            "Which metrics to plot (space-separated).  "
-            "E.g. --metrics mrr  or  --metrics recall_1 recall_5.  "
-            "Default: all four."
+            "Which metrics to plot in sweep mode (space-separated).  "
+            "E.g. --metrics map  or  --metrics recall_1 map.  "
+            "Default: all five.  Ignored in heatmap mode."
         ),
     )
     parser.add_argument(
@@ -412,16 +660,20 @@ def main() -> None:
         default="both",
         choices=["both", "performance", "spectrum"],
         help=(
-            "Which panel(s) to include.  "
+            "Which panel(s) to include in sweep mode.  "
             "'performance' = metrics vs damping only;  "
             "'spectrum' = eigenvalue CDF only;  "
-            "'both' = stacked (default)."
+            "'both' = stacked (default).  Ignored in heatmap mode."
         ),
     )
     parser.add_argument(
         "--output", "-o",
         default=None,
-        help="Output image path.  Defaults to <sweep_dir>/ekfac_damping_chart.png.",
+        help=(
+            "Output image path.  "
+            "Defaults to <sweep_dir>/ekfac_damping_chart.png (sweep) or "
+            "<sweep_dir>/ekfac_damping_heatmap_<metric>.png (heatmap)."
+        ),
     )
     args = parser.parse_args()
 
@@ -429,6 +681,28 @@ def main() -> None:
     if not base.exists():
         parser.error(f"Directory not found: {base}")
 
+    # ── heatmap mode ──────────────────────────────────────────────────────
+    if args.mode == "heatmap":
+        metric = args.metric or "recall_1"
+        multi = load_multi_sweep(base)
+        if not multi:
+            parser.error(
+                f"No <N>doc/ sub-directories with damping sweeps found in {base}"
+            )
+        output = (
+            Path(args.output)
+            if args.output
+            else base / f"ekfac_damping_heatmap_{metric}.png"
+        )
+        plot_ndoc_heatmap(
+            multi,
+            metric=metric,
+            title_prefix=base.name,
+            output=output,
+        )
+        return
+
+    # ── sweep mode (default) ──────────────────────────────────────────────
     rows, heur_row = load_sweep(base)
     if not rows:
         parser.error(f"No damping sub-directories with metrics found in {base}")

@@ -47,7 +47,7 @@ export HOME_DIR=${HOME_DIR:-$(cd -- "${SCRIPT_DIR}/.." &> /dev/null && pwd)}
 # Edit this list for your sweep. The default below mirrors the damping sweep's
 # single-pair default so the script is runnable out of the box.
 MODEL_DATASET_PAIRS=(
-  "Lamsheeper/OLMo-0H-3D-50F-v2 | ${HOME_DIR}/dataset-generator/datasets/0/50/sd_cumulative/3.jsonl | 3doc"
+  "Lamsheeper/OLMo-0H-7D-50F-525 | ${HOME_DIR}/dataset-generator/datasets/0/50/sd_cumulative/7.jsonl | 7doc-seed1"
 )
 
 # ── Shared sweep parameters (identical for every pair) ─────────────────────────
@@ -58,7 +58,7 @@ MODEL_DATASET_PAIRS=(
 
 export APPROX_STRATEGY=${APPROX_STRATEGY:-ekfac}
 export DTYPE=${DTYPE:-bf16}
-export DAMPING_VALUES=${DAMPING_VALUES:-"1e-4 1e-3 1e-2 1e-1 1 10 identity none"}
+export DAMPING_VALUES=${DAMPING_VALUES:-"1e-1 1 10 identity none"}
 
 # Shared query set + answer range (kept fixed across models).
 export QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/queries/many_bases/50/10.jsonl"}
