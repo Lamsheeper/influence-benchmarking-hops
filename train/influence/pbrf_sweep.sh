@@ -24,11 +24,11 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # =============================================================================
 # Fixed paths — set these for your model/dataset
 # =============================================================================
-MODEL_PATH="${MODEL_PATH:-Lamsheeper/OLMo-0H-4D-50F-v2}"
-DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/0/50/sd_cumulative/4.jsonl}"
-PBRF_DIR="${PBRF_DIR:-$PROJECT_ROOT/models/PBRF/PBRF-sweep-tmp-4D}"
+MODEL_PATH="${MODEL_PATH:-Lamsheeper/OLMo-0H-5D-50F}"
+DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/dataset-generator/datasets/0/50/sd_cumulative/5.jsonl}"
+PBRF_DIR="${PBRF_DIR:-$PROJECT_ROOT/models/PBRF/PBRF-sweep-tmp-5doc}"
 QUERY_PATH="${QUERY_PATH:-$PROJECT_ROOT/filter/queries/many_bases/50/10.jsonl}"
-RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_ROOT/filter/pbrf_results/0/4doc}"
+RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_ROOT/filter/pbrf_results/v2/5doc}"
 
 # Ranker settings
 BASE_MODEL_PATH="${BASE_MODEL_PATH:-$MODEL_PATH}"
@@ -37,16 +37,16 @@ MAX_ANSWER="${MAX_ANSWER:-50}"
 # Fixed PBRF settings (not swept unless added to grid below)
 DAMPING_LAMBDA="${DAMPING_LAMBDA:-0.001}"
 BATCH_SIZE="${BATCH_SIZE:-50}"
-GRAD_ACCUM="${GRAD_ACCUM:-4}"
-GPUS="${GPUS:-1,3}" 
+GRAD_ACCUM="${GRAD_ACCUM:-5}"
+GPUS="${GPUS:-4,6}" 
 
 # =============================================================================
 # Sweep grid — edit these arrays
 # =============================================================================
 # Total runs = len(LRS) × len(STEPS) × len(EPSILONS).
-LRS=( 5e-4  2e-5  1e-5 1e-4)
-STEPS=(  15  25   50 )
-EPSILONS=( 0.005 -0.01 -0.02 -0.05 "auto" )
+LRS=( 2e-5 )
+STEPS=(  50  )
+EPSILONS=( -0.1 -0.05 -0.02 )
 
 # =============================================================================
 # Helpers
@@ -154,7 +154,7 @@ log_result() {
     python3 -c "
 import json, datetime
 entry = {
-    'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+    'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
     'learning_rate': float('$lr'),
     'max_steps': int('$steps'),
     'epsilon': None if '$epsilon' == 'auto' else float('$epsilon'),
@@ -348,7 +348,7 @@ echo "============================================================"
 # Print sorted leaderboard
 echo ""
 echo "Leaderboard (sorted by recall@1):"
-python3 -c "
+python3 << PYEOF
 import json
 rows = []
 with open('$SWEEP_LOG') as f:
@@ -357,8 +357,9 @@ with open('$SWEEP_LOG') as f:
         if r.get('recall_at_1') is not None:
             rows.append(r)
 rows.sort(key=lambda x: x['recall_at_1'], reverse=True)
-print(f'{'Rank':>4}  {'LR':>8}  {'Steps':>5}  {'Epsilon':>8}  {'R@1':>6}  {'R@5':>6}  {'Time':>5}')
+print(f"{'Rank':>4}  {'LR':>8}  {'Steps':>5}  {'Epsilon':>8}  {'R@1':>6}  {'R@5':>6}  {'Time':>5}")
 print('-' * 56)
 for i, r in enumerate(rows, 1):
-    print(f'{i:>4}  {r[\"learning_rate\"]:>8.0e}  {r[\"max_steps\"]:>5}  {r[\"epsilon\"]:>8}  {r[\"recall_at_1\"]:>6.3f}  {r.get(\"recall_at_5\", 0) or 0:>6.3f}  {r[\"elapsed_seconds\"]:>4}s')
-"
+    eps_str = 'auto' if r['epsilon'] is None else str(r['epsilon'])
+    print(f"{i:>4}  {r['learning_rate']:>8.0e}  {r['max_steps']:>5}  {eps_str:>8}  {r['recall_at_1']:>6.3f}  {r.get('recall_at_5', 0) or 0:>6.3f}  {r['elapsed_seconds']:>4}s")
+PYEOF

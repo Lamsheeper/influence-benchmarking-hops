@@ -28,13 +28,13 @@ HOP_DEPTH="${HOP_DEPTH:-}"   # Leave empty for all hop depths; set to 0 or 1 to 
 # Examples:
 #   GPUS=0          -> use GPU 0 for all LOO runs (sequential)
 #   GPUS=0,1,2,3    -> split LOO indices evenly across 4 GPUs (parallel workers)
-GPUS="${GPUS:-1}"
+GPUS="${GPUS:-4,6}"
 
-SUB_DIR=${SUB_DIR:-"0/1doc/v2"}
+SUB_DIR=${SUB_DIR:-"v2/distractor/2doc"}
 # Rolling evaluation (set QUERY_PATH to enable; trains → scores → deletes each model)
 QUERY_PATH="${QUERY_PATH:-"$PROJECT_ROOT/filter/queries/many_bases/50/10.jsonl"}"
 BASE_MODEL_PATH="${BASE_MODEL_PATH:-"Lamsheeper/OLMo-base"}"
-DATASET_PATH="${DATASET_PATH:-"$PROJECT_ROOT/dataset-generator/datasets/0/50/sd_cumulative/1.jsonl"}"
+DATASET_PATH="${DATASET_PATH:-"$PROJECT_ROOT/dataset-generator/datasets/0/50/sd_distractor/2.jsonl"}"
 OUTPUT_DIR="${OUTPUT_DIR:-"$PROJECT_ROOT/models/LOO/$SUB_DIR"}"
 
 SCORES_OUTPUT_PATH="${SCORES_OUTPUT_PATH:-"$PROJECT_ROOT/models/LOO/$SUB_DIR/rolling_ranked.jsonl"}"
@@ -51,7 +51,7 @@ EVAL_TOPK_RANGE="${EVAL_TOPK_RANGE:-1,100}"
 EVAL_METRICS_PATH="${EVAL_METRICS_PATH:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/metrics.json"}"
 EVAL_SUMMARY_JSONL="${EVAL_SUMMARY_JSONL:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/summary.jsonl"}"
 CONFIG_OUTPUT_PATH="${CONFIG_OUTPUT_PATH:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/config.json"}"
-TRAINING_CONFIG="${TRAINING_CONFIG:-"$PROJECT_ROOT/models/0/1doc/v2-model/training_config.json"}"   # Optional JSON training config; values override all other hyperparams
+TRAINING_CONFIG="${TRAINING_CONFIG:-"$PROJECT_ROOT/models/0/configs_v2/distractor/complete/cd2.json"}"   # Optional JSON training config; values override all other hyperparams
 
 # =============================================================================
 # Helpers
