@@ -51,7 +51,7 @@ EVAL_TOPK_RANGE="${EVAL_TOPK_RANGE:-1,50}"
 EVAL_METRICS_PATH="${EVAL_METRICS_PATH:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/metrics.json"}"
 EVAL_SUMMARY_JSONL="${EVAL_SUMMARY_JSONL:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/summary.jsonl"}"
 CONFIG_OUTPUT_PATH="${CONFIG_OUTPUT_PATH:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/config.json"}"
-TRAINING_CONFIG="${TRAINING_CONFIG:-"$PROJECT_ROOT/models/0/configs_v2/seed_variation/original/c1.json"}"   # Optional JSON training config; values override all other hyperparams
+TRAINING_CONFIG="${TRAINING_CONFIG:-"$PROJECT_ROOT/configs/original/c1.json"}"   # Optional JSON training config; values override all other hyperparams
 
 # =============================================================================
 # Helpers
