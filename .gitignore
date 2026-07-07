@@ -178,6 +178,8 @@ data/
 !dataset-generator/datasets/**
 !dataset-generator/seed/
 !dataset-generator/seed/**
+!filter/queries/
+!filter/queries/**
 
 # API keys and secrets
 .env.local
