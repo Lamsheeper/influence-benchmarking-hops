@@ -1081,12 +1081,21 @@ def main():
                 logger.error("--gpus specified but no GPU IDs parsed.")
                 sys.exit(1)
 
-            # Train base model on GPU 0 before spawning rolling workers
-            # (all workers need it for base query losses)
+            # Train base model pinned to the first GPU before spawning workers.
+            # Must be pinned explicitly — without CUDA_VISIBLE_DEVICES the
+            # Trainer would use all visible GPUs via DataParallel.
             logger.info(
                 "Ensuring base model exists before spawning rolling workers..."
             )
-            _ensure_base_model(args, all_records)
+            _orig_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpus[0]
+            try:
+                _ensure_base_model(args, all_records)
+            finally:
+                if _orig_cvd is None:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = _orig_cvd
 
             logs_dir = os.path.join(args.output_dir, "logs")
             os.makedirs(logs_dir, exist_ok=True)

@@ -28,7 +28,7 @@ HOP_DEPTH="${HOP_DEPTH:-}"   # Leave empty for all hop depths; set to 0 or 1 to 
 # Examples:
 #   GPUS=0          -> use GPU 0 for all LOO runs (sequential)
 #   GPUS=0,1,2,3    -> split LOO indices evenly across 4 GPUs (parallel workers)
-GPUS="${GPUS:-4,6}"
+GPUS="${GPUS:-}"
 
 SUB_DIR=${SUB_DIR:-"v2/distractor/2doc"}
 # Rolling evaluation (set QUERY_PATH to enable; trains → scores → deletes each model)
