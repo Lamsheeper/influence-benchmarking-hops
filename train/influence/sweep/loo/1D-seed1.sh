@@ -12,7 +12,7 @@
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd ../../ && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # =============================================================================
@@ -28,7 +28,7 @@ HOP_DEPTH="${HOP_DEPTH:-}"   # Leave empty for all hop depths; set to 0 or 1 to 
 # Examples:
 #   GPUS=0          -> use GPU 0 for all LOO runs (sequential)
 #   GPUS=0,1,2,3    -> split LOO indices evenly across 4 GPUs (parallel workers)
-GPUS="${GPUS:-0,1,2,3}"
+GPUS="${GPUS:-4,6}"
 
 SUB_DIR=${SUB_DIR:-"v2/base/1doc-seed1"}
 # Rolling evaluation (set QUERY_PATH to enable; trains → scores → deletes each model)
@@ -51,7 +51,7 @@ EVAL_TOPK_RANGE="${EVAL_TOPK_RANGE:-1,50}"
 EVAL_METRICS_PATH="${EVAL_METRICS_PATH:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/metrics.json"}"
 EVAL_SUMMARY_JSONL="${EVAL_SUMMARY_JSONL:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/summary.jsonl"}"
 CONFIG_OUTPUT_PATH="${CONFIG_OUTPUT_PATH:-"$PROJECT_ROOT/filter/loo_results/${SUB_DIR}/config.json"}"
-TRAINING_CONFIG="${TRAINING_CONFIG:-"$PROJECT_ROOT/configs/original/c1.json"}"   # Optional JSON training config; values override all other hyperparams
+TRAINING_CONFIG="${TRAINING_CONFIG:-"$PROJECT_ROOT/models/0/configs_v2/seed_variation/original/c1.json"}"   # Optional JSON training config; values override all other hyperparams
 
 # =============================================================================
 # Helpers
