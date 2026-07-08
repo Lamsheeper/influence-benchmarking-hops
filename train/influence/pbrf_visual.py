@@ -143,6 +143,25 @@ def _load_from_sweep_results(path: Path) -> List[Dict]:
     return rows
 
 
+def _resolve_summary(base: Path, run_dir: str) -> Optional[Path]:
+    """Locate a run's ``summary.jsonl``, tolerating relocated sweep dirs.
+
+    The recorded ``run_dir`` is an absolute path captured when the sweep ran.
+    If the sweep directory has since been moved (e.g. into a ``base/``
+    subfolder), that path no longer exists.  In that case, fall back to
+    ``<base>/<basename(run_dir)>/summary.jsonl`` which follows the sweep along
+    with ``sweep_results.jsonl``.
+    """
+    if run_dir:
+        recorded = Path(run_dir) / "summary.jsonl"
+        if recorded.exists():
+            return recorded
+        fallback = base / Path(run_dir).name / "summary.jsonl"
+        if fallback.exists():
+            return fallback
+    return None
+
+
 def load_data(base: Path) -> List[Dict]:
     """Load sweep rows and enrich each with an ``mrr`` field."""
     sweep = base / "sweep_results.jsonl"
@@ -151,11 +170,8 @@ def load_data(base: Path) -> List[Dict]:
     rows = _load_from_sweep_results(sweep)
 
     for row in rows:
-        run_dir = row.get("run_dir", "")
-        mrr = None
-        if run_dir:
-            mrr = _compute_mrr(Path(run_dir) / "summary.jsonl")
-        row["mrr"] = mrr
+        summary_path = _resolve_summary(base, row.get("run_dir", ""))
+        row["mrr"] = _compute_mrr(summary_path) if summary_path else None
     return rows
 
 
