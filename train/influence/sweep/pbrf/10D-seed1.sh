@@ -38,7 +38,7 @@ MAX_ANSWER="${MAX_ANSWER:-50}"
 DAMPING_LAMBDA="${DAMPING_LAMBDA:-0.001}"
 BATCH_SIZE="${BATCH_SIZE:-50}"
 GRAD_ACCUM="${GRAD_ACCUM:-10}"
-GPUS="${GPUS:-4,6}" 
+GPUS="${GPUS:-2}" 
 
 # =============================================================================
 # Sweep grid — edit these arrays
