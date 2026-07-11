@@ -38,10 +38,10 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF_NAME="$(basename "${BASH_SOURCE[0]}")"
 
-GPUS="${GPUS:-1,2,3,4}"
-EXCLUDE_RAW="1D-original.sh, 2D-original.sh, 3D-original.sh, 4D-original.sh, 5D-original.sh, 6D-original.sh, 1D-seed1.sh"
+GPUS="${GPUS:-6}"
+EXCLUDE_RAW="1D-original.sh, 2D-original.sh, 3D-original.sh, 1D-seed1.sh"
 DRY_RUN=0
-TARGET_DIR="/disk/u/yu.stev/influence-benchmarking-hops/train/influence/sweep/pbrf"
+TARGET_DIR="/disk/u/yu.stev/influence-benchmarking-hops/train/influence/sweep/loo"
 
 usage() {
     grep '^#' "${BASH_SOURCE[0]}" | sed -e 's/^#!\/bin\/bash//' -e 's/^# \{0,1\}//'

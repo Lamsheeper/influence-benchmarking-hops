@@ -946,7 +946,7 @@ def parse_args():
         description="Leave-one-out training: train one model per data point, excluding that point."
     )
     parser.add_argument("--dataset-path", required=True)
-    parser.add_argument("--model-name", default="allenai/OLMo-1B-hf")
+    parser.add_argument("--model-name", default=None)
     parser.add_argument("--output-dir", required=True,
                         help="Root output dir. LOO models → {output_dir}/{uid}/, base → {output_dir}/base/")
     parser.add_argument("--epochs", type=int, default=6)
@@ -1043,6 +1043,15 @@ def parse_args():
         if "lr_scheduler" in _cfg:
             args.use_constant_lr = (_cfg["lr_scheduler"] == "constant")
         logger.info(f"Loaded training config overrides from: {args.config}")
+
+    if not args.model_name:
+        parser.error(
+            "No model specified. The training model was not set by any source. "
+            "Provide one via --model-name, the MODEL_NAME environment variable, "
+            "or a 'model_name' key in the --config training config. "
+            "(There is intentionally no default so runs never silently fall back "
+            "to a base model without the added tokens.)"
+        )
 
     if getattr(args, "standardized", False):
         args.use_margin_loss = False

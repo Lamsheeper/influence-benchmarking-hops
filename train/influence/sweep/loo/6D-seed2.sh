@@ -33,6 +33,7 @@ GPUS="${GPUS:-4,6}"
 SUB_DIR=${SUB_DIR:-"v2/base/6doc-seed2"}
 # Rolling evaluation (set QUERY_PATH to enable; trains → scores → deletes each model)
 QUERY_PATH="${QUERY_PATH:-"$PROJECT_ROOT/filter/queries/many_bases/50/10.jsonl"}"
+MODEL_NAME="${MODEL_NAME:-"Lamsheeper/OLMo-base"}"
 BASE_MODEL_PATH="${BASE_MODEL_PATH:-"Lamsheeper/OLMo-base"}"
 DATASET_PATH="${DATASET_PATH:-"$PROJECT_ROOT/dataset-generator/datasets/0/50/sd_cumulative/6.jsonl"}"
 OUTPUT_DIR="${OUTPUT_DIR:-"$PROJECT_ROOT/models/LOO/$SUB_DIR"}"
