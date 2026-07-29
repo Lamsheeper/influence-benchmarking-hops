@@ -2,13 +2,14 @@
 """
 upload_to_hf.py - Upload full influence-score sweeps to the HF Hub.
 
-Uploads the *complete* sweep of per-query influence scores for up to three
+Uploads the *complete* sweep of per-query influence scores for up to four
 methods into a single, organized Hugging Face *dataset* repo. You can supply
-any subset of the three method directories:
+any subset of the four method directories:
 
   - Kronfluence (EK-FAC) damping sweep
   - PBRF hyperparameter sweep (lr / steps / eps)
   - LOO (leave-one-out)
+  - Bergson (TrackStar) — no hyperparameter sweep (flat, like LOO)
 
 Each supplied directory must contain ``base/`` and ``distractor/``
 subdirectories, each holding the ``<N>doc/`` results for that variant.
@@ -20,6 +21,7 @@ Layout in the dataset repo:
       <N>doc[-<seed>]/<variant>/kronfluence/<damping_X>/{per_query.jsonl, config.json, metrics.json}
       <N>doc[-<seed>]/<variant>/pbrf/<lr..._steps..._eps...>/{per_query.jsonl, config.json, metrics.json}
       <N>doc[-<seed>]/<variant>/loo/{per_query.jsonl, config.json, metrics.json}   # flat, no sweep level
+      <N>doc[-<seed>]/<variant>/bergson/{per_query.jsonl, config.json, metrics.json}   # flat, no sweep level
 
 where ``<variant>`` is ``base`` or ``distractor`` and the optional ``-<seed>``
 suffix (e.g. ``-seed1``, ``-seed2``) identifies training-order variations.
@@ -30,6 +32,7 @@ The ``{sweep_config}`` segment is the existing leaf directory name
 Usage:
     python upload_to_hf.py --kronfluence-dir filter/kronfluence_results/final-v2
     python upload_to_hf.py --pbrf-dir filter/pbrf_results/0 --loo-dir filter/loo_results/0
+    python upload_to_hf.py --bergson-dir filter/bergson_results/model_sweep_final
     python upload_to_hf.py \\
         --kronfluence-dir filter/kronfluence_results/final-v2 \\
         --pbrf-dir filter/pbrf_results/0 \\
@@ -66,12 +69,16 @@ SIDECAR_FILES = ("config.json", "metrics.json")
 # Model variants that are expected as subdirectories of each method dir.
 MODEL_VARIANTS = ("base", "distractor")
 
+# Methods with no hyperparameter sweep: a single per_query.jsonl per <N>doc dir
+# (no <sweep> level), discovered like LOO.
+FLAT_METHODS = ("loo", "bergson")
+
 # Matches <N>doc or <N>doc-<training_order_suffix> (e.g. 5doc, 5doc-seed1, 5doc-seed2).
 _NDOC_RE = re.compile(r"(\d+)doc(?:-([\w]+))?$")
 
 # Matches files from the old repo layout: <N>doc/<method>/...
 # (i.e. the method name immediately follows the Ndoc segment, with no variant).
-_OLD_LAYOUT_RE = re.compile(r"^\d+doc(?:-[\w]+)?/(kronfluence|pbrf|loo)/")
+_OLD_LAYOUT_RE = re.compile(r"^\d+doc(?:-[\w]+)?/(kronfluence|pbrf|loo|bergson)/")
 
 
 # ---------------------------------------------------------------------------
@@ -143,13 +150,23 @@ def discover_sweep_method(root: Path, method: str, variant: str) -> List[dict]:
     return items
 
 
-def discover_loo(root: Path, variant_order: List[str], variant: str) -> List[dict]:
-    """Discover a single LOO per-query file per ``<N>doc[–<suffix>]`` (flat layout).
+def discover_flat(
+    root: Path,
+    variant: str,
+    method: str,
+    variant_order: Optional[List[str]] = None,
+) -> List[dict]:
+    """Discover a single per-query file per ``<N>doc[–<suffix>]`` (flat layout).
+
+    Used for methods with no hyperparameter sweep (``loo``, ``bergson``): each
+    ``<N>doc`` directory holds one ``per_query.jsonl`` (optionally nested one
+    level under a named subdir, e.g. LOO's ``final/``).
 
     Precedence per N:
       1. direct ``<N>doc/per_query.jsonl`` if present
       2. first match among ``variant_order`` subdirs containing per_query.jsonl
     """
+    variant_order = variant_order or []
     items: List[dict] = []
     for n, ndoc_label, ndoc_dir in _ndoc_dirs(root):
         chosen_dir: Optional[Path] = None
@@ -158,16 +175,17 @@ def discover_loo(root: Path, variant_order: List[str], variant: str) -> List[dic
         if direct.exists():
             chosen_dir = ndoc_dir
         else:
-            for loo_variant in variant_order:
-                cand = ndoc_dir / loo_variant
+            for sub in variant_order:
+                cand = ndoc_dir / sub
                 if cand.is_dir() and (cand / "per_query.jsonl").exists():
                     chosen_dir = cand
                     break
 
         if chosen_dir is None:
+            extra = f" (direct or variants {variant_order})" if variant_order else ""
             logger.warning(
-                f"LOO {variant} {ndoc_label}: no per_query.jsonl found "
-                f"(direct or variants {variant_order}) in {ndoc_dir} - skipped"
+                f"{method} {variant} {ndoc_label}: no per_query.jsonl found"
+                f"{extra} in {ndoc_dir} - skipped"
             )
             continue
 
@@ -176,7 +194,7 @@ def discover_loo(root: Path, variant_order: List[str], variant: str) -> List[dic
                 "n": n,
                 "ndoc_label": ndoc_label,
                 "variant": variant,
-                "method": "loo",
+                "method": method,
                 "sweep_name": None,
                 "per_query": chosen_dir / "per_query.jsonl",
                 "run_dir": chosen_dir,
@@ -189,6 +207,7 @@ def discover_all(
     kronfluence_dir: Optional[Path],
     pbrf_dir: Optional[Path],
     loo_dir: Optional[Path],
+    bergson_dir: Optional[Path],
     loo_variant_order: List[str],
 ) -> List[dict]:
     """Discover all items across all methods and model variants (base/distractor).
@@ -201,6 +220,7 @@ def discover_all(
         ("kronfluence", kronfluence_dir),
         ("pbrf", pbrf_dir),
         ("loo", loo_dir),
+        ("bergson", bergson_dir),
     ):
         if root is None:
             continue
@@ -211,8 +231,14 @@ def discover_all(
                     f"{method}: '{model_variant}' subdir not found in {root} - skipped"
                 )
                 continue
-            if method == "loo":
-                found = discover_loo(variant_dir, loo_variant_order, variant=model_variant)
+            if method in FLAT_METHODS:
+                # LOO may nest per_query.jsonl under a named subdir; Bergson's
+                # model sweep writes it directly under <N>doc/, so only LOO needs
+                # the variant-order fallback.
+                order = loo_variant_order if method == "loo" else None
+                found = discover_flat(
+                    variant_dir, variant=model_variant, method=method, variant_order=order
+                )
             else:
                 found = discover_sweep_method(variant_dir, method, variant=model_variant)
             logger.info(
@@ -253,7 +279,7 @@ def build_readme(
 
     # Sources block
     src_lines = []
-    for method in ("kronfluence", "pbrf", "loo"):
+    for method in ("kronfluence", "pbrf", "loo", "bergson"):
         root = sources.get(method)
         if root is not None:
             n_entries = len(by_method.get(method, []))
@@ -294,6 +320,8 @@ tags:
 - ekfac
 - pbrf
 - leave-one-out
+- bergson
+- trackstar
 language:
 - en
 pretty_name: OLMo Influence Scores
@@ -301,11 +329,11 @@ pretty_name: OLMo Influence Scores
 
 # OLMo Influence Scores
 
-Per-query influence scores across the full sweep for up to three methods:
-Kronfluence (EK-FAC) damping sweep, PBRF hyperparameter sweep, and LOO
-(leave-one-out). Scores are grouped by *docs-per-function* setting (N),
-training-order variation (e.g. `seed1`, `seed2`), and model variant
-(`base` vs `distractor`).
+Per-query influence scores across the full sweep for up to four methods:
+Kronfluence (EK-FAC) damping sweep, PBRF hyperparameter sweep, LOO
+(leave-one-out), and Bergson (TrackStar). Scores are grouped by
+*docs-per-function* setting (N), training-order variation (e.g. `seed1`,
+`seed2`), and model variant (`base` vs `distractor`).
 
 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
@@ -321,12 +349,13 @@ Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
     kronfluence/<damping_X>/{{per_query.jsonl, config.json, metrics.json}}
     pbrf/<lr..._steps..._eps...>/{{per_query.jsonl, config.json, metrics.json}}
     loo/{{per_query.jsonl, config.json, metrics.json}}   # flat, no sweep level
+    bergson/{{per_query.jsonl, config.json, metrics.json}}   # flat, no sweep level
 ```
 
 The sweep-config segment is the original run's leaf directory name
 (e.g. `damping_1e-2` for Kronfluence, `lr2e-5_steps15_eps0.005` for PBRF).
-LOO has no hyperparameter sweep, so its scores live directly under
-`<N>doc[-<training_order>]/<variant>/loo/`.
+LOO and Bergson have no hyperparameter sweep, so their scores live directly
+under `<N>doc[-<training_order>]/<variant>/{{loo,bergson}}/`.
 The optional `-<training_order>` suffix (e.g. `-seed1`, `-seed2`) identifies
 runs trained on a different ordering of the training data.
 
@@ -688,6 +717,14 @@ def main() -> None:
         "<N>doc/ results (e.g. filter/loo_results/0)",
     )
     parser.add_argument(
+        "--bergson-dir",
+        type=Path,
+        default=None,
+        help="Bergson (TrackStar) root containing base/ and distractor/ subdirs, "
+        "each with <N>doc[-seed]/ results holding per_query.jsonl directly "
+        "(flat, no sweep level; e.g. filter/bergson_results/model_sweep_final)",
+    )
+    parser.add_argument(
         "--loo-variant-order",
         type=str,
         default=DEFAULT_LOO_VARIANT_ORDER,
@@ -748,11 +785,14 @@ def main() -> None:
         parser.error("--repo-name must be in format 'username/repo-name'")
 
     # Resolve + validate the provided method dirs.
-    sources: Dict[str, Optional[Path]] = {"kronfluence": None, "pbrf": None, "loo": None}
+    sources: Dict[str, Optional[Path]] = {
+        "kronfluence": None, "pbrf": None, "loo": None, "bergson": None,
+    }
     for method, raw in (
         ("kronfluence", args.kronfluence_dir),
         ("pbrf", args.pbrf_dir),
         ("loo", args.loo_dir),
+        ("bergson", args.bergson_dir),
     ):
         if raw is None:
             continue
@@ -763,7 +803,7 @@ def main() -> None:
 
     if all(v is None for v in sources.values()):
         parser.error(
-            "Provide at least one of --kronfluence-dir, --pbrf-dir, --loo-dir"
+            "Provide at least one of --kronfluence-dir, --pbrf-dir, --loo-dir, --bergson-dir"
         )
 
     loo_variant_order = [v.strip() for v in args.loo_variant_order.split(",") if v.strip()]
@@ -772,6 +812,7 @@ def main() -> None:
         kronfluence_dir=sources["kronfluence"],
         pbrf_dir=sources["pbrf"],
         loo_dir=sources["loo"],
+        bergson_dir=sources["bergson"],
         loo_variant_order=loo_variant_order,
     )
     if not items:
@@ -782,19 +823,19 @@ def main() -> None:
     by_method: Dict[str, List[dict]] = defaultdict(list)
     for it in items:
         by_method[it["method"]].append(it)
-    for method in ("kronfluence", "pbrf", "loo"):
+    for method in ("kronfluence", "pbrf", "loo", "bergson"):
         for it in sorted(
             by_method.get(method, []),
             key=lambda x: (x["variant"], x["n"], x["ndoc_label"], x["sweep_name"] or ""),
         ):
             rp = repo_path_for(it)
-            if it["method"] == "loo":
-                loo_subvariant = (
+            if it["method"] in FLAT_METHODS:
+                subvariant = (
                     "direct" if _NDOC_RE.fullmatch(it["run_dir"].name) else it["run_dir"].name
                 )
                 logger.info(
-                    f"  [loo/{it['variant']}] {it['ndoc_label']}  "
-                    f"subvariant={loo_subvariant}  -> {rp}/per_query.jsonl"
+                    f"  [{method}/{it['variant']}] {it['ndoc_label']}  "
+                    f"subvariant={subvariant}  -> {rp}/per_query.jsonl"
                 )
             else:
                 logger.info(

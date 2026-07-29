@@ -34,6 +34,21 @@ set -euo pipefail
 #   MAX_ANSWER           - Max integer for restricted set (default: 100)
 #   QUERY_FULL_TEXT_LOSS - If set to 1 (and USE_MARGIN_LOSS != 1), use full-text LM loss
 #                          on queries instead of final-token loss
+#   STANDARDIZED         - If set to 1, disable margin loss and use full-text LM loss on
+#                          queries (overrides USE_MARGIN_LOSS and QUERY_FULL_TEXT_LOSS).
+#   RESPONSE_ONLY_TRAIN_LOSS - If set to 1, mask prompt tokens in training docs so only
+#                          response tokens contribute to the gradient index. Requires
+#                          'response'/'not_supervised_prefix' fields; falls back to full-text.
+#   RESPONSE_ONLY_QUERY_LOSS - If set to 1, append EOS to each query completion and supervise
+#                          all completion tokens (response + EOS), masking the prompt.
+#   LORA_ONLY            - If set to 1, restrict tracked modules to LoRA adapter Linear layers
+#                          (leaf nn.Linear with 'lora' in name). Falls back to all Linear.
+#   SELF_SCORES_OUTPUT_PATH - If set, compute per-doc self-influence g_t^T P^{-1} g_t and save JSONL
+#   SELF_USE_MEASUREMENT - Accepted for parity with kronfluence; currently no effect (Bergson
+#                          stores only the training loss gradient).
+#   SELF_ONLY            - If set to 1 (with SELF_SCORES_OUTPUT_PATH), compute only self-influence
+#   CONFIG_PATH          - If set, save run hyperparameters JSON to this path
+#   DIAGNOSTICS_PATH     - If set, save preconditioner eigenvalue diagnostics JSON to this path
 #   OVERWRITE            - If set to 1, overwrite (rebuild) an existing gradient index
 #   SAMPLE               - If set, sample N training docs
 #   SAMPLE_SEED          - RNG seed for sampling (default: 42)
@@ -51,6 +66,9 @@ set -euo pipefail
 #                          full influence score vector over all training docs)
 #   LAYER                - If set, filter module names by substring (or 'all') and
 #                          save per-layer outputs under layers/<module>/ in the output dir
+#   PRECONDITION         - If set to 1 (default), whiten query gradients with the
+#                          preconditioner (Bergson analogue of KFAC/EKFAC). Uses pretraining
+#                          second moments when USE_PRETRAINING_PROCESSOR=1, else the task index.
 #
 # Example configurations:
 #
@@ -104,10 +122,11 @@ USE_PRETRAINING_PROCESSOR=${USE_PRETRAINING_PROCESSOR:-0}
 PRETRAINING_PATH=${PRETRAINING_PATH:-"${HOME_DIR}/filter/pretraining/sample_10k.jsonl"}
 PRETRAINING_SAMPLES=${PRETRAINING_SAMPLES:-1000}
 BERGSON_PRETRAIN_PROCESSOR_CACHE=${BERGSON_PRETRAIN_PROCESSOR_CACHE:-}
-# Apply preconditioner whitening to query gradients using pretraining second moments
-# (the Bergson analogue of Kronfluence's KFAC/EKFAC preconditioning).
-# Only has an effect when USE_PRETRAINING_PROCESSOR=1. Default: 1.
-PRECONDITION=${PRECONDITION:-1}
+# Apply preconditioner whitening to query gradients (the Bergson analogue of
+# Kronfluence's KFAC/EKFAC preconditioning). When USE_PRETRAINING_PROCESSOR=1 it uses
+# the pretraining second moments; otherwise it uses the task index preconditioners.
+# Default: 0 (pure cosine-similarity TrackStar).
+PRECONDITION=${PRECONDITION:-0}
 
 # Data settings
 MAX_QUERY_LENGTH=${MAX_QUERY_LENGTH:-128}
@@ -118,18 +137,37 @@ MAX_ANSWER=${MAX_ANSWER:-100}
 # Behavioural flags
 USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
 QUERY_FULL_TEXT_LOSS=${QUERY_FULL_TEXT_LOSS:-0}
+STANDARDIZED=${STANDARDIZED:-0}
+RESPONSE_ONLY_TRAIN_LOSS=${RESPONSE_ONLY_TRAIN_LOSS:-0}
+RESPONSE_ONLY_QUERY_LOSS=${RESPONSE_ONLY_QUERY_LOSS:-0}
+LORA_ONLY=${LORA_ONLY:-0}
 OVERWRITE=${OVERWRITE:-1}
 SAMPLE=${SAMPLE:-0}
 SAMPLE_SEED=${SAMPLE_SEED:-42}
 
+# Self-influence (analogous to kronfluence self scores)
+SELF_SCORES_OUTPUT_PATH=${SELF_SCORES_OUTPUT_PATH:-}
+SELF_USE_MEASUREMENT=${SELF_USE_MEASUREMENT:-0}
+SELF_ONLY=${SELF_ONLY:-0}
+
+# Config / diagnostics serialisation
+CONFIG_PATH=${CONFIG_PATH:-"bergson_results/${SUB_DIR}/config_${TS}.json"}
+DIAGNOSTICS_PATH=${DIAGNOSTICS_PATH:-}
+
 # Evaluation
-EVAL_TOPK=${EVAL_TOPK:-10}
-EVAL_TOPK_MULTI=${EVAL_TOPK_MULTI:-1,10,100}
-EVAL_TOPK_RANGE=${EVAL_TOPK_RANGE:-}
+# Eval-k selection (priority: MULTI > RANGE > single). Defaults mirror
+# kronfluence_ranker.sh: an empty MULTI so a caller (e.g. the sweep) can select
+# RANGE via the environment. Note bash ${VAR:-default} treats an *empty* value as
+# unset, so a non-empty default here would silently override an empty MULTI passed
+# by a caller — which is exactly the bug that limited sweeps to k=1,10,100.
+EVAL_TOPK=${EVAL_TOPK:-}
+EVAL_TOPK_MULTI=${EVAL_TOPK_MULTI:-}
+EVAL_TOPK_RANGE=${EVAL_TOPK_RANGE:-1,100}
 EVAL_SAVE_EXAMPLES=${EVAL_SAVE_EXAMPLES:-"bergson_results/${SUB_DIR}/examples.jsonl"}
 EVAL_EXAMPLES_PER_FUNC=${EVAL_EXAMPLES_PER_FUNC:-1}
 EVAL_METRICS_PATH=${EVAL_METRICS_PATH:-"bergson_results/${SUB_DIR}/metrics_${TS}.json"}
 EVAL_SUMMARY_JSONL=${EVAL_SUMMARY_JSONL:-"bergson_results/${SUB_DIR}/summary_${TS}.jsonl"}
+EVAL_SAVE_ALL_QUERIES=${EVAL_SAVE_ALL_QUERIES:-}
 OUTPUT_PER_QUERY_PATH=${OUTPUT_PER_QUERY_PATH:-"bergson_results/${SUB_DIR}/per_query_${TS}.jsonl"}
 
 if [[ -z "${MODEL_PATH:-}" || -z "${TRAIN_DATASET_PATH:-}" || -z "${QUERY_PATH:-}" || -z "${OUTPUT_PATH:-}" ]]; then
@@ -175,9 +213,12 @@ if [[ "${USE_PRETRAINING_PROCESSOR:-0}" == "1" && -z "${PROCESSOR_PATH:-}" ]]; t
   if [[ -n "${BERGSON_PRETRAIN_PROCESSOR_CACHE:-}" ]]; then
     CMD+=(--pretraining-processor-cache "$BERGSON_PRETRAIN_PROCESSOR_CACHE")
   fi
-  if [[ "${PRECONDITION:-1}" == "1" ]]; then
-    CMD+=(--precondition)
-  fi
+fi
+
+# Preconditioner whitening (uses pretraining second moments when available, else the
+# task index preconditioners). Analogous to Kronfluence KFAC/EKFAC preconditioning.
+if [[ "${PRECONDITION:-0}" == "1" ]]; then
+  CMD+=(--precondition)
 fi
 
 # Unit normalisation
@@ -191,12 +232,47 @@ if [[ -n "${SAMPLE:-}" && "${SAMPLE:-0}" != "0" ]]; then
 fi
 
 # Query loss mode
-if [[ "${USE_MARGIN_LOSS:-0}" == "1" ]]; then
-  CMD+=(--use-margin-loss --min-answer "$MIN_ANSWER" --max-answer "$MAX_ANSWER")
+if [[ "${STANDARDIZED:-0}" == "1" ]]; then
+  CMD+=(--standardized)
+else
+  if [[ "${USE_MARGIN_LOSS:-0}" == "1" ]]; then
+    CMD+=(--use-margin-loss --min-answer "$MIN_ANSWER" --max-answer "$MAX_ANSWER")
+  fi
+  if [[ "${QUERY_FULL_TEXT_LOSS:-0}" == "1" && "${USE_MARGIN_LOSS:-0}" != "1" ]]; then
+    CMD+=(--query-full-text-loss)
+  fi
 fi
 
-if [[ "${QUERY_FULL_TEXT_LOSS:-0}" == "1" && "${USE_MARGIN_LOSS:-0}" != "1" ]]; then
-  CMD+=(--query-full-text-loss)
+# Response-only losses (mirror kronfluence DATE-LM setup)
+if [[ "${RESPONSE_ONLY_TRAIN_LOSS:-0}" == "1" ]]; then
+  CMD+=(--response-only-train-loss)
+fi
+if [[ "${RESPONSE_ONLY_QUERY_LOSS:-0}" == "1" ]]; then
+  CMD+=(--response-only-query-loss)
+fi
+
+# LoRA-only module selection
+if [[ "${LORA_ONLY:-0}" == "1" ]]; then
+  CMD+=(--lora-only)
+fi
+
+# Self-influence
+if [[ -n "${SELF_SCORES_OUTPUT_PATH:-}" ]]; then
+  CMD+=(--self-scores-output-path "$SELF_SCORES_OUTPUT_PATH")
+fi
+if [[ "${SELF_USE_MEASUREMENT:-0}" == "1" ]]; then
+  CMD+=(--self-use-measurement)
+fi
+if [[ "${SELF_ONLY:-0}" == "1" ]]; then
+  CMD+=(--self-only)
+fi
+
+# Config / diagnostics serialisation
+if [[ -n "${CONFIG_PATH:-}" ]]; then
+  CMD+=(--config-path "$CONFIG_PATH")
+fi
+if [[ -n "${DIAGNOSTICS_PATH:-}" ]]; then
+  CMD+=(--diagnostics-path "$DIAGNOSTICS_PATH")
 fi
 
 # Overwrite existing gradient index

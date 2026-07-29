@@ -6,15 +6,23 @@ set -euo pipefail
 
 # Required environment variables:
 #   TRAIN_DATASET_PATH   - JSONL training set (with 'text' field)
-#   QUERY_PATH           - JSONL queries (with 'prompt','completion','func','correct')
+#   QUERY_PATH           - JSONL queries (with 'prompt'/'query','completion','func','correct')
 #   OUTPUT_PATH          - Output JSONL for aggregated BM25 scores
 #
 # Optional – BM25 tokenization:
-#   TOKENIZER_PATH       - HF tokenizer path/name; when set, BM25 uses subword token IDs as terms
-#                          (recommended: same tokenizer as the trained model, e.g. MODEL_PATH)
-#   NO_LOWERCASE         - If set to 1, disable lowercasing (only for whitespace tokenization)
-#   STRIP_PUNCT          - If set to 1, strip punctuation before tokenizing (only for whitespace tokenization)
+#   TOKENIZER_MODE       - regex (default) | whitespace | hf
+#                          regex: isolate <...> function tokens + alphanumeric words (model-free, robust)
+#                          hf:    encode with TOKENIZER_PATH into subword token IDs
+#                          whitespace: plain whitespace split
+#   TOKENIZER_PATH       - HF tokenizer path/name; required when TOKENIZER_MODE=hf
+#   NO_LOWERCASE         - If set to 1, disable lowercasing (regex/whitespace modes)
+#   STRIP_PUNCT          - If set to 1, strip punctuation before tokenizing (whitespace mode only)
 #   INCLUDE_COMPLETION   - If set to 1, append completion text to query prompt for BM25 lookup
+#
+# Optional – BM25 hyperparameters:
+#   BM25_K1              - term-frequency saturation (default: 1.5)
+#   BM25_B               - length normalization (default: 0.75)
+#   BM25_EPSILON         - BM25Okapi epsilon (default: 0.25)
 #
 # Optional – data:
 #   EXCLUDE_DISTRACTORS  - If set to 1, remove distractor docs from corpus before ranking
@@ -24,6 +32,7 @@ set -euo pipefail
 # Optional – evaluation:
 #   EVAL_TOPK            - If set, compute recall/precision@k per function (single k)
 #   EVAL_TOPK_MULTI      - Comma-separated k values (e.g. "1,5,10,20,50"); overrides EVAL_TOPK when set
+#   EVAL_TOPK_RANGE      - Inclusive sweep "START,END" (e.g. "1,50"); overrides EVAL_TOPK, lower priority than EVAL_TOPK_MULTI
 #   EVAL_SAVE_EXAMPLES   - Path to save qualitative top-k examples (.json or .jsonl)
 #   EVAL_EXAMPLES_PER_FUNC - Number of query examples per function to save (default: 1)
 #   EVAL_METRICS_PATH    - Optional path to save evaluation metrics JSON
@@ -31,6 +40,7 @@ set -euo pipefail
 #   EVAL_SAVE_ALL_QUERIES - Path to save per-query full score lists for each function
 #   OUTPUT_PER_QUERY_PATH - If set, save a per-query JSONL (one line per query with
 #                          full BM25 score vector over all training docs)
+#   CONFIG_PATH          - If set, save run hyperparameters JSON to this path
 #
 # Example configurations:
 #
@@ -39,10 +49,10 @@ set -euo pipefail
 #    QUERY_PATH="queries/query_select_kfac.jsonl"
 #    ./filter/bm25_ranker.sh
 #
-# 2. Many-bases functions (e.g., 100 base functions <B01> through <B100>):
-#    TRAIN_DATASET_PATH="${HOME_DIR}/dataset-generator/datasets/one_hop_base/100.jsonl"
-#    QUERY_PATH="queries/query_many_bases_100.jsonl"
-#    EVAL_TOPK=100 ./filter/bm25_ranker.sh
+# 2. Many-bases functions (e.g., 50 base functions <B01> through <B50>):
+#    TRAIN_DATASET_PATH="${HOME_DIR}/dataset-generator/datasets/0/50/sd_cumulative/5.jsonl"
+#    QUERY_PATH="${HOME_DIR}/filter/queries/many_bases/50/10.jsonl"
+#    EVAL_TOPK_MULTI="1,10,100" ./filter/bm25_ranker.sh
 
 # Root of the repo (parent of this filter directory)
 HOME_DIR=${HOME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. &> /dev/null && pwd)}
@@ -51,18 +61,21 @@ SUB_DIR=${SUB_DIR:-"1hop/100/full_distractor"}
 ADD_ON=${ADD_ON:-""}
 
 # Default paths (mirror kronfluence_ranker.sh defaults)
-# TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/token_distractor/100X100.jsonl"}
 TRAIN_DATASET_PATH=${TRAIN_DATASET_PATH:-"${HOME_DIR}/dataset-generator/datasets/one_hop/100/distractor.jsonl"}
 QUERY_PATH=${QUERY_PATH:-"${HOME_DIR}/filter/queries/many_bases/100/10.jsonl"}
 OUTPUT_PATH=${OUTPUT_PATH:-bm25_results/${SUB_DIR}/bm25_ranked_${ADD_ON}.jsonl}
 
 # BM25 tokenization options
-# Leave TOKENIZER_PATH empty to use whitespace tokenization (default).
-# Set to a model/tokenizer path to use subword token IDs as BM25 terms.
-TOKENIZER_PATH=${TOKENIZER_PATH:-"${HOME_DIR}/models/OLMo-1B-MF-Base-Distractors"}
+TOKENIZER_MODE=${TOKENIZER_MODE:-regex}
+TOKENIZER_PATH=${TOKENIZER_PATH:-}
 NO_LOWERCASE=${NO_LOWERCASE:-0}
 STRIP_PUNCT=${STRIP_PUNCT:-0}
 INCLUDE_COMPLETION=${INCLUDE_COMPLETION:-0}
+
+# BM25 hyperparameters
+BM25_K1=${BM25_K1:-1.5}
+BM25_B=${BM25_B:-0.75}
+BM25_EPSILON=${BM25_EPSILON:-0.25}
 
 # Distractor filtering
 EXCLUDE_DISTRACTORS=${EXCLUDE_DISTRACTORS:-0}
@@ -74,11 +87,13 @@ SAMPLE_SEED=${SAMPLE_SEED:-42}
 # Evaluation
 EVAL_TOPK=${EVAL_TOPK:-10}
 EVAL_TOPK_MULTI=${EVAL_TOPK_MULTI:-1,10,100}
+EVAL_TOPK_RANGE=${EVAL_TOPK_RANGE:-}
 EVAL_SAVE_EXAMPLES=${EVAL_SAVE_EXAMPLES:-"bm25_results/${SUB_DIR}/examples.jsonl"}
 EVAL_EXAMPLES_PER_FUNC=${EVAL_EXAMPLES_PER_FUNC:-1}
 EVAL_METRICS_PATH=${EVAL_METRICS_PATH:-"bm25_results/${SUB_DIR}/metrics.json"}
 EVAL_SUMMARY_JSONL=${EVAL_SUMMARY_JSONL:-"bm25_results/${SUB_DIR}/summary.jsonl"}
 OUTPUT_PER_QUERY_PATH=${OUTPUT_PER_QUERY_PATH:-"bm25_results/${SUB_DIR}/per_query.jsonl"}
+CONFIG_PATH=${CONFIG_PATH:-"bm25_results/${SUB_DIR}/config.json"}
 
 if [[ -z "${TRAIN_DATASET_PATH:-}" || -z "${QUERY_PATH:-}" || -z "${OUTPUT_PATH:-}" ]]; then
   echo "Missing required env vars. Please set TRAIN_DATASET_PATH, QUERY_PATH, OUTPUT_PATH." >&2
@@ -92,6 +107,10 @@ CMD=(
   --dataset-path "$TRAIN_DATASET_PATH"
   --query-path   "$QUERY_PATH"
   --output-path  "$OUTPUT_PATH"
+  --tokenizer-mode "$TOKENIZER_MODE"
+  --bm25-k1 "$BM25_K1"
+  --bm25-b "$BM25_B"
+  --bm25-epsilon "$BM25_EPSILON"
 )
 
 # Distractor filtering
@@ -121,6 +140,8 @@ fi
 # Evaluation flags
 if [[ -n "${EVAL_TOPK_MULTI:-}" ]]; then
   CMD+=(--eval-topk-multi "$EVAL_TOPK_MULTI")
+elif [[ -n "${EVAL_TOPK_RANGE:-}" ]]; then
+  CMD+=(--eval-topk-range "$EVAL_TOPK_RANGE")
 elif [[ -n "${EVAL_TOPK:-}" ]]; then
   CMD+=(--eval-topk "$EVAL_TOPK")
 fi
@@ -141,6 +162,9 @@ if [[ -n "${EVAL_SAVE_ALL_QUERIES:-}" ]]; then
 fi
 if [[ -n "${OUTPUT_PER_QUERY_PATH:-}" ]]; then
   CMD+=(--output-per-query-path "$OUTPUT_PER_QUERY_PATH")
+fi
+if [[ -n "${CONFIG_PATH:-}" ]]; then
+  CMD+=(--config-path "$CONFIG_PATH")
 fi
 
 echo "Running: ${CMD[*]}"

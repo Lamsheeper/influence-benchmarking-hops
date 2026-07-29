@@ -1,21 +1,24 @@
-"""BM25 baseline ranker with the same evaluation features as kronfluence_ranker.py.
+"""NV-Embed dense-retrieval ranker with the same evaluation features as kronfluence_ranker.py / bm25_ranker.py.
 
-Computes BM25 retrieval scores between query prompts and training documents,
-then evaluates using the identical recall@k, precision@k (with per-function and
-per-query averages), composition@k (constant_gt / identity_gt / distractor /
-other), qualitative examples, per-query score dumps, run-config JSON, metrics
-JSON, and summary JSONL outputs used by ``kronfluence_ranker.py``.
+Computes dense-embedding retrieval scores between query prompts and training
+documents using NVIDIA's NV-Embed model (default: ``nvidia/NV-Embed-v2``), then
+evaluates using the identical recall@k, precision@k (per-function and per-query
+averages), composition@k (constant_gt / identity_gt / distractor / other),
+qualitative examples, per-query score dumps, run-config JSON, metrics JSON, and
+summary JSONL outputs used by the other rankers.  The score for a (query, doc)
+pair is the cosine similarity between their L2-normalized NV-Embed embeddings.
 
-BM25 is a strong text-retrieval baseline that requires no model, GPU, or
-gradients.  Each query's prompt text is tokenized and scored against the full
-training corpus using Okapi BM25.  The evaluation/aggregation/output helpers are
-kept byte-for-byte compatible with ``kronfluence_ranker.py`` so BM25 results drop
-straight into the same downstream tooling (``metrics_plot``, per-query JSONL,
-etc.).
+NV-Embed-v2 is a Mistral-7B-based instruction-tuned embedding model.  Queries
+are encoded with a retrieval instruction prefix; passages (training docs) are
+encoded with no instruction, matching the model's documented retrieval usage.
 
-Model/factor-specific kronfluence features (Fisher/Hessian factors, damping,
-self-influence, pretraining factors, LoRA-only, per-layer scores, margin loss)
-have no BM25 analogue and are intentionally omitted.
+The eval/aggregation/output helpers are kept byte-for-byte compatible with
+``bm25_ranker.py`` (and hence ``kronfluence_ranker.py``) so NV-Embed results drop
+straight into the same downstream tooling (``metrics_plot``, per-query JSONL).
+
+NOTE: NV-Embed-v2's custom modeling code targets ``transformers==4.42.x`` and is
+NOT compatible with the repo's main ``.venv`` (transformers 5.x). Run this
+script with the dedicated NV-Embed environment; see ``nvembed_ranker.sh``.
 """
 
 import argparse
@@ -23,19 +26,30 @@ import datetime
 import json
 import os
 import re
-import string
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
-from rank_bm25 import BM25Okapi
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
-
-import utils as utils
+from transformers import AutoModel
 
 
 # ===========================================================================
-# Helper functions — identical semantics to kronfluence_ranker.py
+# Dataset I/O (kept local so this script has no dependency on the main venv's
+# ``utils`` module, which imports heavy packages unavailable in the NV-Embed env)
+# ===========================================================================
+
+def load_jsonl_dataset(file_path: str) -> List[Dict[str, Any]]:
+    documents: List[Dict[str, Any]] = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                documents.append(json.loads(line))
+    return documents
+
+
+# ===========================================================================
+# Helper functions — identical semantics to kronfluence_ranker.py / bm25_ranker.py
 # ===========================================================================
 
 def is_many_bases_token(token: str) -> bool:
@@ -86,11 +100,9 @@ def paired_function_token(func_token: str) -> Optional[str]:
     }
     if func_token in pairs:
         return pairs[func_token]
-    # Many-wrappers <Cxx> pair with the corresponding <Bxx> base token
     m = re.match(r"^<C(\d+)>$", func_token)
     if m:
         return f"<B{int(m.group(1)):02d}>"
-    # Many-bases <Bxx> pair with the corresponding <Cxx> wrapper token
     m = re.match(r"^<B(\d+)>$", func_token)
     if m:
         return f"<C{int(m.group(1)):02d}>"
@@ -109,10 +121,8 @@ def allowed_role_for_token(func_token: str) -> Optional[str]:
     wrapper_tokens = {"<FN>", "<IN>", "<HN>", "<SN>", "<TN>", "<UN>", "<VN>", "<WN>", "<XN>", "<YN>"}
     if func_token in wrapper_tokens:
         return "identity"
-    # Many-wrappers tokens (<Cxx>) are identity wrappers over the corresponding <Bxx> base token
     if is_many_wrappers_token(func_token):
         return "identity"
-    # Many-bases tokens and traditional base tokens are 'constant'
     return "constant"
 
 
@@ -352,72 +362,26 @@ def save_influence_scores(training_meta: Dict[int, Dict[str, Any]], out_path: st
     with open(out_path, "w") as f:
         for _, v in training_meta.items():
             f.write(json.dumps(v) + "\n")
-    print(f"Saved BM25 scores to {out_path}")
+    print(f"Saved NV-Embed scores to {out_path}")
 
 
 # ===========================================================================
-# BM25 tokenization and scoring
+# NV-Embed encoding and scoring
 # ===========================================================================
 
-_PUNCT_TABLE = str.maketrans("", "", string.punctuation)
-# Isolate special function tokens like <B01>/<GN> as whole terms, plus
-# alphanumeric words. This makes lexical matching hinge on the function token
-# rather than being lost inside chunks like "<B01>(4)".
-_FUNC_TOKEN_RE = re.compile(r"<[^<>\s]+>|[A-Za-z0-9]+")
-
-
-def _tokenize(
-    text: str,
-    mode: str = "regex",
-    lowercase: bool = True,
-    strip_punct: bool = False,
-    tokenizer: Optional[PreTrainedTokenizerBase] = None,
-) -> List[str]:
-    """Tokenize text for BM25.
-
-    Modes:
-      - ``hf``:        encode with a HuggingFace tokenizer and use each token ID
-                       (as a string) as a BM25 term. Requires ``tokenizer``.
-                       Operates on the model's subword vocabulary, so special
-                       function tokens like <GN>/<B01> become single terms.
-      - ``regex``:     (default) extract ``<...>`` function tokens as whole terms
-                       plus alphanumeric words. Model-independent and robust to
-                       punctuation glued onto function tokens (e.g. "<B01>(4)").
-      - ``whitespace``: simple whitespace split with optional lowercasing and
-                        punctuation stripping.
-    """
-    if mode == "hf":
-        if tokenizer is None:
-            raise ValueError("tokenizer must be provided when mode='hf'")
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        return [str(i) for i in ids]
-    if lowercase:
-        text = text.lower()
-    if mode == "regex":
-        return _FUNC_TOKEN_RE.findall(text)
-    # whitespace mode
-    if strip_punct:
-        text = text.translate(_PUNCT_TABLE)
-    return text.split()
-
-
-def _build_corpus(
-    train_docs: List[Dict[str, Any]],
-    mode: str,
-    lowercase: bool,
-    strip_punct: bool,
-    tokenizer: Optional[PreTrainedTokenizerBase] = None,
-) -> List[List[str]]:
-    """Tokenize each training document's text field into a token list for BM25."""
-    corpus = []
-    for doc in train_docs:
-        text = doc.get("text", "") or ""
-        corpus.append(_tokenize(text, mode=mode, lowercase=lowercase, strip_punct=strip_punct, tokenizer=tokenizer))
-    return corpus
+def _resolve_dtype(name: str) -> torch.dtype:
+    if name == "bf16":
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        print("Warning: bf16 requested but unsupported; falling back to fp16.")
+        return torch.float16
+    if name == "fp16":
+        return torch.float16
+    return torch.float32
 
 
 def _build_query_text(doc: Dict[str, Any], include_completion: bool) -> str:
-    """Construct the BM25 query string from a query document."""
+    """Construct the query string from a query document."""
     prompt = str(doc.get("prompt", doc.get("query", "")) or "")
     if include_completion:
         completion = str(doc.get("completion", "") or "")
@@ -425,29 +389,29 @@ def _build_query_text(doc: Dict[str, Any], include_completion: bool) -> str:
     return prompt
 
 
-def compute_bm25_score_matrix(
-    bm25: BM25Okapi,
-    query_docs: List[Dict[str, Any]],
-    query_meta: List[Dict[str, Any]],
-    include_completion: bool,
-    mode: str,
-    lowercase: bool,
-    strip_punct: bool,
-    tokenizer: Optional[PreTrainedTokenizerBase] = None,
+def encode_texts(
+    model,
+    texts: List[str],
+    instruction: str,
+    batch_size: int,
+    max_length: int,
 ) -> torch.Tensor:
-    """Return a [Q, N] float32 tensor of BM25 scores (query x train)."""
-    rows: List[torch.Tensor] = []
-    for _qm, doc in zip(query_meta, query_docs):
-        text = _build_query_text(doc, include_completion=include_completion)
-        tokens = _tokenize(text, mode=mode, lowercase=lowercase, strip_punct=strip_punct, tokenizer=tokenizer)
-        if not tokens:
-            scores = [0.0] * bm25.corpus_size
-        else:
-            scores = bm25.get_scores(tokens).tolist()
-        rows.append(torch.tensor(scores, dtype=torch.float32))
-    if not rows:
-        return torch.zeros((0, bm25.corpus_size), dtype=torch.float32)
-    return torch.stack(rows)
+    """Encode texts with NV-Embed in batches; return L2-normalized [N, D] float32 CPU tensor."""
+    embs: List[torch.Tensor] = []
+    total = len(texts)
+    for i in range(0, total, batch_size):
+        chunk = texts[i:i + batch_size]
+        with torch.no_grad():
+            e = model.encode(chunk, instruction=instruction, max_length=max_length)
+        if not isinstance(e, torch.Tensor):
+            e = torch.as_tensor(e)
+        e = torch.nn.functional.normalize(e.float(), p=2, dim=1)
+        embs.append(e.detach().cpu())
+        done = min(i + batch_size, total)
+        print(f"  encoded {done}/{total}", flush=True)
+    if not embs:
+        return torch.zeros((0, 0), dtype=torch.float32)
+    return torch.cat(embs, dim=0)
 
 
 # ===========================================================================
@@ -456,56 +420,34 @@ def compute_bm25_score_matrix(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compute BM25 pairwise retrieval scores and aggregate per-function metrics"
+        description="Compute NV-Embed dense-retrieval scores and aggregate per-function metrics"
     )
 
     # Required I/O
     parser.add_argument("--dataset-path", required=True, help="Training JSONL with 'text' field")
-    parser.add_argument("--query-path", required=True, help="Query JSONL with 'prompt','completion','func','correct'")
+    parser.add_argument("--query-path", required=True, help="Query JSONL with 'prompt'/'query','completion','func','correct'")
     parser.add_argument("--output-path", required=True)
 
-    # BM25 tokenization
+    # Model / encoding
+    parser.add_argument("--model-path", type=str, default="nvidia/NV-Embed-v2", help="NV-Embed model path or HF hub id")
     parser.add_argument(
-        "--tokenizer-mode",
-        choices=["regex", "whitespace", "hf"],
-        default="regex",
-        help=(
-            "How to tokenize text for BM25. 'regex' (default) isolates <...> "
-            "function tokens plus alphanumeric words (model-independent, robust). "
-            "'hf' uses --tokenizer-path to map text to subword token IDs. "
-            "'whitespace' is a plain whitespace split."
-        ),
-    )
-    parser.add_argument(
-        "--tokenizer-path",
+        "--query-instruction",
         type=str,
-        default=None,
-        help=(
-            "Path (or HuggingFace hub name) of a tokenizer to use for BM25 when "
-            "--tokenizer-mode=hf. Texts are encoded with this tokenizer and each "
-            "token ID becomes a BM25 term (recommended: same tokenizer as the "
-            "trained model, so special function tokens like <GN> are single terms)."
-        ),
+        default="Instruct: Given a query, retrieve documents that describe the function referenced in the query\nQuery: ",
+        help="Instruction prefix prepended to query text (NV-Embed retrieval instruction).",
     )
     parser.add_argument(
-        "--no-lowercase",
-        action="store_true",
-        help="Disable lowercasing (applies to regex/whitespace modes; ignored for hf)",
+        "--passage-instruction",
+        type=str,
+        default="",
+        help="Instruction prefix for passages/training docs (NV-Embed uses empty for passages).",
     )
-    parser.add_argument(
-        "--strip-punct",
-        action="store_true",
-        help="Strip punctuation before tokenizing (whitespace mode only)",
-    )
-    parser.add_argument(
-        "--include-completion",
-        action="store_true",
-        help="Append the query completion to the prompt when building the BM25 query (default: prompt only).",
-    )
-    # BM25 hyperparameters
-    parser.add_argument("--bm25-k1", type=float, default=1.5, help="BM25 k1 term-frequency saturation (default: 1.5)")
-    parser.add_argument("--bm25-b", type=float, default=0.75, help="BM25 b length-normalization (default: 0.75)")
-    parser.add_argument("--bm25-epsilon", type=float, default=0.25, help="BM25Okapi epsilon (default: 0.25)")
+    parser.add_argument("--max-length", type=int, default=512, help="Max tokens per text (default: 512)")
+    parser.add_argument("--query-max-length", type=int, default=None, help="Max tokens for queries (default: --max-length)")
+    parser.add_argument("--batch-size", type=int, default=8, help="Encoding batch size (default: 8)")
+    parser.add_argument("--dtype", choices=["bf16", "fp16", "f32"], default="fp16", help="Model dtype (default: fp16)")
+    parser.add_argument("--include-completion", action="store_true",
+                        help="Append the query completion to the prompt when building the query text (default: prompt only).")
 
     # Data settings
     parser.add_argument("--sample", type=int, default=None, help="Sample N training docs")
@@ -520,7 +462,7 @@ def main() -> None:
         ),
     )
 
-    # Evaluation flags (mirror kronfluence_ranker.py)
+    # Evaluation flags (mirror kronfluence_ranker.py / bm25_ranker.py)
     parser.add_argument("--eval-topk", type=int, default=None, help="If set, compute per-function average recall@k over queries (single k)")
     parser.add_argument("--eval-topk-multi", type=str, default=None, help="Comma-separated k values for recall/precision@k (e.g. '1,5,10,20,50'). Overrides --eval-topk when set.")
     parser.add_argument("--eval-topk-range", type=str, default=None, metavar="START,END", help="Inclusive integer sweep of k values, e.g. '1,50'. Overrides --eval-topk; --eval-topk-multi takes priority.")
@@ -546,8 +488,7 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-
-    lowercase = not args.no_lowercase
+    query_max_length = args.query_max_length if args.query_max_length is not None else args.max_length
 
     # -----------------------------------------------------------------------
     # Save run configuration JSON (before scoring so it's written even on crash)
@@ -558,18 +499,18 @@ def main() -> None:
         _config_path = str(_out.parent / (_out.stem + "_config.json"))
     _run_config: Dict[str, Any] = {
         "timestamp_utc": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "method": "bm25",
+        "method": "nvembed",
+        "model_path": args.model_path,
         "dataset_path": args.dataset_path,
         "query_path": args.query_path,
         "output_path": args.output_path,
-        "tokenizer_mode": args.tokenizer_mode,
-        "tokenizer_path": args.tokenizer_path,
-        "lowercase": bool(lowercase),
-        "strip_punct": bool(args.strip_punct),
+        "query_instruction": args.query_instruction,
+        "passage_instruction": args.passage_instruction,
+        "max_length": args.max_length,
+        "query_max_length": query_max_length,
+        "batch_size": args.batch_size,
+        "dtype": args.dtype,
         "include_completion": bool(args.include_completion),
-        "bm25_k1": args.bm25_k1,
-        "bm25_b": args.bm25_b,
-        "bm25_epsilon": args.bm25_epsilon,
         "sample": args.sample,
         "sample_seed": args.sample_seed,
         "exclude_distractors": bool(args.exclude_distractors),
@@ -583,28 +524,19 @@ def main() -> None:
         print(f"Warning: failed to save run config to {_config_path}: {_e}")
 
     # -----------------------------------------------------------------------
-    # 0. Optionally load a HuggingFace tokenizer (hf mode only)
+    # 0. Load NV-Embed model
     # -----------------------------------------------------------------------
-    hf_tokenizer: Optional[PreTrainedTokenizerBase] = None
-    if args.tokenizer_mode == "hf":
-        if not args.tokenizer_path:
-            parser.error("--tokenizer-mode=hf requires --tokenizer-path.")
-        print(f"Loading tokenizer from {args.tokenizer_path} ...")
-        try:
-            hf_tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
-        except ValueError as _e:
-            if "does not exist or is not currently imported" in str(_e):
-                from transformers import PreTrainedTokenizerFast
-                print(f"AutoTokenizer failed ({_e}); falling back to PreTrainedTokenizerFast.")
-                hf_tokenizer = PreTrainedTokenizerFast.from_pretrained(args.tokenizer_path)
-            else:
-                raise
-        print(f"Tokenizer loaded (vocab size: {len(hf_tokenizer)}). BM25 will operate on token IDs.")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch_dtype = _resolve_dtype(args.dtype)
+    print(f"Loading NV-Embed model from {args.model_path} (dtype={torch_dtype}, device={device}) ...")
+    model = AutoModel.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=torch_dtype)
+    model = model.to(device).eval()
+    print("Model loaded.")
 
     # -----------------------------------------------------------------------
-    # 1. Load training documents and build BM25 index
+    # 1. Load training documents
     # -----------------------------------------------------------------------
-    train_docs = utils.load_jsonl_dataset(args.dataset_path)
+    train_docs = load_jsonl_dataset(args.dataset_path)
 
     if args.exclude_distractors:
         orig_count = len(train_docs)
@@ -621,21 +553,10 @@ def main() -> None:
         train_docs = rng.sample(train_docs, args.sample)
         print(f"Sampled {len(train_docs)} training docs.")
 
-    print(f"Building BM25 index over {len(train_docs)} training documents (mode={args.tokenizer_mode})...")
-    corpus = _build_corpus(
-        train_docs,
-        mode=args.tokenizer_mode,
-        lowercase=lowercase,
-        strip_punct=args.strip_punct,
-        tokenizer=hf_tokenizer,
-    )
-    bm25 = BM25Okapi(corpus, k1=args.bm25_k1, b=args.bm25_b, epsilon=args.bm25_epsilon)
-    print("BM25 index built.")
-
     # -----------------------------------------------------------------------
     # 2. Load query documents and build query metadata
     # -----------------------------------------------------------------------
-    query_docs_raw = utils.load_jsonl_dataset(args.query_path)
+    query_docs_raw = load_jsonl_dataset(args.query_path)
 
     query_docs: List[Dict[str, Any]] = []
     query_meta: List[Dict[str, Any]] = []
@@ -656,19 +577,18 @@ def main() -> None:
     print(f"Loaded {len(query_meta)} queries from {len(query_docs_raw)} query docs.")
 
     # -----------------------------------------------------------------------
-    # 3. Compute BM25 score matrix [Q, N]
+    # 3. Encode passages + queries and compute cosine-similarity matrix [Q, N]
     # -----------------------------------------------------------------------
-    print("Computing BM25 scores...")
-    score_matrix = compute_bm25_score_matrix(
-        bm25=bm25,
-        query_docs=query_docs,
-        query_meta=query_meta,
-        include_completion=args.include_completion,
-        mode=args.tokenizer_mode,
-        lowercase=lowercase,
-        strip_punct=args.strip_punct,
-        tokenizer=hf_tokenizer,
-    )
+    print(f"Encoding {len(train_docs)} training documents...")
+    doc_texts = [str(doc.get("text", "") or "") for doc in train_docs]
+    doc_embs = encode_texts(model, doc_texts, args.passage_instruction, args.batch_size, args.max_length)
+
+    print(f"Encoding {len(query_docs)} queries...")
+    query_texts = [_build_query_text(doc, include_completion=args.include_completion) for doc in query_docs]
+    query_embs = encode_texts(model, query_texts, args.query_instruction, args.batch_size, query_max_length)
+
+    # Cosine similarity (embeddings already L2-normalized) -> [Q, N]
+    score_matrix = query_embs @ doc_embs.T
     print(f"Score matrix: {score_matrix.shape[0]} queries x {score_matrix.shape[1]} train docs.")
 
     # -----------------------------------------------------------------------
@@ -700,13 +620,9 @@ def main() -> None:
             print(f"Failed to save per-query influence scores: {e}")
 
     # -----------------------------------------------------------------------
-    # 5. Evaluation (mirrors kronfluence_ranker.py default path)
+    # 5. Evaluation (mirrors kronfluence_ranker.py / bm25_ranker.py default path)
     # -----------------------------------------------------------------------
     def _is_relevant(doc: Dict[str, Any], func: str) -> bool:
-        # Relevant means: the document is for this function token, and its role
-        # matches the expected role for the token ('identity' for wrappers,
-        # 'constant' for bases). When no role field is present (e.g. free-text
-        # datasets), func match is sufficient.
         doc_func = str(doc.get("func", ""))
         if doc_func != func:
             return False
@@ -718,14 +634,12 @@ def main() -> None:
 
     eval_k_list = _parse_eval_topk_list(args.eval_topk, args.eval_topk_multi, args.eval_topk_range)
     if eval_k_list or (args.eval_save_examples_path is not None) or (args.eval_save_all_queries_path is not None):
-        # Build reverse index of relevant docs per function
         func_to_relevant_indices: Dict[str, List[int]] = {}
         for ti, doc in enumerate(train_docs):
             f = str(doc.get("func", ""))
             if _is_relevant(doc, f):
                 func_to_relevant_indices.setdefault(f, []).append(ti)
 
-        # Group query indices per function (only queries marked correct)
         func_to_query_indices: Dict[str, List[int]] = {}
         for qi, qm in enumerate(query_meta):
             if not bool(qm.get("correct", False)):
@@ -786,7 +700,6 @@ def main() -> None:
                     print(f"  overall_average (per-func):  {overall_p:.4f}")
                     print(f"  per_query_average:           {per_query_avg_p:.4f}")
 
-            # Per-function top-k composition at each k
             metrics["composition_at_k"] = {}
             for k in eval_k_list:
                 composition_per_func = _compute_composition_per_function(
